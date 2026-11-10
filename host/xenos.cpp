@@ -140,6 +140,9 @@ static uint64_t g_mxEpoch = 0;                                               // 
 static ComPtr<IDXGISwapChain> g_swap;
 static ComPtr<ID3D11RenderTargetView> g_backRtv;
 static ComPtr<ID3D11Texture2D> g_backTex;
+// The swap chain is 10 bits per channel: the game's display gamma ramp (a 10-bit table, as on the console) is applied in the present pass, and an 8-bit
+// back buffer rounded its output again, merging neighbouring dark tones into visible bands. ASURA_BACKBUFFER8=1 keeps the old 8-bit chain.
+static const DXGI_FORMAT g_backFmt = getenv("ASURA_BACKBUFFER8") ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R10G10B10A2_UNORM;
 static ComPtr<ID3D11SamplerState> g_presentSampler;
 static ComPtr<ID3D11PixelShader> g_psPresentPlain;
 static uint32_t g_backW = 1280, g_backH = 720;
@@ -339,7 +342,7 @@ static bool device_init() {
     CreateThread(nullptr, 0, window_thread, ev, 0, nullptr);
     WaitForSingleObject(ev, 10000);
     DXGI_SWAP_CHAIN_DESC sd{};
-    sd.BufferCount = 2; sd.BufferDesc.Width = 1280; sd.BufferDesc.Height = 720; sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferCount = 2; sd.BufferDesc.Width = 1280; sd.BufferDesc.Height = 720; sd.BufferDesc.Format = g_backFmt;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow = g_hwnd; sd.SampleDesc.Count = 1; sd.Windowed = TRUE;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     if (gpu_vrr()) { sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING; g_swapFlags = sd.Flags; g_tearing = true; }
@@ -1019,6 +1022,8 @@ struct Translator {
                 // tfi.z = slice stride in surface v): the two nearest slices, blended, with v kept inside the slice.
                 B += S(" float ld=max(tfp[%u].w,1.0), lz=clamp(uw.z*ld-0.5,0.0,ld-1.0), l0=floor(lz), lf=lz-l0, l1=min(l0+1.0,ld-1.0);\n", slot);
                 B += S(" uv.y=clamp(uv.y,0.5*tfscale(%u).y*tfi[%u].y,tfscale(%u).y*(1.0-0.5*tfi[%u].y));\n", slot, slot, slot, slot);
+                // Hardware filtering on the stored (render-scale) surface. Tried 2026-11-10: blending on the game's own 16x16 grid instead, as the
+                // console's filter would; compared side by side on one frame, this one banded much less.
                 smp = "lerp(" + one(S("uv+float2(0,l0*tfi[%u].z)", slot)) + "," + one(S("uv+float2(0,l1*tfi[%u].z)", slot)) + ",lf)";
             } else smp = one("uv");
         }
@@ -1559,6 +1564,7 @@ static Rt* get_color_rt(uint32_t base, uint32_t fmt, uint32_t pitch) {
     auto it = g_rts.find(key);
     if (it != g_rts.end()) return it->second;
     Rt* r = new Rt(); rt_size(pitch, r->w, r->h); r->fmt = rt_dxgi(fmt);
+    logf_once(S("rtnew%u_%u", fmt, pitch).c_str(), "colour target format %u pitch %u (host format %u) first used at frame %llu", fmt, pitch, (unsigned)r->fmt, (unsigned long long)g_frame);
     D3D11_TEXTURE2D_DESC d{}; d.Width = r->w * g_resScale; d.Height = std::min(r->h * g_resScale, 16384u); d.MipLevels = 1; d.ArraySize = 1; d.Format = r->fmt; d.SampleDesc.Count = 1;
     d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     g_dev->CreateTexture2D(&d, nullptr, &r->tex);
@@ -3608,6 +3614,12 @@ static void note_display_stats(LARGE_INTEGER presented, uint64_t frame) {
     }
 }
 
+// One back buffer pixel as 8-bit r, g, b: the swap chain is 10-bit (R10G10B10A2) unless ASURA_BACKBUFFER8 is set.
+static inline void back_px(const uint8_t* s, DXGI_FORMAT f, uint8_t& r, uint8_t& g, uint8_t& b) {
+    if (f == DXGI_FORMAT_R10G10B10A2_UNORM) { uint32_t w; memcpy(&w, s, 4); r = (uint8_t)((w >> 2) & 255); g = (uint8_t)((w >> 12) & 255); b = (uint8_t)((w >> 22) & 255); }
+    else if (f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) { b = s[0]; g = s[1]; r = s[2]; }
+    else { r = s[0]; g = s[1]; b = s[2]; }
+}
 static void save_shot(ID3D11Texture2D* st, const D3D11_TEXTURE2D_DESC& d, uint64_t frame, const char* dir) {
     D3D11_MAPPED_SUBRESOURCE ms; if (FAILED(g_ctx->Map(st, 0, D3D11_MAP_READ, 0, &ms))) return;
     std::string p = std::string(dir) + S("\\shot_%06llu.bmp", (unsigned long long)frame);
@@ -3620,7 +3632,7 @@ static void save_shot(ID3D11Texture2D* st, const D3D11_TEXTURE2D_DESC& d, uint64
         std::vector<uint8_t> row(d.Width * 4);
         for (uint32_t y = 0; y < d.Height; y++) {
             const uint8_t* s = (const uint8_t*)ms.pData + y * ms.RowPitch;
-            for (uint32_t x = 0; x < d.Width; x++) { row[x * 4] = s[x * 4 + 2]; row[x * 4 + 1] = s[x * 4 + 1]; row[x * 4 + 2] = s[x * 4]; row[x * 4 + 3] = 255; }
+            for (uint32_t x = 0; x < d.Width; x++) { uint8_t r, g, b; back_px(s + x * 4, d.Format, r, g, b); row[x * 4] = b; row[x * 4 + 1] = g; row[x * 4 + 2] = r; row[x * 4 + 3] = 255; }
             fwrite(row.data(), 1, row.size(), f);
         }
         fclose(f);
@@ -3685,11 +3697,10 @@ static void take_screenshot_if_wanted() {
     ComPtr<ID3D11Texture2D> st; if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &st))) return;
     g_ctx->CopyResource(st.Get(), g_backTex.Get());
     D3D11_MAPPED_SUBRESOURCE ms; if (FAILED(g_ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &ms))) return;
-    const bool bgra = d.Format == DXGI_FORMAT_B8G8R8A8_UNORM || d.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
     auto px = std::make_shared<std::vector<uint8_t>>((size_t)d.Width * d.Height * 4);
     for (uint32_t y = 0; y < d.Height; y++) {
         const uint8_t* s = (const uint8_t*)ms.pData + (size_t)y * ms.RowPitch; uint8_t* o = px->data() + (size_t)y * d.Width * 4;
-        for (uint32_t x = 0; x < d.Width; x++) { o[x * 4] = bgra ? s[x * 4] : s[x * 4 + 2]; o[x * 4 + 1] = s[x * 4 + 1]; o[x * 4 + 2] = bgra ? s[x * 4 + 2] : s[x * 4]; o[x * 4 + 3] = 255; }
+        for (uint32_t x = 0; x < d.Width; x++) { uint8_t r, g, b; back_px(s + x * 4, d.Format, r, g, b); o[x * 4] = b; o[x * 4 + 1] = g; o[x * 4 + 2] = r; o[x * 4 + 3] = 255; }
     }
     g_ctx->Unmap(st.Get(), 0);
     SYSTEMTIME t; GetLocalTime(&t);
@@ -3817,7 +3828,7 @@ static void update_display() {
         }
         if (want == kExclusive) {
             static const int kOutH = getenv("ASURA_OUTRES") ? atoi(getenv("ASURA_OUTRES")) : 0;
-            if (kOutH >= 360 && kOutH <= 4320) { DXGI_MODE_DESC md{}; md.Width = (UINT)((kOutH * 16 + 4) / 9); md.Height = (UINT)kOutH; md.Format = DXGI_FORMAT_R8G8B8A8_UNORM; g_swap->ResizeTarget(&md); }
+            if (kOutH >= 360 && kOutH <= 4320) { DXGI_MODE_DESC md{}; md.Width = (UINT)((kOutH * 16 + 4) / 9); md.Height = (UINT)kOutH; md.Format = g_backFmt; g_swap->ResizeTarget(&md); }
             HRESULT hr = g_swap->SetFullscreenState(TRUE, nullptr);
             if (FAILED(hr)) { fprintf(stderr, "[display] exclusive fullscreen failed: %08lX\n", hr); g_modeWanted = want = kWindowed; }
         }
