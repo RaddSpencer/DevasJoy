@@ -1113,6 +1113,9 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
     if (const char* dd = getenv("ASURA_SHADERDUMP")) {
         std::string p = std::string(dd) + S("\\%s_%016llX.hlsl", isVs ? "vs" : "ps", (unsigned long long)h);
         if (FILE* f = fopen(p.c_str(), "wb")) { fwrite(src.data(), 1, src.size(), f); fclose(f); }
+        // the microcode too, as text (one dword per line), to check a translation against the original
+        std::string m = std::string(dd) + S("\\%s_%016llX.ucode.txt", isVs ? "vs" : "ps", (unsigned long long)h);
+        if (FILE* f = fopen(m.c_str(), "wb")) { for (uint32_t w : code) fprintf(f, "%08X\n", w); fclose(f); }
     }
     for (auto& kv : T.texs) sh->tex.push_back(kv.second);
     for (auto& kv : T.vfs) sh->vf.push_back({ kv.first, kv.second });
@@ -1474,7 +1477,7 @@ static void write_bmp(const std::string& path, const std::vector<uint8_t>& rgba,
             const uint8_t* s = &rgba[((size_t)y * w + x) * 4];
             uint8_t* d = &row[x * 4];
             if (alphaOnly) d[0] = d[1] = d[2] = s[3]; else { d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; }
-            d[3] = 255;
+            d[3] = alphaOnly ? 255 : s[3];   // colour dumps keep their alpha (tools\bmp2png.py --alpha makes a transparent PNG)
         }
         fwrite(row.data(), 1, row.size(), f);
     }

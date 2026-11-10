@@ -89,6 +89,26 @@ Fixed on the way:
 - XAPI's heap: `MEM_RESERVE` must not commit, `NtQueryVirtualMemory` must report the run of pages in one state (not the whole allocation), and commits in a 64K-page range cover whole 64K pages. Each was an intermittent heap crash on a worker thread.
 - WAIT_REG_MEM on memory now waits (up to 3 s), EVENT_WRITE_EXT is packet 0x5A with full-screen extents, and occlusion queries are answered by the renderer, as in BCR2.
 
+### Input (2026-11-09)
+
+The pad works (XInput slot 0 is user 0). The main menu had stopped responding because the game opens a system message box ("saved data does not exist") and then ignores input until it hears the system UI close: every XamShow*UI now sends XN_SYS_UI 1 then 0 to the listeners. After that: the save is created (`saves\SAVEDATA.DAT`), all five DLC packs mount (DLC0-DLC4) and the Episode Menu works. Seen: a checkered garbage band along the top of the Episode Menu (a rendering bug, not yet looked at).
+
+### Testing aids and saves (2026-11-09)
+
+- `ASURA_SKIPINTRO`: the autosave notice and the four logo movies are served as one-frame copies made from the originals (`cache\intro\`, built by the host on first use; `tools\bink1frame.py` does the same by hand). A missing or empty movie is a fatal "I/O failure" in this game, so they must stay valid Bink files.
+- The user's completed save: `C:\dev\asura\SAVEDATA.DAT` is a console `CON` package; its one file (`SAVEDATA.DAT`, 50,193 bytes) is installed as `saves\SAVEDATA.DAT\SAVEDATA.DAT` and the game accepts it (the Episode Menu opens on Part IV, Episode 19). The game's own fresh save is kept in `saves_backup\`.
+
+### Episode Menu ring (open)
+
+The user reports the portrait ring "revolving around a fixed point instead of rotating around the portrait"; captures show the ring and the portrait apart, with a white disc where the portrait should be. Ruled out so far (frame dumps at the Episode Menu, `ASURA_DRAWPRINTFULL=4213EBD96F9DECE3`): the Scaleform vertex shader translation (its odd swizzles compose to a plain 2D transform), the vertex position decoding (16_16, high half is x), and the matrices themselves (axis-aligned scales with 16:9 aspect; the rotated element is a proper rotation about its own origin). So the placement comes from the game's CPU-side UI logic. Also ruled out: vertex shader ABC6D461 (a real constant-output shader, its draws are empty on hardware too), `mfocrf` (XenonRecomp hard-codes cr6, but this game only uses cr6), the unaligned vector loads (`lvlx`/`lvrx`, standard Unleashed versions), the offscreen passes (the 328x184 resolves come out black but don't move anything).
+
+Reference (user's Xenia shots): the ring, the petal frame and the portrait share one centre at about (1100, 360), and five episode rows with thumbnails show. Here, on the episode detail screen (frame dump, `logs\run38.log`): ring pieces at (1079.5, 371.5) except one piece exactly (-128, -128) px off, the two big petal-frame shapes (2298 and 1146 vertices) at (1172, 72) and (1173, 4), the portrait and a white backing disc elsewhere. A clean 128 px offset on some clips points at wrong data in some display-list matrices (CPU side), not at the renderer. Next: find the Scaleform code that composes a clip's world matrix and watch the -128 clip's matrix being written (hardware watchpoint on its guest address), then check the instructions on that path, starting with the vector ones this project or BCR2 added to XenonRecomp (vpkd3d float16_2, vctuxs, vpkuwus/vpkuhus, ...). Also seen: a checkered band along the top of the Episode Menu, and only the selected episode row drawn.
+
+### Wanted later (from the user, 2026-11-09)
+
+- 60 fps play, and a 24 fps mode for FreeSync/G-Sync displays, if the game's timing allows it.
+- Watch mode: quick-time events and button prompts complete themselves, and the on-screen display is hidden, to watch the game as a film.
+
 ### Next
 
 1. Input past the title screen (XInput works; keyboard and mouse are BCR2's kbm.cpp, not ported), then play into the first episode and look for rendering bugs.

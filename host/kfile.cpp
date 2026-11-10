@@ -156,6 +156,45 @@ static bool host_path_of(const std::string& p, std::string& out, bool& writable)
 // disposition: 0 supersede, 1 open, 2 create, 3 open_if, 4 overwrite, 5 overwrite_if
 static void open_file(PPCContext& ctx, uint32_t outH, uint32_t access, uint32_t oa, uint32_t iosb, uint32_t disposition, uint32_t options) {
     std::string name = oa_path(oa), path; bool writable = false;
+    // ASURA_SKIPINTRO: the start-up movies (autosave notice and the four logos) open as an empty file, for faster test runs
+    // (a missing movie is a fatal I/O error in this game; an empty one is skipped)
+    static const bool kSkipIntro = getenv("ASURA_SKIPINTRO") != nullptr;
+    bool skipped = false;
+    if (kSkipIntro) {
+        const std::string low = lower(name);
+        for (const char* m : { "00_autosave_xenon.bik", "40_capcomlogo.bik", "40_cc2logo.bik", "20_ue3logo.bik", "20_speedtreelogo.bik" })
+            if (low.size() >= strlen(m) && low.compare(low.size() - strlen(m), std::string::npos, m) == 0) skipped = true;
+    }
+    if (skipped) {   // serve cache\intro\<movie>: the original's header and first frame only (as tools\bink1frame.py makes them)
+        std::string src; bool w = false;
+        if (resolve_game_path(name, src, w)) {
+            const std::string dir = data_root() + "\\cache\\intro", dst = dir + src.substr(src.find_last_of('\\'));
+            if (GetFileAttributesA(dst.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                CreateDirectoryA((data_root() + "\\cache").c_str(), nullptr);
+                CreateDirectoryA(dir.c_str(), nullptr);
+                std::vector<uint8_t> d;
+                if (FILE* f = fopen(src.c_str(), "rb")) { fseek(f, 0, SEEK_END); d.resize(ftell(f)); fseek(f, 0, SEEK_SET); fread(d.data(), 1, d.size(), f); fclose(f); }
+                auto u32 = [&](size_t o) { uint32_t v; memcpy(&v, &d[o], 4); return v; };
+                if (d.size() > 64 && !memcmp(d.data(), "BIK", 3)) {
+                    const size_t table = 44 + u32(40) * 12;
+                    const uint32_t off0 = u32(table), off1 = u32(table + 4), n = (off1 & ~1u) - (off0 & ~1u);
+                    std::vector<uint8_t> o(d.begin(), d.begin() + table);
+                    const uint32_t nt = (uint32_t)table + 8, one = 1, total = nt + n;
+                    memcpy(&o[8], &one, 4); memcpy(&o[12], &n, 4); memcpy(&o[16], &one, 4);
+                    const uint32_t t0 = nt | (off0 & 1), t1 = total, sz = total - 8;
+                    o.insert(o.end(), (const uint8_t*)&t0, (const uint8_t*)&t0 + 4);
+                    o.insert(o.end(), (const uint8_t*)&t1, (const uint8_t*)&t1 + 4);
+                    o.insert(o.end(), d.begin() + (off0 & ~1u), d.begin() + (off0 & ~1u) + n);
+                    memcpy(&o[4], &sz, 4);
+                    if (FILE* f = fopen(dst.c_str(), "wb")) { fwrite(o.data(), 1, o.size(), f); fclose(f); }
+                }
+            }
+            if (GetFileAttributesA(dst.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                LOG("[file] '%s' replaced by its first frame (ASURA_SKIPINTRO)\n", name.c_str());
+                name = "@" + dst;
+            }
+        }
+    }
     if (!host_path_of(name, path, writable)) {
         LOG("[file] '%s' -> not mapped\n", name.c_str());
         set_iosb(iosb, STATUS_OBJECT_PATH_NOT_FOUND, 0); ctx.r3.u64 = STATUS_OBJECT_PATH_NOT_FOUND; return;

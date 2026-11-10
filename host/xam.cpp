@@ -308,10 +308,12 @@ static void XamContentGetDeviceData_(PPCContext& ctx, uint8_t*) {
     ctx.r3.u64 = 0;
 }
 static void XamContentGetLicenseMask_(PPCContext& ctx, uint8_t*) { if (ctx.r3.u32) wr32(ctx.r3.u32, 0xFFFFFFFF); ctx.r3.u64 = finish(ctx.r4.u32, 0); }
+static void notify_system_ui();
 // XamShowDeviceSelectorUI(user, type, flags, bytes, device*, overlapped*): picks the hard drive
 static void XamShowDeviceSelectorUI_(PPCContext& ctx, uint8_t*) {
     if (ctx.r7.u32) wr32(ctx.r7.u32, kDevice);
     ctx.r3.u64 = finish(ctx.r8.u32, 0);
+    notify_system_ui();
 }
 
 // ======================================================================== notifications
@@ -350,18 +352,32 @@ static void XNotifyGetNext_(PPCContext& ctx, uint8_t*) {
     }
     ctx.r3.u64 = 0;
 }
+// Every system dialog the game opens is answered at once, but the game still has to hear that the system UI opened and closed:
+// UE3 ignores pad input while it believes the guide or a system dialog is up (XN_SYS_UI 1 ... 0). Without this the main menu
+// stopped responding after the "saved data does not exist" message box.
+static void notify_system_ui() {
+    std::lock_guard<std::mutex> g(g_ntLock);
+    for (auto& [h, l] : g_listeners) {
+        if (!(l.mask & 1)) continue;
+        l.q.push_back({ 0x00000009, 1 });
+        l.q.push_back({ 0x00000009, 0 });
+        wr32(l.obj + 4, 1);
+    }
+    ob_signal_changed();
+}
 
 // ======================================================================== system UI
 static void XamShowMessageBoxUI_(PPCContext& ctx, uint8_t*) {
-    // (user, title, text, button_count, buttons*, focus, flags, result*, overlapped* [stack])
+    // (user, title, text, button_count, buttons*, focus, flags, result*, overlapped* [stack]): the first button is chosen
     std::string text; for (uint32_t p = ctx.r5.u32; p && rd16(p); p += 2) text += (char)rd16(p);
     fprintf(stderr, "[ui] message box: %s\n", text.c_str());
     if (ctx.r10.u32) wr32(ctx.r10.u32, 0);
     ctx.r3.u64 = finish(rd32(ctx.r1.u32 + 0x54), 0);
+    notify_system_ui();
 }
 static void XamShowMessageBoxUIEx_(PPCContext& ctx, uint8_t* b) { XamShowMessageBoxUI_(ctx, b); }
-static void XamShowKeyboardUI_(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = finish(rd32(ctx.r1.u32 + 0x54), 1223); }   // ERROR_CANCELLED
-static void XamShowSigninUI_(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = 0; }
+static void XamShowKeyboardUI_(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = finish(rd32(ctx.r1.u32 + 0x54), 1223); notify_system_ui(); }   // ERROR_CANCELLED
+static void XamShowSigninUI_(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = 0; notify_system_ui(); }
 static void XamShowDirtyDiscErrorUI_(PPCContext& ctx, uint8_t*) {
     fprintf(stderr, "[ui] dirty disc error (a game file could not be read) lr=%08X\n", (uint32_t)ctx.lr); fflush(stderr);
     TerminateProcess(GetCurrentProcess(), 6);
