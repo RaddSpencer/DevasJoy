@@ -11,6 +11,7 @@ iso_list.txt
 
 # build output
 host/build/
+host/build_prof/
 recomp_check/build/
 *.obj
 *.exe

@@ -1684,14 +1684,14 @@ static void write_bmp(const std::string& path, const std::vector<uint8_t>& rgba,
 static void dump_texture_bmp(const char* dir, uint32_t base, uint32_t fmt, uint32_t w, uint32_t h, const TexFmt& tf, const uint8_t* data) {
     static std::unordered_map<uint32_t, uint64_t> last;
     static int count = 0;
-    if (w < 64 && h < 64) return;
+    if (w < 8 && h < 8) return;
     uint64_t hs = fnv64(data, (size_t)w * h / (tf.conv ? 1 : (tf.block * tf.block)) * (tf.conv ? 4 : tf.bpb));
     auto it = last.find(base);
     if (it != last.end() && it->second == hs) return;
     last[base] = hs;
     const bool decodable = tf.conv || tf.dxgi == DXGI_FORMAT_R8G8B8A8_UNORM || tf.dxgi == DXGI_FORMAT_BC1_UNORM || tf.dxgi == DXGI_FORMAT_BC2_UNORM || tf.dxgi == DXGI_FORMAT_BC3_UNORM;
     if (!decodable) return;                                                 // (movie planes, 8-bit: would use up the count)
-    if (count++ >= 2000) return;
+    if (count++ >= 8000) return;
     std::vector<uint8_t> rgba((size_t)w * h * 4, 0);
     if (tf.conv || tf.dxgi == DXGI_FORMAT_R8G8B8A8_UNORM) memcpy(rgba.data(), data, rgba.size());
     else if (tf.dxgi == DXGI_FORMAT_BC1_UNORM || tf.dxgi == DXGI_FORMAT_BC2_UNORM || tf.dxgi == DXGI_FORMAT_BC3_UNORM) {
@@ -1844,6 +1844,11 @@ static HostTex* get_texture(const FetchInfo& fi) {
         uint32_t lw = log2_ceil(fi.w), lh = log2_ceil(fi.h), lmin = std::min(lw, lh);
         if (lmin <= 4) { if (lw > lh) offY = 16; else offX = 16; offX /= tf.block; offY /= tf.block; }
     }
+    // Tiled textures whose fetch pitch is at least twice their width hold the image at (width, height) inside the tile: a 64x32
+    // DXT1 with pitch 128 sits at texel 64,32 (found from the raw tiles; the game's loader writes the cooked tile as is). Without
+    // this they decode as scrambled squares (explosion sprites, Gohma swarms). Empirical rule; ASURA_NOSUBRECT turns it off.
+    static const bool kSubRect = getenv("ASURA_NOSUBRECT") == nullptr;
+    if (kSubRect && fi.tiled && fi.pitch >= 2 * fi.w && !offX && !offY) { offX = fi.w / tf.block; offY = fi.h / tf.block; }
     uint64_t key = fnv64(&fi, sizeof(fi));
     auto& slot = g_texCache[key];
     if (!slot) slot = new HostTex();
@@ -1952,6 +1957,18 @@ static HostTex* get_texture(const FetchInfo& fi) {
                 }
             }
             g_ctx->UpdateSubresource(ht->tex.Get(), D3D11CalcSubresource(l, f, levels), nullptr, lvl.data(), hbw * outBpb, hbw * hbh * outBpb);
+            static const char* kDumpMips = getenv("ASURA_TEXDUMPMIPS");      // dir: every mip level too (files <base + level>_f<fmt>_<w>x<h>)
+            if (kDumpMips && f == 0 && hbw * tf.block >= 8) {
+                if (l == 1) {
+                    fprintf(stderr, "[mipdump] base=%08X %ux%u fmt=%u mipBase=%08X (base + %X; base level %X bytes) levels=%u packedLevel=%u tiled=%d\n",
+                            fi.base, fi.w, fi.h, fi.fmt, fi.mipBase, fi.mipBase - fi.base, total, maxLevel, packedLevel, (int)fi.tiled);
+                    if (fi.w == 2 * fi.h && fi.w <= 256) {                    // the raw tile(s), to work out the layout offline: base level then mips
+                        std::string p = std::string(kDumpMips) + S("\\raw_%08X_f%u_%ux%u.bin", fi.base, fi.fmt, fi.w, fi.h);
+                        if (FILE* rf = fopen(p.c_str(), "wb")) { for (uint32_t o = 0; o < total + mipBytes; o += 4) { uint32_t v = *(const uint32_t*)phys(fi.base + o); fwrite(&v, 4, 1, rf); } fclose(rf); }
+                    }
+                }
+                dump_texture_bmp(kDumpMips, fi.base + l, fi.fmt, hbw * tf.block, hbh * tf.block, tf, lvl.data());
+            }
         }
     }
     return ht;
@@ -2623,6 +2640,10 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
             }
         }
         FetchInfo fi{};
+        {   static const bool kWide = getenv("ASURA_TEXDBGWIDE") != nullptr;   // raw fetch constants of the 2:1 DXT textures that decode scrambled
+            if (kWide && w == 2 * h && w <= 256 && (fmt == 18 || fmt == 20))
+                logf_once(S("tfraw%X", base).c_str(), "fetch %X fmt %u %ux%u dim %u: %08X %08X %08X %08X %08X %08X (shader dim %u)", base, fmt, w, h, dim, tf[0], tf[1], tf[2], tf[3], tf[4], tf[5], u.dim);
+        }
         fi.base = base; fi.fmt = fmt; fi.w = w; fi.h = h; fi.pitch = ((tf[0] >> 22) & 0x1FF) << 5; fi.endian = (tf[1] >> 6) & 3;
         fi.dim = dim; fi.faces = dim == 3 ? 6 : 1; fi.tiled = tf[0] >> 31; fi.packed = (tf[5] >> 11) & 1;
         if (uint32_t mipPage = tf[5] >> 12) {                               // no mip address means the base image is all there is
@@ -2630,6 +2651,15 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
             uint32_t mipMin = std::min((tf[4] >> 2) & 15, sizeMax);
             fi.maxLevel = std::max(std::min((tf[4] >> 6) & 15, sizeMax), mipMin);
             if (fi.maxLevel) fi.mipBase = (mipPage & 0x1FFFF) << 12;
+            {   // which textures sit on pages the GPU side treats as E0 (shifted 0x1000), once per texture
+                bool phys_page_is_e0(uint32_t p);
+                static const bool kE0Log = getenv("ASURA_TEXE0LOG") != nullptr;
+                if (kE0Log && (phys_page_is_e0(base) || (fi.maxLevel && phys_page_is_e0(fi.mipBase))))
+                    logf_once(S("texe0%X", base).c_str(), "texture %X %ux%u fmt %u on E0-marked pages (base %d, mips %d at %X)", base, w, h, fmt,
+                              (int)phys_page_is_e0(base), fi.maxLevel ? (int)phys_page_is_e0(fi.mipBase) : -1, fi.mipBase);
+            }
+            static const long kMipShift = getenv("ASURA_MIPSHIFT") ? strtol(getenv("ASURA_MIPSHIFT"), nullptr, 0) : 0;   // experiment: move the mip address
+            if (fi.maxLevel && kMipShift) fi.mipBase = (uint32_t)((long)fi.mipBase + kMipShift);
         }
         if (dim == 2) { logf_once("tex3d", "3D texture not implemented"); return; }
         if ((u.dim == 3) != (dim == 3)) { logf_once("texdim", "texture dimension mismatch shader=%u fetch=%u", u.dim, dim); return; }
@@ -3546,7 +3576,11 @@ void hw_watch_set(uint32_t phys);
 void hw_watch_reads(const uint32_t* a, int n);
 uint64_t gpu_frame_number() { return g_frame; }
 
+void funcprof_frame(uint64_t frame);   // funcprof.cpp (profiling build only)
+void physwatch_tick();                  // hooks.cpp (ASURA_PHYSWATCH)
 static void do_swap(uint32_t front) {
+    funcprof_frame(g_frame);
+    physwatch_tick();
     LARGE_INTEGER swapStart; QueryPerformanceCounter(&swapStart);
     if (g_drawsLeftOut) {
         fprintf(stderr, "[shader] frame=%llu left out %llu draws waiting on a compile, waited %.1f ms\n", (unsigned long long)g_frame, (unsigned long long)g_drawsLeftOut, g_compileWaitMs);
@@ -3828,6 +3862,7 @@ void gpu_packet(uint8_t* base, uint32_t op, const uint32_t* b, uint32_t cnt) {
         if (g_trace > 0) fprintf(stderr, "[zpd] f=%llu at %08X before: %08X %08X %08X %08X %08X %08X %08X %08X%s\n", (unsigned long long)g_frame, addr,
                                  c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], (endZPass || endZFail) ? " end" : "");
         memset(c, 0, 32);
+
         if (endZPass || endZFail) { c[4] = 1000; c[0] = 1000; }
         static int nl = 0;
         if (nl++ < 4) fprintf(stderr, "[gfx] occlusion query report at %08X finished=%d\n", addr, (int)(endZPass || endZFail));

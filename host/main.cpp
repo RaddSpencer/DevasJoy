@@ -121,6 +121,39 @@ static std::vector<char> read_file(const std::string& p) {
 }
 
 int main(int argc, char** argv) {
+    if (argc >= 7 && !strcmp(argv[1], "--decode-dxt1")) {                     // --decode-dxt1 <raw file> <w> <h> <pitch texels> <tiled 0/1> [out.bmp]: big-endian 8in16 DXT1, as the console stores it
+        std::ifstream f(argv[2], std::ios::binary); std::vector<uint8_t> raw((std::istreambuf_iterator<char>(f)), {});
+        const uint32_t w = atoi(argv[3]), h = atoi(argv[4]), pitch = atoi(argv[5]); const bool tiled = atoi(argv[6]) != 0;
+        const uint32_t bw = w / 4, bh = h / 4, pb = std::max(pitch / 4, bw), pa = (pb + 31) & ~31u;
+        auto tiled2d = [](uint32_t x, uint32_t y, uint32_t pitchAligned, uint32_t l2) {
+            uint32_t outer = (((y >> 5) * (pitchAligned >> 5)) + (x >> 5)) << 6, inner = (((y >> 1) & 7) << 3) | (x & 7), oib = (outer | inner) << l2;
+            uint32_t bank = (y >> 4) & 1, pipe = ((x >> 3) & 3) ^ (((y >> 3) & 1) << 1), ylsb = y & 1;
+            return (ylsb << 4) | (pipe << 6) | (bank << 11) | (oib & 0xF) | (((oib >> 4) & 1) << 5) | (((oib >> 5) & 7) << 8) | ((oib >> 8) << 12); };
+        std::vector<uint8_t> px((size_t)w * h * 3, 0);
+        for (uint32_t by = 0; by < bh; by++) for (uint32_t bx = 0; bx < bw; bx++) {
+            const uint32_t a = tiled ? tiled2d(bx, by, pa, 3) : (by * pb + bx) * 8;
+            if (a + 8 > raw.size()) continue;
+            uint8_t b[8]; for (int k = 0; k < 8; k += 2) { b[k] = raw[a + k + 1]; b[k + 1] = raw[a + k]; }   // 8-in-16 swap
+            const uint16_t c0 = b[0] | b[1] << 8, c1 = b[2] | b[3] << 8;
+            uint8_t c[4][3];
+            auto ex = [](uint16_t v, uint8_t* o) { o[0] = ((v >> 11) & 31) * 255 / 31; o[1] = ((v >> 5) & 63) * 255 / 63; o[2] = (v & 31) * 255 / 31; };
+            ex(c0, c[0]); ex(c1, c[1]);
+            for (int k = 0; k < 3; k++) { c[2][k] = c0 > c1 ? (2 * c[0][k] + c[1][k]) / 3 : (c[0][k] + c[1][k]) / 2; c[3][k] = c0 > c1 ? (c[0][k] + 2 * c[1][k]) / 3 : 0; }
+            const uint32_t bits = b[4] | b[5] << 8 | b[6] << 16 | (uint32_t)b[7] << 24;
+            for (int i = 0; i < 16; i++) { const uint8_t* cc = c[(bits >> (2 * i)) & 3]; uint8_t* d = &px[((size_t)(by * 4 + i / 4) * w + bx * 4 + (i & 3)) * 3]; d[0] = cc[2]; d[1] = cc[1]; d[2] = cc[0]; }
+        }
+        const std::string out = argc >= 8 ? argv[7] : std::string(argv[2]) + ".bmp";
+        if (FILE* o = fopen(out.c_str(), "wb")) {
+            const uint32_t rowB = (w * 3 + 3) & ~3u, img = rowB * h; uint8_t hd[54] = { 'B', 'M' };
+            auto p32 = [&](int at, uint32_t v) { memcpy(hd + at, &v, 4); };
+            p32(2, 54 + img); p32(10, 54); p32(14, 40); p32(18, w); p32(22, (uint32_t)(-(int32_t)h)); hd[26] = 1; hd[28] = 24; p32(34, img);
+            fwrite(hd, 1, 54, o); std::vector<uint8_t> row(rowB, 0);
+            for (uint32_t y = 0; y < h; y++) { memcpy(row.data(), &px[(size_t)y * w * 3], w * 3); fwrite(row.data(), 1, rowB, o); }
+            fclose(o);
+        }
+        printf("wrote %s\n", out.c_str());
+        return 0;
+    }
     if (argc >= 5 && !strcmp(argv[1], "--probe-lzx")) {                       // --probe-lzx <package> <start> <length> (hex): where LZX streams start, and recorded shaders in them
         std::vector<uint8_t> d;
         if (!ue3_unpack_file(argv[2], d)) { std::ifstream f(argv[2], std::ios::binary); d.assign(std::istreambuf_iterator<char>(f), {}); }

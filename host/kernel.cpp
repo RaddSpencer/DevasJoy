@@ -232,6 +232,7 @@ uint32_t phys_alloc(uint32_t size, uint32_t align) {   // kernel side: the 64K-p
 // at the same section offset (views must be 64K aligned), so each E0 block gets one spare page at its end and this table marks the
 // physical pages that belong to E0 blocks: the GPU side translates those 0x1000 lower.
 static uint8_t g_e0Page[0x20000];
+bool phys_page_is_e0(uint32_t p) { return g_e0Page[(p & 0x1FFFFFFFu) >> 12] != 0; }
 uint32_t gpu_phys_to_host(uint32_t p) {
     p &= 0x1FFFFFFFu;
     return g_e0Page[p >> 12] ? 0xE0000000u + p - 0x1000u : 0xA0000000u + p;
@@ -248,6 +249,9 @@ static void MmAllocatePhysicalMemoryEx_(PPCContext& ctx, uint8_t*) {
     uint32_t off = phys_place(sz + (window == 0xE0000000u ? 0x1000 : 0), std::max(align, page));
     uint32_t a = off == 0xFFFFFFFFu ? 0 : window | off;
     if (a && window == 0xE0000000u) mark_e0(off, sz, 1);
+    // An A0/C0 block owns its pages outright: clear any E0 marks left there by an earlier block (a stale mark shifted every GPU
+    // read of the texture pool by 0x1000, so 64x32 textures and many mip chains came out scrambled or black).
+    if (a && window != 0xE0000000u) for (uint32_t pg = off >> 12, end = (off + sz) >> 12; pg < end && pg < 0x20000; pg++) g_e0Page[pg] = 0;
     if (!a) fprintf(stderr, "[mem] physical memory full (%X wanted)\n", size);
     LOG("[mem] MmAllocatePhysicalMemoryEx %X align=%X prot=%X -> %08X lr=%08X\n", size, align, prot, a, (uint32_t)ctx.lr);
     ctx.r3.u64 = a;

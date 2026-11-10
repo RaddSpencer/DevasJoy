@@ -77,6 +77,8 @@ static bool cond(uint32_t func, uint32_t value, uint32_t ref) {
 }
 
 static void execute(const uint32_t* p, uint32_t n, int depth);
+static uint32_t g_predSkipped = 0;                 // draws skipped by bin predication since the last swap (ASURA_PREDLOG)
+static uint64_t g_predLastSel = 0, g_predLastMask = 0;
 static void exec_indirect(uint32_t addr, uint32_t dwords, int depth) {
     if (depth > 4 || dwords > 0x400000) return;
     std::vector<uint32_t> v(dwords);
@@ -131,6 +133,11 @@ static void type3(uint32_t op, const uint32_t* d, uint32_t cnt, int depth) {
       case 0x64: {                                // XE_SWAP (written by VdSwap): 'SWAP', front buffer
         uint64_t n = ++g_gpu.swaps;
         if (n <= 3 || n % 600 == 0) LOG("[gpu] swap #%llu front=%08X\n", (unsigned long long)n, cnt > 1 ? d[1] : 0);
+        if (g_predSkipped) {
+            fprintf(stderr, "[pred] swap %llu: %u draws predicated out (last select %016llX mask %016llX)\n", (unsigned long long)n, g_predSkipped,
+                    (unsigned long long)g_predLastSel, (unsigned long long)g_predLastMask);
+            g_predSkipped = 0;
+        }
         break; }
       default: break;
     }
@@ -159,6 +166,10 @@ static void execute(const uint32_t* p, uint32_t n, int depth) {
             }
             g_opCount[op]++;
             if (!(h & 1) || (g_gpu.binSelect & g_gpu.binMask)) type3(op, p + i + 1, c, depth);
+            else if (op == 0x22 || op == 0x36) {                          // a draw predicated out: counted per frame (ASURA_PREDLOG)
+                static const bool kLog = getenv("ASURA_PREDLOG") != nullptr;
+                if (kLog) { g_predSkipped++; g_predLastSel = g_gpu.binSelect; g_predLastMask = g_gpu.binMask; }
+            }
             i += 1 + c;
         }
     }
