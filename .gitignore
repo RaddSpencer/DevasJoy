@@ -1,0 +1,25 @@
+# the user's game files and everything unpacked or derived from them
+gamefiles/
+game/
+private/
+ppc/
+iso_list.txt
+*.xex
+*.xexp
+*.bin
+*.iso
+
+# build output
+host/build/
+recomp_check/build/
+*.obj
+*.exe
+*.map
+*.pdb
+
+# logs, saves and run output
+logs/
+saves/
+cache/
+*.log
+build_log*.txt

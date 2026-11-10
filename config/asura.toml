@@ -1,0 +1,30 @@
+# XenonRecomp config for Asura's Wrath (title 43430817), TU applied
+[main]
+file_path = "../private/default.xex"
+patch_file_path = "../private/default.xexp"
+patched_file_path = "../private/default_patched.xex"
+out_directory_path = "../ppc"
+switch_table_file_path = "switch_tables.toml"
+
+# found by tools/findhelpers.py in the patched image
+savegprlr_14_address = 0x82B58EE0
+restgprlr_14_address = 0x82B58F30
+savefpr_14_address   = 0x82B597A0
+restfpr_14_address   = 0x82B597EC
+savevmx_14_address   = 0x82B598A0
+restvmx_14_address   = 0x82B59B38
+savevmx_64_address   = 0x82B59934
+restvmx_64_address   = 0x82B59BCC
+
+# Skip the zero-word padding between functions
+invalid_instructions = [
+    { data = 0x00000000, size = 4 },
+    # SEH header in front of __try functions: handler 0x82E3C8C4 + scope table pointer
+    { data = 0x82E3C8C4, size = 8 },
+]
+
+# Whole-function overrides. XenonRecomp's analyzer ends a function at its first conditional return when the code after it is only
+# reached by falling through: memset (1350 callers) lost its last two byte stores, as in BCR2. Found by tools/trunc.py.
+functions = [
+    { address = 0x82B594C0, size = 0xA0 },   # memset
+]
