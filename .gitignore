@@ -26,3 +26,4 @@ build_log*.txt
 saves_backup/
 SAVEDATA.DAT
 asura_logo*.png
+thirdparty/

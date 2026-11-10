@@ -104,6 +104,16 @@ The user reports the portrait ring "revolving around a fixed point instead of ro
 
 Reference (user's Xenia shots): the ring, the petal frame and the portrait share one centre at about (1100, 360), and five episode rows with thumbnails show. Here, on the episode detail screen (frame dump, `logs\run38.log`): ring pieces at (1079.5, 371.5) except one piece exactly (-128, -128) px off, the two big petal-frame shapes (2298 and 1146 vertices) at (1172, 72) and (1173, 4), the portrait and a white backing disc elsewhere. A clean 128 px offset on some clips points at wrong data in some display-list matrices (CPU side), not at the renderer. Next: find the Scaleform code that composes a clip's world matrix and watch the -128 clip's matrix being written (hardware watchpoint on its guest address), then check the instructions on that path, starting with the vector ones this project or BCR2 added to XenonRecomp (vpkd3d float16_2, vctuxs, vpkuwus/vpkuhus, ...). Also seen: a checkered band along the top of the Episode Menu, and only the selected episode row drawn.
 
+### Sound (2026-11-09)
+
+Working, confirmed by ear by the user: title music (speed, pitch) and menu sound effects. `audio_out.cpp` is BCR2's WASAPI output (48 kHz stereo, 5.1 folded down, the device's buffer paces the game's audio callback). `xma.cpp` emulates the XMA decoder with FFmpeg's XMA2 decoder (`thirdparty\ffmpeg`: BtbN ffmpeg-n8.1-latest-win64-lgpl-shared-8.1, 80,304,622 bytes, SHA-256 7f2cd74c2805437d7f07739fdd7bea7c9d851ee2dba9503fc8e7d60c24a57447; out of git, DLLs copied next to the exe by the build).
+
+Things that mattered:
+- XMA registers are little-endian (the game uses lwbrx/stwbrx). 0x600 is the context array's physical address, read once at start-up, so it's set before the game boots. Kick 0x650-0x659, lock 0x690-0x699, clear 0x6A0-0x6A9, one bit per context; XAudio2 locks and kicks each stream every audio frame.
+- Register writes are events, so the register page (0x7FEA1000) is read-only and writes are trapped (fault, single step, apply). Lock order: the trap critical section, then the context lock. The worker must never write the page itself while it is protected (it did, and aborted the process).
+- Context fields follow Xenia's XMA_CONTEXT_DATA; context updates are compare-and-swap on the big-endian words.
+- Not done: Bink movie audio (none heard yet), gameplay voice and music not yet checked, `ASURA_NOXMA` turns the decoder off.
+
 ### Wanted later (from the user, 2026-11-09)
 
 - 60 fps play, and a 24 fps mode for FreeSync/G-Sync displays, if the game's timing allows it.

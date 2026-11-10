@@ -22,6 +22,7 @@ void register_file_imports();
 void register_string_imports();
 void gpu_init_mmio();
 void monitor_start();
+void register_xma_imports();
 
 void guest_fp_init(PPCContext& ctx) { ctx.fpscr.loadFromHost(); }
 
@@ -189,6 +190,7 @@ int main(int argc, char** argv) {
     register_xam_imports();
     register_gpu_imports();
     register_audio_imports();
+    register_xma_imports();
     kernel_init_variables();
     monitor_start();
     LOG("[main] data root %s, %zu import records\n", root.c_str(), ni);

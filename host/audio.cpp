@@ -1,10 +1,12 @@
-// Audio, first stage: the XAudio render driver calls the game's client every 5.33 ms (256 samples at 48 kHz) and discards the
-// output, which keeps the audio engine's threads moving. XMA contexts are allocated but not decoded yet (UE3 plays XMA).
-// The WASAPI output from the BCR2 host (host/audio.cpp there) replaces the discard later.
+// Audio: the XAudio render driver. The game's client is called whenever the output device has room for another 256-sample frame
+// (48 kHz, so about every 5.33 ms; with no device, on a 5.33 ms clock), and the frame it submits goes to WASAPI (audio_out.cpp,
+// from BCR2). XMA decoding is in xma.cpp.
 #include "kernel.h"
+#include "audio_out.h"
 #include <windows.h>
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <thread>
 
 void guest_fp_init(PPCContext& ctx);
@@ -14,13 +16,16 @@ static std::atomic<uint64_t> g_frames{0};
 static void audio_thread() {
     GuestHostThread t = make_host_guest_thread("audio");
     const uint32_t argWord = vm_alloc(0x1000);
+    const auto kFrame = std::chrono::microseconds(5333);
     auto next = std::chrono::steady_clock::now();
     for (;;) {
         uint32_t cb = g_cb.load();
         if (!cb) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); next = std::chrono::steady_clock::now(); continue; }
-        next += std::chrono::microseconds(5333);
-        std::this_thread::sleep_until(next);
-        if (std::chrono::steady_clock::now() > next + std::chrono::milliseconds(100)) next = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const int room = audio_out_room();               // frames the device wants now; -1 without a device (keep our own clock)
+        if (room == 0 || (room < 0 && now < next)) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+        next += kFrame;
+        if (next < now - std::chrono::milliseconds(100)) next = now;   // no catching up after a long stall
         PPCContext c{}; guest_fp_init(c);
         bind_guest_thread(c, t);
         wr32(argWord, g_arg.load());
@@ -43,19 +48,11 @@ static void XAudioRegisterRenderDriverClient_(PPCContext& ctx, uint8_t*) {
     ctx.r3.u64 = 0;
 }
 static void XAudioUnregisterRenderDriverClient_(PPCContext& ctx, uint8_t*) { g_cb = 0; ctx.r3.u64 = 0; }
-static void XAudioSubmitRenderDriverFrame_(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = 0; }   // 6 x 256 big-endian floats at r4: discarded
+// XAudioSubmitRenderDriverFrame(driver, samples*): 6 channels x 256 big-endian floats, from inside the client callback on the audio thread
+static void XAudioSubmitRenderDriverFrame_(PPCContext& ctx, uint8_t*) { if (ctx.r4.u32) audio_out_submit(g_base + ctx.r4.u32); ctx.r3.u64 = 0; }
 static void XAudioGetSpeakerConfig_(PPCContext& ctx, uint8_t*) { if (ctx.r3.u32) wr32(ctx.r3.u32, 0x00010001); ctx.r3.u64 = 0; }
 static void XAudioGetVoiceCategoryVolume_(PPCContext& ctx, uint8_t*) { if (ctx.r4.u32) wr32(ctx.r4.u32, 0x3F800000); ctx.r3.u64 = 0; }
 static void XAudioGetDucker_(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = 0; }
-
-// XMA: contexts are 64-byte blocks in physical memory that the game's XAudio2 fills in; the hardware would decode from them.
-static void XMACreateContext_(PPCContext& ctx, uint8_t*) {
-    uint32_t c = phys_alloc(0x40, 0x40);
-    LOG("[xma] context %08X (not decoded)\n", c);
-    if (ctx.r3.u32) wr32(ctx.r3.u32, c);
-    ctx.r3.u64 = c ? 0 : STATUS_NO_MEMORY;
-}
-static void XMAReleaseContext_(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = 0; }
 
 void register_audio_imports() {
     register_import("XAudioRegisterRenderDriverClient", XAudioRegisterRenderDriverClient_);
@@ -66,6 +63,4 @@ void register_audio_imports() {
     for (const char* n : { "XAudioEnableDucker", "XAudioGetDuckerLevel", "XAudioGetDuckerThreshold", "XAudioGetDuckerAttackTime",
                            "XAudioGetDuckerReleaseTime", "XAudioGetDuckerHoldTime" })
         register_import(n, XAudioGetDucker_);
-    register_import("XMACreateContext", XMACreateContext_);
-    register_import("XMAReleaseContext", XMAReleaseContext_);
 }
