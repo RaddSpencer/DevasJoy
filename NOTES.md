@@ -57,13 +57,15 @@ Python is `C:\Users\deuce\AppData\Local\Programs\Python\Python313\python.exe` (r
 | `kernel.cpp` | imports, memory arenas, dispatcher objects and waits, APCs, threads, TLS, time, XEX module calls, thread monitor |
 | `kfile.cpp` / `kstring.cpp` | file system (disc, DLC, saves, symbolic links) / strings and the printf family |
 | `xam.cpp` | input (XInput, `ASURA_AUTOINPUT`), profile, content (saves, DLC), enumerators, notifications, UI stubs, XMsg, net stubs |
-| `gpu.cpp` | null GPU: Vd* calls, ring, PM4 side effects (fences, memory writes, interrupts, swaps), 60 Hz vblank |
+| `gpu.cpp` | command processor: Vd* calls, ring, PM4 interpreter (fences, memory writes, waits, interrupts, swaps), 60 Hz vblank; hands registers and packets to the renderer |
+| `xenos.cpp` | the D3D11 Xenos renderer, copied from BCR2 by `tools\port_renderer.py` (switches renamed `ASURA_*`, guest reads through `gpu_phys_to_host`); keep it close to BCR2's so they can merge |
+| `xenos_glue.cpp`, `gpu.h`, `kbm.h`, `paths.h`, `shaderpack.*` | what the renderer expects from its host (BCR2's settings, keyboard and data paths, stubbed or mapped) |
 | `audio.cpp` | null XAudio driver (client called every 5.33 ms, output discarded), XMA contexts allocated but not decoded |
 | `hooks.cpp` | overrides of game functions (the UE3 fatal-error handler is logged) |
 
 Run: `host\build\asura.exe --log` (log in `logs\`; `ASURA_LOGFILE` names another file). Debug switches: `ASURA_STRICT` (stop at the first unimplemented import), `ASURA_WATCH=addr,...` (words printed by the 10 s thread monitor), `ASURA_CRASHDUMP=addr,len`, `ASURA_AUTOINPUT`, `ASURA_CMDLINE` (UE3 command line), `ASURA_NOAUDIO`.
 
-State at the end of the first host session: boots through the logos (Capcom, CyberConnect2, UE3, SpeedTree) to the title screen's background movie (`TitleMenu_Bg00.bik`) and runs at a steady 30 frames per second, with nothing drawn (null GPU) and no sound.
+State at the end of the first host session (null GPU): boots through the logos (Capcom, CyberConnect2, UE3, SpeedTree) to the title screen's background movie (`TitleMenu_Bg00.bik`) and runs at a steady 30 frames per second, with nothing drawn (null GPU) and no sound.
 
 ### Bugs found while booting (each was a hang or crash)
 
@@ -78,8 +80,17 @@ State at the end of the first host session: boots through the logos (Capcom, Cyb
 - File information class 26 (sector of the file) is asked for every package; answered with a stable per-path number.
 - Drives seen: `game:`/`D:` (disc), `UPDATE:` (title update data: empty here, `game\update`), `cache:` (utility drive, not mounted yet).
 
+### Renderer (2026-11-09)
+
+BCR2's renderer runs unchanged apart from the port script's edits. The boot sequence and the title screen ("PRESS START" over the background movie) draw correctly at 30 fps, 140-240 draws per frame. Frame captures: `ASURA_SHOTDIR=<dir>` with `ASURA_SHOTEVERY=<frames>`; `tools\bmp2png.py` makes PNGs or a contact sheet. Not yet checked: anything past the title screen, BCR2's precompiled-shader bundle (Asura's shaders compile on first use), VRR and display pacing (the 60 Hz tick here is free-running).
+
+Fixed on the way:
+- The swap packet must carry the front buffer's physical address (E0 window +0x1000): with the virtual one the present found no surface (flat purple frames).
+- XAPI's heap: `MEM_RESERVE` must not commit, `NtQueryVirtualMemory` must report the run of pages in one state (not the whole allocation), and commits in a 64K-page range cover whole 64K pages. Each was an intermittent heap crash on a worker thread.
+- WAIT_REG_MEM on memory now waits (up to 3 s), EVENT_WRITE_EXT is packet 0x5A with full-screen extents, and occlusion queries are answered by the renderer, as in BCR2.
+
 ### Next
 
-1. Renderer: port BCR2's D3D11 Xenos renderer (`C:\dev\bcr2\host\gpu.cpp`) behind the PM4 executor here, then the window, present and input focus.
+1. Input past the title screen (XInput works; keyboard and mouse are BCR2's kbm.cpp, not ported), then play into the first episode and look for rendering bugs.
 2. Audio: WASAPI output from BCR2, then XMA decoding (UE3 plays its sound as XMA; BCR2 never needed it).
 3. Saves and the `cache:` utility drive, then the menus with real input.

@@ -1,7 +1,9 @@
-// Null GPU: video-kernel calls (Vd*), the command ring and a PM4 interpreter that performs the side effects the CPU depends on
-// (fence and memory writes, scratch registers, interrupts, swaps) and draws nothing. The renderer from the BCR2 host plugs in later.
+// Command processor: video-kernel calls (Vd*), the command ring and the PM4 interpreter. Register writes and every type-3 packet
+// that passes its predicate go to the renderer (xenos.cpp, from BCR2: state, shaders, draws, resolves, present); this file does the
+// side effects the CPU depends on (fence and memory writes, scratch registers, waits, interrupts). ASURA_NOGPU keeps it a null GPU.
 // Predicated packets are skipped unless bin select & mask is set: running them anyway was the BCR2 crash root cause (bcr2 notes).
 #include "kernel.h"
+#include "gpu.h"
 #include <windows.h>
 #include <atomic>
 #include <chrono>
@@ -56,9 +58,11 @@ static void call_interrupt(uint32_t source, uint32_t cpu, GuestHostThread& t) {
     call_guest(c, g_gpu.intrCb);
 }
 
+static const bool kRender = gpu_enabled();
 static void reg_write(uint32_t r, uint32_t v) {
     r &= 0xFFFF;
     g_regs[r] = v;
+    if (kRender) gpu_reg(r, v);
     wr32(reg_addr(r), v);
     if (r >= 0x0578 && r <= 0x057F) {   // SCRATCH_REG0-7: mirrored to SCRATCH_ADDR when enabled in SCRATCH_UMSK
         uint32_t n = r - 0x0578;
@@ -80,6 +84,7 @@ static void exec_indirect(uint32_t addr, uint32_t dwords, int depth) {
     execute(v.data(), dwords, depth + 1);
 }
 static void type3(uint32_t op, const uint32_t* d, uint32_t cnt, int depth) {
+    if (kRender) gpu_packet(g_base, op, d, cnt);    // renderer first: state, constants, shaders, draws, resolves, swaps
     switch (op) {
       case 0x3F: case 0x37:                       // INDIRECT_BUFFER(_PFD)
         exec_indirect(d[0] & ~3u, d[1] & 0xFFFFF, depth); break;
@@ -90,41 +95,44 @@ static void type3(uint32_t op, const uint32_t* d, uint32_t cnt, int depth) {
       case 0x58: {                                // EVENT_WRITE_SHD: initiator, address, value (bit 31 of the initiator: write the swap count)
         uint32_t v = (d[0] >> 31) ? (uint32_t)g_gpu.swaps.load() : d[2];
         write_endian(d[1], v); break; }
-      case 0x59: {                                // EVENT_WRITE_EXT: screen extents, reported as the full screen
+      case 0x5A: {                                // EVENT_WRITE_EXT: screen extents of the last draw. Reported as everything, as Xenia and
+        if (cnt < 2) break;                       // BCR2 do: games use them to pick tiles, and zeros cull nearly every draw. {minX, maxX, minY, maxY, minZ, maxZ}
         uint32_t a = phys(d[1] & ~3u);
-        static const uint16_t ext[6] = { 0, 1280 / 8, 0, 720 / 8, 0, 1 };
+        static const uint16_t ext[6] = { 0, 8192 >> 3, 0, 8192 >> 3, 0, 1 };
         for (int k = 0; k < 6; k++) wr16(a + k * 2, ext[k]);
         break; }
-      case 0x5B:                                  // EVENT_WRITE_ZPD: occlusion result, report "visible"
-        if (cnt >= 2) { uint32_t a = phys(d[1] & ~3u); wr32(a, 0xFFFFFEED); } break;
       case 0x45: {                                // COND_WRITE: func, poll address/reg, ref, mask, write address/reg, value
         uint32_t func = d[0], value = (func & 0x10) ? read_endian(d[1]) : g_regs[d[1] & 0xFFFF];
         if (cond(func, value & d[3], d[2])) {
             if (func & 0x100) write_endian(d[4], d[5]); else reg_write(d[4], d[5]);
         }
         break; }
-      case 0x3C: break;                           // WAIT_REG_MEM: nothing is in flight on a null GPU
-      case 0x3E: {                                // REG_RMW: reg, and mask, or mask (bit 31/30: from registers)
-        uint32_t r = d[0] & 0x1FFF, a = (d[0] >> 31) ? g_regs[d[1] & 0x1FFF] : d[1], o = (d[0] >> 30 & 1) ? g_regs[d[2] & 0x1FFF] : d[2];
-        reg_write(r, (g_regs[r] & a) | o); break; }
-      case 0x2D: {                                // SET_CONSTANT
-        uint32_t idx = d[0] & 0x7FF, type = (d[0] >> 16) & 0xFF, base = 0;
-        switch (type) { case 0: base = 0x4000; break; case 1: base = 0x4800; break; case 2: base = 0x4900; break; case 3: base = 0x4908; break; case 4: base = 0x2000; break; }
-        for (uint32_t k = 1; k < cnt; k++) reg_write(base + idx + k - 1, d[k]);
+      case 0x3C: {                                // WAIT_REG_MEM: wait until a memory word meets the condition (register polls are not emulated)
+        if (!(d[0] & 0x10)) break;
+        const uint32_t fn = d[0], ref = d[2], mask = d[3];
+        auto t0 = std::chrono::steady_clock::now();
+        for (int w = 0; !cond(fn, read_endian(d[1]) & mask, ref); w++) {
+            if (w < 2000) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(100));
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(3)) {
+                static int n = 0;
+                if (n++ < 10) fprintf(stderr, "[gpu] WAIT_REG_MEM timed out at %08X (value %08X, ref %08X, function %u)\n", d[1], read_endian(d[1]), ref, fn & 7);
+                break;
+            }
+        }
         break; }
       case 0x60: g_gpu.binMask = (g_gpu.binMask & 0xFFFFFFFF00000000ull) | d[0]; break;
       case 0x61: g_gpu.binMask = (g_gpu.binMask & 0xFFFFFFFFull) | ((uint64_t)d[0] << 32); break;
       case 0x62: g_gpu.binSelect = (g_gpu.binSelect & 0xFFFFFFFF00000000ull) | d[0]; break;
       case 0x63: g_gpu.binSelect = (g_gpu.binSelect & 0xFFFFFFFFull) | ((uint64_t)d[0] << 32); break;
-      case 0x54: {                                // INTERRUPT: one callback per CPU in the mask
+      case 0x54: {                                // INTERRUPT: one callback per CPU in the mask, finished before the ring goes on
         g_gpu.interrupts++;
         for (uint32_t cpu = 0; cpu < 6; cpu++) if (d[0] & (1u << cpu)) call_interrupt(1, cpu, g_gpuThread);
         break; }
-      case 0x64: {                                // XE_SWAP (written by VdSwap): one frame done
+      case 0x64: {                                // XE_SWAP (written by VdSwap): 'SWAP', front buffer
         uint64_t n = ++g_gpu.swaps;
         if (n <= 3 || n % 600 == 0) LOG("[gpu] swap #%llu front=%08X\n", (unsigned long long)n, cnt > 1 ? d[1] : 0);
         break; }
-      default: break;                             // draws, state, shaders: nothing to do without a renderer
+      default: break;
     }
 }
 static void execute(const uint32_t* p, uint32_t n, int depth) {
@@ -231,10 +239,13 @@ static void VdGetSystemCommandBuffer_(PPCContext& ctx, uint8_t*) {
 // VdSwap(buffer*, fetch*, ..., frontbuffer** in r8): fills the reserved 64-dword slot with an XE_SWAP packet
 static void VdSwap_(PPCContext& ctx, uint8_t*) {
     uint32_t buf = ctx.r3.u32, front = ctx.r8.u32 ? rd32(ctx.r8.u32) : 0;
-    if (buf) {
+    // the GPU gets the physical address, as MmGetPhysicalAddress gives it: the E0 window is 0x1000 ahead (E032E000 -> 0032F000)
+    if (front) front = (front & 0x1FFFFFFFu) + (front >= 0xE0000000u ? 0x1000u : 0u);
+    if (buf) {   // the layout the renderer expects (as in Xenia and BCR2): 'SWAP', front buffer, then padding
         wr32(buf, 0xC0000000u | (62u << 16) | (0x64u << 8));
-        wr32(buf + 4, front);
-        for (uint32_t i = 2; i < 64; i++) wr32(buf + i * 4, 0);
+        wr32(buf + 4, 0x53574150u);
+        wr32(buf + 8, front);
+        for (uint32_t i = 3; i < 64; i++) wr32(buf + i * 4, 0);
     }
     ctx.r3.u64 = 0;
 }

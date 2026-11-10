@@ -123,7 +123,7 @@ uint32_t vm_alloc(uint32_t size) {
 }
 
 // NtAllocateVirtualMemory(base*, size*, type, protect, debug): type MEM_COMMIT 0x1000, MEM_RESERVE 0x2000,
-// MEM_LARGE_PAGES 0x20000000 (64K pages), MEM_16MB_PAGES 0x40000000. Reserving commits too (the host commit is lazy anyway).
+// MEM_LARGE_PAGES 0x20000000 (64K pages), MEM_16MB_PAGES 0x40000000.
 static void NtAllocateVirtualMemory_(PPCContext& ctx, uint8_t*) {
     uint32_t baseP = ctx.r3.u32, sizeP = ctx.r4.u32, type = ctx.r5.u32;
     uint32_t addr = rd32(baseP), size = rd32(sizeP);
@@ -135,11 +135,13 @@ static void NtAllocateVirtualMemory_(PPCContext& ctx, uint8_t*) {
         addr = ar.place(size, (type & 0x40000000) ? 0x1000000 : ar.page);
         if (!addr) { fprintf(stderr, "[mem] %s virtual arena full (%X wanted)\n", ar.name, size); ctx.r3.u64 = STATUS_NO_MEMORY; return; }
         size = ar.blocks[addr];
-    } else {
-        uint32_t end = (addr + size + 0xFFF) & ~0xFFFu;
-        addr &= ~0xFFFu; size = end - addr;
+    } else {   // whole pages of the range's page size: committing in a 64K-page range commits whole 64K pages, and XAPI's heap relies on it
+        const uint32_t page = arena_of(addr).page;
+        uint32_t end = (uint32_t)(((uint64_t)addr + size + page - 1) & ~(uint64_t)(page - 1));
+        addr &= ~(page - 1); size = end - addr;
     }
-    if (!commit_range(addr, size)) {
+    // Only MEM_COMMIT commits: a reserve stays reserved, so the heap's own bookkeeping of committed pages (it asks NtQueryVirtualMemory) holds.
+    if ((type & 0x1000) && !commit_range(addr, size)) {
         fprintf(stderr, "[mem] NtAllocateVirtualMemory: commit %08X+%X failed (%lu)\n", addr, size, GetLastError());
         ctx.r3.u64 = STATUS_NO_MEMORY; return;
     }
@@ -167,8 +169,9 @@ static void NtFreeVirtualMemory_(PPCContext& ctx, uint8_t*) {
     }
     ctx.r3.u64 = STATUS_SUCCESS;
 }
-// NtQueryVirtualMemory(address, MEMORY_BASIC_INFORMATION*): the region ends where the allocation ends. Windows merges neighbouring
-// committed blocks into one region, and UE3's realloc grows a block in place when the region looks big enough: it overran the next block.
+// NtQueryVirtualMemory(address, MEMORY_BASIC_INFORMATION*): a region is the run of pages in one state from the queried page, and it
+// never runs past the end of its allocation. Windows merges neighbouring committed blocks, and UE3's realloc grew a block in place
+// over its neighbour; XAPI's heap needs the committed and reserved runs exactly. Addresses outside any allocation are MEM_FREE.
 static void NtQueryVirtualMemory_(PPCContext& ctx, uint8_t*) {
     uint32_t addr = ctx.r3.u32, out = ctx.r4.u32;
     MEMORY_BASIC_INFORMATION mbi{};
@@ -176,17 +179,19 @@ static void NtQueryVirtualMemory_(PPCContext& ctx, uint8_t*) {
     uint32_t rbase = (uint32_t)((uint8_t*)mbi.BaseAddress - g_base);
     uint64_t rsize = std::min<uint64_t>(mbi.RegionSize, 0x100000000ull - rbase);
     uint32_t ab = rbase & ~0xFFFFu;
+    bool inAllocation = addr >= 0x80000000u;   // image and physical windows: as Windows reports them
     {   std::lock_guard<std::mutex> g(g_vmLock);
         Arena& ar = arena_of(addr);
         auto it = ar.blocks.upper_bound(addr);
         if (it != ar.blocks.begin()) {
             --it;
             if (addr < it->first + it->second) {
+                inAllocation = true;
                 ab = it->first;
-                rbase = addr & ~(ar.page - 1);
-                rsize = it->first + it->second - rbase;
+                rsize = std::min<uint64_t>(rsize, it->first + it->second - rbase);
             }
         } }
+    if (!inAllocation) mbi.State = MEM_FREE;
     LOG("[mem] NtQueryVirtualMemory %08X -> base %08X size %llX lr=%08X\n", addr, rbase, (unsigned long long)rsize, (uint32_t)ctx.lr);
     wr32(out + 0x00, rbase);
     wr32(out + 0x04, ab);
