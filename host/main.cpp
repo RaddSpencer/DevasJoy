@@ -7,7 +7,9 @@
 //   82000000           the image, then the indirect-call table (8 bytes per code word)
 //   A0000000-BFFFFFFF  physical memory, aliased at C0000000 and E0000000 like the console
 #include "kernel.h"
+#include "shaderindex.h"
 #include <windows.h>
+#include <algorithm>
 #include <atomic>
 #include <fstream>
 #include <vector>
@@ -119,6 +121,131 @@ static std::vector<char> read_file(const std::string& p) {
 }
 
 int main(int argc, char** argv) {
+    if (argc >= 5 && !strcmp(argv[1], "--probe-lzx")) {                       // --probe-lzx <package> <start> <length> (hex): where LZX streams start, and recorded shaders in them
+        std::vector<uint8_t> d;
+        if (!ue3_unpack_file(argv[2], d)) { std::ifstream f(argv[2], std::ios::binary); d.assign(std::istreambuf_iterator<char>(f), {}); }
+        const size_t s = strtoull(argv[3], nullptr, 16), len = strtoull(argv[4], nullptr, 16);
+        std::vector<std::vector<uint8_t>> pats;                               // first 32 bytes of each recorded shader
+        { std::ifstream m(data_root() + "\\cache\\shader_manifest.txt"); std::string line;
+          while (std::getline(m, line)) {
+              if (line.empty() || (line[0] != 'V' && line[0] != 'P')) continue;
+              unsigned pg; size_t n; int used = 0; if (sscanf(line.c_str() + 1, " %x %zu%n", &pg, &n, &used) != 2 || n < 8) continue;
+              std::vector<uint8_t> pat; const char* p = line.c_str() + 1 + used; unsigned v; int adv;
+              for (int k = 0; k < 8 && sscanf(p, " %x%n", &v, &adv) == 1; k++) { pat.push_back(v >> 24); pat.push_back(v >> 16); pat.push_back(v >> 8); pat.push_back(v); p += adv; }
+              pats.push_back(pat);
+          } }
+        std::vector<uint8_t> out; int streams = 0;
+        for (size_t o = s; o < s + len && o + 2 < d.size(); o++) {
+            if (d[o] != 0xFF && xmem_lzx_probe(&d[o], d.size() - o, 0x8000, out) < 0x8000) continue;   // a short stream starts with an FF frame
+            const size_t got = xmem_lzx_probe(&d[o], d.size() - o, 0x40000, out);
+            int conts = 0; for (size_t k = 0; k + 4 < out.size(); k++) if (out[k] == 0x10 && out[k + 1] == 0x2A && out[k + 2] == 0x11 && out[k + 3] <= 1) conts++;
+            int hits = 0;
+            if (conts) for (auto& pt : pats) if (std::search(out.begin(), out.end(), pt.begin(), pt.end()) != out.end()) hits++;
+            if (!conts) continue;                                              // most "streams" are noise that happens to decode
+            printf("stream at %zX (+%zX in the object): %zu bytes, %d containers, %d recorded shaders; 16 bytes before:", o, o - s, got, conts, hits);
+            for (size_t k = o >= 16 ? o - 16 : 0; k < o; k++) printf(" %02X", d[k]);
+            printf("\n");
+            if (++streams >= 30) break;
+        }
+        printf("done\n");
+        return 0;
+    }
+    if (argc >= 3 && !strcmp(argv[1], "--pkg-info")) {                        // --pkg-info <package> [class]: summary and exports (of that class) of a UE3 package
+        std::vector<uint8_t> d;
+        if (!ue3_unpack_file(argv[2], d)) { std::ifstream f(argv[2], std::ios::binary); d.assign(std::istreambuf_iterator<char>(f), {}); }
+        size_t at = 0; bool bad = false;
+        auto u32 = [&]() -> uint32_t { if (at + 4 > d.size()) { bad = true; return 0; } uint32_t v = (uint32_t)d[at] << 24 | (uint32_t)d[at + 1] << 16 | (uint32_t)d[at + 2] << 8 | d[at + 3]; at += 4; return v; };
+        auto str = [&]() -> std::string { int32_t n = (int32_t)u32(); if (n <= 0 || at + n > d.size()) return ""; std::string s((const char*)&d[at], n - 1); at += n; return s; };
+        u32(); const uint32_t ver = u32(); u32(); str(); const uint32_t flags = u32();
+        const uint32_t nameCount = u32(), nameOff = u32(), expCount = u32(), expOff = u32(), impCount = u32(), impOff = u32();
+        printf("version %08X flags %08X names %u@%X exports %u@%X imports %u@%X\n", ver, flags, nameCount, nameOff, expCount, expOff, impCount, impOff);
+        std::vector<std::string> names; at = nameOff;
+        for (uint32_t i = 0; i < nameCount && !bad; i++) { names.push_back(str()); u32(); u32(); }
+        auto nm = [&](uint32_t i, uint32_t n) { std::string s = i < names.size() ? names[i] : "?"; if (n) s += "_" + std::to_string(n - 1); return s; };
+        std::vector<std::string> impNames; at = impOff;
+        for (uint32_t i = 0; i < impCount && !bad; i++) { u32(); u32(); u32(); u32(); u32(); const uint32_t a = u32(), b = u32(); impNames.push_back(nm(a, b)); }
+        at = expOff; const char* want = argc >= 4 ? argv[3] : nullptr; int shown = 0;
+        for (uint32_t i = 0; i < expCount && !bad; i++) {
+            const int32_t cls = (int32_t)u32(); u32(); u32(); const uint32_t on = u32(), onum = u32(); u32(); u32(); u32();
+            const uint32_t size = u32(), off = u32(); u32(); const uint32_t nets = u32(); at += nets * 4; at += 16; u32();
+            const std::string c = cls < 0 && (size_t)(-cls - 1) < impNames.size() ? impNames[-cls - 1] : cls == 0 ? "Class" : "(export)";
+            if (want && c != want) continue;
+            if (shown++ < 40) printf("export %u %s '%s' size %u at %X\n", i, c.c_str(), nm(on, onum).c_str(), size, off);
+        }
+        printf("%s\n", bad ? "parse ran past the end" : "ok");
+        return 0;
+    }
+    if (argc >= 3 && !strcmp(argv[1], "--find-shaders")) {                    // --find-shaders <file>: which recorded shaders (cache\shader_manifest.txt) occur in it, and where
+        std::vector<uint8_t> data;
+        if (!ue3_unpack_file(argv[2], data)) { std::ifstream f(argv[2], std::ios::binary); data.assign(std::istreambuf_iterator<char>(f), {}); }
+        std::ifstream m(data_root() + "\\cache\\shader_manifest.txt");
+        std::string line; int tried = 0, found = 0, partial = 0;
+        while (std::getline(m, line)) {
+            if (line.empty() || (line[0] != 'V' && line[0] != 'P')) continue;
+            unsigned pg; size_t n; int used = 0;
+            if (sscanf(line.c_str() + 1, " %x %zu%n", &pg, &n, &used) != 2) continue;
+            std::vector<uint8_t> pat; const char* p = line.c_str() + 1 + used; unsigned v; int adv;
+            while (sscanf(p, " %x%n", &v, &adv) == 1) { pat.push_back(v >> 24); pat.push_back(v >> 16); pat.push_back(v >> 8); pat.push_back(v); p += adv; }
+            tried++;
+            auto it = std::search(data.begin(), data.end(), pat.begin(), pat.end());
+            if (it == data.end() && pat.size() >= 64) {                     // not verbatim: a 16-byte piece from the middle?
+                const size_t mid = (pat.size() / 2) & ~3u;
+                auto jt = std::search(data.begin(), data.end(), pat.begin() + mid, pat.begin() + mid + 16);
+                if (jt != data.end()) { static int np = 0; partial++; if (np++ < 3) printf("%c %zu words: middle piece at %zu\n", line[0], n, (size_t)(jt - data.begin())); }
+            }
+            if (it != data.end()) {
+                found++;
+                const size_t at = it - data.begin();
+                if (found <= 3) {
+                    printf("%c %zu words at %zu; 64 bytes before:", line[0], n, at);
+                    for (size_t k = at >= 64 ? at - 64 : 0; k < at; k++) printf("%s%02X", (k % 16) ? "" : "\n  ", data[k]);
+                    printf("\n");
+                }
+            }
+        }
+        printf("%s: %zu bytes, %d of %d recorded shaders found, %d more by a middle piece\n", argv[2], data.size(), found, tried, partial);
+        return 0;
+    }
+    if (argc >= 4 && !strcmp(argv[1], "--unpack")) {                          // --unpack <package> <out>: one cooked package, for checking the decompressor
+        std::vector<uint8_t> out;
+        const bool ok = ue3_unpack_file(argv[2], out);
+        if (ok) if (FILE* f = fopen(argv[3], "wb")) { fwrite(out.data(), 1, out.size(), f); fclose(f); }
+        printf("%s: %s, %zu bytes\n", argv[2], ok ? "unpacked" : "failed", out.size());
+        return ok ? 0 : 1;
+    }
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--build-shader-index")) {   // unpack the cooked packages into cache\shader_index.bin and exit
+        const std::string cooked = data_root() + "\\game\\disc\\BCGame\\CookedXbox360", out = data_root() + "\\cache";
+        int last = -1;
+        const bool ok = shaderindex_build(cooked, out, [&](int done, int total) {
+            const int pct = total ? done * 100 / total : 100;
+            if (pct != last) { last = pct; fprintf(stderr, "\r[shaderindex] %d%% (%d of %d files)", pct, done, total); }
+        });
+        fprintf(stderr, "\n[shaderindex] %s\n", ok ? "done" : "failed");
+        if (ok && shaderindex_load(out)) {                                   // coverage: recorded shaders (cache\shader_manifest.txt) the index holds
+            std::ifstream m(out + "\\shader_manifest.txt"); std::string line; int tried = 0, found = 0, triedVs = 0, triedPs = 0, foundVs = 0, foundPs = 0, missLog = 0, patched = 0, patchedWords = 0;
+            std::vector<uint32_t> code, got;
+            while (std::getline(m, line)) {
+                if (line.empty() || (line[0] != 'V' && line[0] != 'P')) continue;
+                unsigned pg; size_t n; int used = 0; if (sscanf(line.c_str() + 1, " %x %zu%n", &pg, &n, &used) != 2) continue;
+                code.clear(); const char* p = line.c_str() + 1 + used; unsigned v; int adv;
+                while (sscanf(p, " %x%n", &v, &adv) == 1) { code.push_back(v); p += adv; }
+                tried++;
+                const bool vs = line[0] == 'V';
+                (vs ? triedVs : triedPs)++;
+                uint64_t ck; std::vector<uint32_t> base;
+                if (shaderindex_find(shader_code_key(code.data(), code.size(), vs), got)) { found++; (vs ? foundVs : foundPs)++; }
+                else if (shaderindex_closest(code, vs, ck, base)) {
+                    found++; (vs ? foundVs : foundPs)++; patched++;
+                    int d = 0; for (size_t k = 0; k < code.size(); k++) if (code[k] != base[k]) d++;
+                    patchedWords += d;
+                }
+                else if (missLog++ < 3) fprintf(stderr, "[shaderindex] not found: %s of %zu words, paramGen %08X\n", vs ? "vs" : "ps", code.size(), pg);
+            }
+            fprintf(stderr, "[shaderindex] %zu shaders in the index; %d of %d recorded shaders found (vertex %d of %d, pixel %d of %d); %d of them patched, %d words in all\n",
+                    shaderindex_size(), found, tried, foundVs, triedVs, foundPs, triedPs, patched, patchedWords);
+        }
+        return ok ? 0 : 1;
+    }
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--log")) g_logging = true;
     if (getenv("ASURA_LOG")) g_logging = true;
     if (g_logging) {

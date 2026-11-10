@@ -4,9 +4,14 @@ set(CMAKE_CXX_STANDARD 20)
 
 # The recompiled game code is compiled straight into the exe so generated/import_stubs.cpp can override the weak import thunks.
 file(GLOB PPC_SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../ppc/*.cpp")
-set(HOST_SRC main.cpp kernel.cpp kfile.cpp kstring.cpp xam.cpp gpu.cpp audio.cpp hooks.cpp audio_out.cpp xma.cpp xenos.cpp xenos_glue.cpp shaderpack.cpp generated/import_stubs.cpp)
-add_executable(asura ${HOST_SRC} ${PPC_SRC})
+set(HOST_SRC main.cpp kernel.cpp kfile.cpp kstring.cpp xam.cpp gpu.cpp audio.cpp hooks.cpp audio_out.cpp xma.cpp xenos.cpp xenos_glue.cpp shaderpack.cpp shaderindex.cpp generated/import_stubs.cpp)
+# libmspack's LZX decoder (LGPL 2.1, thirdparty\libmspack): unpacks the cooked packages for the shader index
+set(MSPACK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/libmspack/mspack)
+set(MSPACK_SRC ${MSPACK_DIR}/lzxd.c)
+set_source_files_properties(${MSPACK_SRC} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "/TC;/O2;/w" COMPILE_DEFINITIONS "_CRT_SECURE_NO_WARNINGS")   # C source, built by the C++ compiler in C mode (/TC)
+add_executable(asura ${HOST_SRC} ${PPC_SRC} ${MSPACK_SRC})
 target_include_directories(asura PRIVATE
+    ${MSPACK_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ppc
     ${CMAKE_CURRENT_SOURCE_DIR}/generated

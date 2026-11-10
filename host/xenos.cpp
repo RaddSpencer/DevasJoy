@@ -20,6 +20,7 @@
 #include <d3d11_1.h>
 #include <dxgi1_5.h>
 #include "shaderpack.h"
+#include "shaderindex.h"
 #include "paths.h"
 #include "kbm.h"
 #include <atomic>
@@ -1060,6 +1061,36 @@ static std::string uv_helper() {
 }
 
 static void shader_record(const std::vector<uint32_t>& code, bool isVs, uint32_t paramGen);
+// ASURA_SHADERFIND=<n>: for new shaders after the first n, find every copy of their microcode in guest memory and log the
+// 128 bytes before each, to see the form the game unpacked them in (for the shader index). Six shaders, then it stops.
+static void shader_find(const std::vector<uint32_t>& code, bool isVs) {
+    static const char* env = getenv("ASURA_SHADERFIND");
+    static int seen = 0, done = 0;
+    if (!env || code.size() < 16 || done >= 6 || seen++ < atoi(env)) return;
+    done++;
+    uint32_t pat[8]; for (int k = 0; k < 8; k++) pat[k] = _byteswap_ulong(code[k]);   // as stored in guest memory
+    int hits = 0;
+    fprintf(stderr, "[shaderfind] %s of %zu words, first words %08X %08X %08X %08X\n", isVs ? "vs" : "ps", code.size(), code[0], code[1], code[2], code[3]);
+    for (uint64_t off = 0; off < 0x100000000ull; ) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery(g_base + off, &mi, sizeof mi)) break;
+        const uint64_t size = mi.RegionSize - (uint64_t)((g_base + off) - (uint8_t*)mi.BaseAddress);
+        if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) && size >= 32) {
+            const uint32_t* w = (const uint32_t*)(g_base + off);
+            for (uint64_t i = 0; i + 8 <= size / 4; i++) {
+                if (w[i] != pat[0] || memcmp(&w[i], pat, 32)) continue;
+                const uint32_t ga = (uint32_t)(off + i * 4);
+                std::string s = S("[shaderfind]   at %08X, before:", ga);
+                for (int k = ga < 0x80000000u ? -256 : -8; k < 0; k++) if ((int64_t)i + k >= 0) s += S(" %08X", _byteswap_ulong(w[i + k]));
+                fprintf(stderr, "%s\n", s.c_str());
+                if (++hits >= 8) break;
+            }
+        }
+        if (hits >= 8) break;
+        off += size;
+    }
+    fprintf(stderr, "[shaderfind]   %d copies\n", hits);
+}
 static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint32_t paramGen) {
     static std::unordered_map<uint64_t, XShader*> cache;
     uint64_t h = fnv64(code.data(), code.size() * 4, isVs ? 0x1234 : 0x5678);
@@ -1070,6 +1101,7 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
     sh->hash = h;
     cache[h] = sh;
     shader_record(code, isVs, paramGen);
+    shader_find(code, isVs);
     if (const char* ud = getenv("ASURA_UCODEDUMP")) {                         // the raw microcode of each new shader, big-endian as in guest memory
         std::string p = std::string(ud) + S("\\%s_%016llX.bin", isVs ? "vs" : "ps", (unsigned long long)h);
         if (FILE* f = fopen(p.c_str(), "wb")) { for (uint32_t w : code) { uint32_t be = _byteswap_ulong(w); fwrite(&be, 4, 1, f); } fclose(f); }
@@ -1166,9 +1198,9 @@ static const char* const kShaderBundle = "3b6c2da5af6f2e42.bundle";
 static std::vector<uint8_t> g_packData;
 static std::vector<PackShader> g_pack;
 static bool g_packLoaded = false;
-static std::string g_manifestPath;
-static std::set<std::string> g_manifestLines;
-static bool shader_recording() { static const bool on = g_logging && getenv("ASURA_NORECORD") == nullptr; return on; }   // with --log: every shader the game uses is added to the manifest, so the next start compiles it ahead of time
+static std::string g_manifestPath, g_refPath;                             // local whole-microcode record (cache\), shippable references
+static std::set<std::string> g_manifestLines, g_refLines;
+static bool shader_recording() { static const bool on = getenv("ASURA_NORECORD") == nullptr; return on; }   // always (ASURA_NORECORD turns it off): every shader the game uses is added to the manifest, so the next start compiles it ahead of time
 
 static std::string exe_dir() {
     wchar_t w[MAX_PATH]; GetModuleFileNameW(nullptr, w, MAX_PATH);
@@ -1182,6 +1214,7 @@ static bool pack_load() {
     const std::string root = get_content_root();
     if (root.empty()) return false;
     const std::string path = root + "\\assets\\" + kShaderBundle;
+    if (GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES) return false;     // BCR2's bundle; Asura uses the shader index instead
     if (!shaderpack_load(path, g_packData, g_pack)) { fprintf(stderr, "[shader] could not read %s\n", path.c_str()); g_pack.clear(); return false; }
     fprintf(stderr, "[shader] %zu shader containers in %s\n", g_pack.size(), kShaderBundle);
     return !g_pack.empty();
@@ -1193,17 +1226,43 @@ static void manifest_read() {
         CreateDirectoryA(dir.c_str(), nullptr);
         g_manifestPath = dir + "\\shader_manifest.txt";
     }
-    if (FILE* f = fopen(g_manifestPath.c_str(), "r")) {
-        char line[8192];
-        while (fgets(line, sizeof line, f)) { std::string s = line; while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back(); if (!s.empty()) g_manifestLines.insert(s); }
-        fclose(f);
+    auto read_lines = [](const std::string& path, std::set<std::string>& into) {
+        if (FILE* f = fopen(path.c_str(), "r")) {
+            static char line[1 << 20];                                       // whole-microcode lines can be long
+            while (fgets(line, sizeof line, f)) { std::string s = line; while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back(); if (!s.empty()) into.insert(s); }
+            fclose(f);
+        }
+    };
+    read_lines(g_manifestPath, g_manifestLines);
+    // The manifest that ships (beside NOTES.md, in git): "vs|ps <key> <paramGen>", the key a hash of the shader's microcode.
+    // No game code: the code comes from the shader index, built from the player's own game files (shaderindex.cpp).
+    g_refPath = getenv("ASURA_SHADERREFS") ? getenv("ASURA_SHADERREFS") : bcr2_data_root() + "\\shader_manifest.txt";
+    read_lines(g_refPath, g_refLines);
+}
+// A reference line names the index entry (the game's own container) plus the words the game patched when binding the shader
+// (vertex shaders get their vertex fetches written). Needs the index; without it the local record keeps the shader until it is.
+static bool g_indexReady = false;
+static void ref_record(const std::vector<uint32_t>& code, bool isVs, uint32_t paramGen) {   // caller holds the record lock
+    if (!g_indexReady) return;
+    uint64_t key = shader_code_key(code.data(), code.size(), isVs);
+    std::vector<uint32_t> base;
+    std::string patches;
+    if (!shaderindex_find(key, base)) {
+        if (!shaderindex_closest(code, isVs, key, base)) return;            // not in the game files (the local record has it)
+        for (size_t i = 0; i < code.size(); i++) if (code[i] != base[i]) patches += S(" %zu=%08X", i, code[i]);
     }
+    const std::string line = S("%s %016llX %08X%s", isVs ? "vs" : "ps", (unsigned long long)key, paramGen, patches.c_str());
+    if (!g_refLines.insert(line).second) return;
+    if (FILE* f = fopen(g_refPath.c_str(), "a")) { fprintf(f, "%s\n", line.c_str()); fclose(f); }
 }
 // Records a shader the game used: its container, plus the words that differ from it.
 static void shader_record(const std::vector<uint32_t>& code, bool isVs, uint32_t paramGen) {
     if (!shader_recording()) return;
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lock(mtx);
     if (!pack_load()) {                                                      // Asura has no shader bundle: record the whole microcode ("V"/"P" lines)
         if (g_manifestPath.empty()) manifest_read();
+        ref_record(code, isVs, paramGen);
         std::string line = S("%c %08X %zu", isVs ? 'V' : 'P', paramGen, code.size());
         for (uint32_t w : code) line += S(" %08X", w);
         if (!g_manifestLines.insert(line).second) return;
@@ -1229,10 +1288,44 @@ static void shader_record(const std::vector<uint32_t>& code, bool isVs, uint32_t
 static void show_compile_progress(int pct);   // draws the "Compiling shaders... NN%" screen (defined with the sprites, below)
 static void shader_precompile() {
     manifest_read();
+    // The index of the player's own shaders (shaderindex.cpp): built once from the cooked packages (about 1.5 minutes), then
+    // loaded on every start, since recording needs it too. Only when the game has no BCR2-style bundle.
+    const std::string cacheDir = bcr2_data_root() + "\\cache";
+    if (!pack_load()) {
+        if (!shaderindex_load(cacheDir) && !getenv("ASURA_NOSHADERINDEX")) {
+            const std::string cooked = bcr2_data_root() + "\\game\\disc\\BCGame\\CookedXbox360";
+            fprintf(stderr, "[shader] building the shader index from %s\n", cooked.c_str());
+            const bool showIdx = !getenv("ASURA_NOPROGRESS");
+            int lastPct = -1;
+            if (shaderindex_build(cooked, cacheDir, [&](int done, int total) {
+                    const int pct = total ? done * 100 / total : 100;
+                    if (pct == lastPct) return;
+                    lastPct = pct;
+                    SetWindowTextA(g_hwnd, S("Asura's Wrath - reading shaders from the game files (%d%%)", pct).c_str());
+                    if (showIdx) show_compile_progress(pct);
+                }))
+                shaderindex_load(cacheDir);
+            if (showIdx) show_compile_progress(-1);
+        }
+        g_indexReady = shaderindex_size() > 0;
+        fprintf(stderr, "[shader] shader index: %zu shaders\n", shaderindex_size());
+        if (g_indexReady) {                                                  // the local record becomes reference lines (once each)
+            std::vector<uint32_t> c;
+            for (const std::string& line : g_manifestLines) {
+                if (line[0] != 'V' && line[0] != 'P') continue;
+                unsigned pg = 0; size_t n = 0; int used = 0;
+                if (sscanf(line.c_str() + 1, " %x %zu%n", &pg, &n, &used) != 2 || n == 0 || n > 65536) continue;
+                c.resize(n);
+                const char* p = line.c_str() + 1 + used; size_t k = 0; unsigned val = 0; int adv = 0;
+                while (k < n && sscanf(p, " %x%n", &val, &adv) == 1) { c[k++] = val; p += adv; }
+                if (k == n) ref_record(c, line[0] == 'V', pg);
+            }
+        }
+    }
     if (getenv("ASURA_NOPRECOMPILE") || getenv("ASURA_SYNCSHADERS")) return;
     // Done already for this build, render scale and manifest? Cached shaders load quickly on first use, so nothing more is needed.
     WIN32_FILE_ATTRIBUTE_DATA fa{}; wchar_t ew[MAX_PATH]; GetModuleFileNameW(nullptr, ew, MAX_PATH); GetFileAttributesExW(ew, GetFileExInfoStandard, &fa);
-    const std::string stampWant = S("%08lX%08lX scale=%d manifest=%zu", fa.ftLastWriteTime.dwHighDateTime, fa.ftLastWriteTime.dwLowDateTime, g_resScale, g_manifestLines.size());
+    const std::string stampWant = S("%08lX%08lX scale=%d manifest=%zu refs=%zu", fa.ftLastWriteTime.dwHighDateTime, fa.ftLastWriteTime.dwLowDateTime, g_resScale, g_manifestLines.size(), g_refLines.size());
     const std::string stampPath = shader_cache_dir() + "\\precompile.stamp";
     if (FILE* f = fopen(stampPath.c_str(), "r")) {
         char b[128] = {}; const size_t n = fread(b, 1, sizeof b - 1, f); fclose(f);
@@ -1246,18 +1339,55 @@ static void shader_precompile() {
     auto load = [&](const PackShader& p) { code.resize(p.words); const uint32_t* w = (const uint32_t*)&g_packData[p.offset]; for (uint32_t i = 0; i < p.words; i++) code[i] = _byteswap_ulong(w[i]); };
     size_t nPs = 0, nManifest = 0, nMissing = 0;
     if (havePack) for (const auto& kv : byKey) if (!kv.second->isVs) { load(*kv.second); build_shader(code, false, 0xFFFFFFFFu); nPs++; }
-    for (const std::string& line : g_manifestLines) {
-        if (line[0] == 'V' || line[0] == 'P') {                              // whole microcode (Asura)
+    if (!havePack) {
+        // Asura. Local whole-microcode lines ("V"/"P", cache\) back up the index, and each becomes a reference line if it isn't one yet.
+        std::unordered_map<uint64_t, std::vector<uint32_t>> local;
+        for (const std::string& line : g_manifestLines) {
+            if (line[0] != 'V' && line[0] != 'P') continue;
             unsigned pg = 0; size_t n = 0; int used = 0;
-            if (sscanf(line.c_str() + 1, " %x %zu%n", &pg, &n, &used) != 2 || n == 0 || n > 65536) { nMissing++; continue; }
+            if (sscanf(line.c_str() + 1, " %x %zu%n", &pg, &n, &used) != 2 || n == 0 || n > 65536) continue;
             code.resize(n);
             const char* p = line.c_str() + 1 + used; size_t k = 0; unsigned val = 0; int adv = 0;
             while (k < n && sscanf(p, " %x%n", &val, &adv) == 1) { code[k++] = val; p += adv; }
-            if (k != n) { nMissing++; continue; }
+            if (k != n) continue;
+            const bool vs = line[0] == 'V';
+            local[shader_code_key(code.data(), n, vs)] = code;
+        }
+        size_t fromIndex = 0, fromLocal = 0;
+        std::set<uint64_t> builtLocal;
+        for (const std::string& line : g_refLines) {
+            char kind[4] = {}; unsigned long long key = 0; unsigned pg = 0; int used = 0;
+            if (sscanf(line.c_str(), "%2s %llx %x%n", kind, &key, &pg, &used) != 3) continue;
+            const bool vs = kind[0] == 'v';
+            if (shaderindex_find(key, code)) {
+                fromIndex++;
+                const char* p = line.c_str() + used; unsigned idx = 0, val = 0; int adv = 0;   // the words the game patched
+                while (sscanf(p, " %u=%x%n", &idx, &val, &adv) == 2) { if (idx < code.size()) code[idx] = val; p += adv; }
+                builtLocal.insert(shader_code_key(code.data(), code.size(), vs));
+                build_shader(code, vs, pg);
+                nManifest++;
+                continue;
+            }
+            nMissing++;
+        }
+        for (auto& kv : local) if (!builtLocal.count(kv.first)) fromLocal++;  // recorded shaders the game files don't hold
+        // build those from the local record, with their own paramGen
+        for (const std::string& line : g_manifestLines) {
+            if (line[0] != 'V' && line[0] != 'P') continue;
+            unsigned pg = 0; size_t n = 0; int used = 0;
+            if (sscanf(line.c_str() + 1, " %x %zu%n", &pg, &n, &used) != 2 || n == 0 || n > 65536) continue;
+            code.resize(n);
+            const char* p = line.c_str() + 1 + used; size_t k = 0; unsigned val = 0; int adv = 0;
+            while (k < n && sscanf(p, " %x%n", &val, &adv) == 1) { code[k++] = val; p += adv; }
+            if (k != n || builtLocal.count(shader_code_key(code.data(), n, line[0] == 'V'))) continue;
             build_shader(code, line[0] == 'V', pg);
             nManifest++;
-            continue;
         }
+        fprintf(stderr, "[shader] references: %zu, from the shader index %zu (index holds %zu), from the local record %zu, missing %zu\n",
+                g_refLines.size(), fromIndex, shaderindex_size(), fromLocal, nMissing);
+    }
+    for (const std::string& line : g_manifestLines) {
+        if (line[0] == 'V' || line[0] == 'P') continue;                      // handled above
         if (!havePack) continue;
         char kind = 0; unsigned long long key = 0; unsigned pg = 0; int used = 0;
         if (sscanf(line.c_str(), "%c %llx %x%n", &kind, &key, &pg, &used) != 3) continue;
