@@ -11,6 +11,7 @@
 #include <fstream>
 #include <mutex>
 #include <random>
+#include <cmath>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -47,7 +48,7 @@ static bool pad_read(XINPUT_STATE& s) {
     return false;
 }
 // ASURA_AUTOINPUT="<once>|<loop>": one step per ASURA_AUTOINPUTMS (500) from 10 s after the first poll.
-// S Start, B Back, A, b (B button), X, Y, U/D/L/R d-pad, u/d/l/r left stick, T/Z triggers, '.' nothing.
+// S Start, B Back, A, b (B button), X, Y, U/D/L/R d-pad, u/d/l/r left stick, T/Z triggers, W both triggers, K both sticks down, C left stick circling counterclockwise, '.' nothing.
 static bool auto_input(uint32_t st) {
     static const char* env = getenv("ASURA_AUTOINPUT");
     if (!env) return false;
@@ -57,7 +58,7 @@ static bool auto_input(uint32_t st) {
     static const ULONGLONG t0 = GetTickCount64();
     static const uint32_t step = getenv("ASURA_AUTOINPUTMS") ? (uint32_t)atoi(getenv("ASURA_AUTOINPUTMS")) : 500;
     ULONGLONG el = GetTickCount64() - t0;
-    uint16_t b = 0; int16_t lx = 0, ly = 0; uint8_t lt = 0, rt = 0; uint32_t cyc = 0;
+    uint16_t b = 0; int16_t lx = 0, ly = 0, ry = 0; uint8_t lt = 0, rt = 0; uint32_t cyc = 0;
     if (el >= 10000) {
         cyc = (uint32_t)((el - 10000) / step);
         char c = cyc < once.size() ? once[cyc] : (loop.empty() ? '.' : loop[(cyc - once.size()) % loop.size()]);
@@ -66,10 +67,59 @@ static bool auto_input(uint32_t st) {
           case 'X': b = 0x4000; break; case 'Y': b = 0x8000; break; case 'U': b = 0x0001; break; case 'D': b = 0x0002; break;
           case 'L': b = 0x0004; break; case 'R': b = 0x0008; break; case 'u': ly = 32000; break; case 'd': ly = -32000; break;
           case 'l': lx = -32000; break; case 'r': lx = 32000; break; case 'T': rt = 255; break; case 'Z': lt = 255; break;
+          case 'W': lt = rt = 255; break;                     // both triggers (the first episode 1 prompt)
+          case 'K': ly = ry = -32000; break;                  // both sticks pushed down (the LS/RS prompt)
+          case 'C': {                                         // left stick turning counterclockwise, two turns per step
+              const double a = 6.283185307 * 2.0 * (double)((el - 10000) % step) / step;
+              lx = (int16_t)(30000 * cos(a)); ly = (int16_t)(30000 * sin(a)); break; }
         }
     }
     wr32(st, cyc + 1); wr16(st + 4, b); g_base[st + 6] = lt; g_base[st + 7] = rt; wr16(st + 8, (uint16_t)lx); wr16(st + 10, (uint16_t)ly);
+    wr16(st + 14, (uint16_t)ry);
     return true;
+}
+// ASURA_INPUTREC=<file>: write every change of the pad state as "ms buttons lt rt lx ly rx ry" (ms since the first poll).
+// ASURA_INPUTPLAY=<file>: play such a file back instead of the pad (the state of the last line whose time has passed).
+// Timing is wall-clock, so a playback drifts with loading times; start both runs the same way (ASURA_SKIPINTRO and the same save).
+struct PadRec { uint32_t ms; uint16_t b; uint8_t lt, rt; int16_t lx, ly, rx, ry; };
+static ULONGLONG input_t0() { static const ULONGLONG t0 = GetTickCount64(); return t0; }
+static bool input_play(uint32_t st) {
+    static const char* path = getenv("ASURA_INPUTPLAY");
+    if (!path) return false;
+    static std::vector<PadRec> recs = [] {
+        std::vector<PadRec> v;
+        if (FILE* f = fopen(path, "r")) {
+            PadRec r{}; unsigned b, lt, rt; int lx, ly, rx, ry;
+            while (fscanf(f, "%u %x %u %u %d %d %d %d", &r.ms, &b, &lt, &rt, &lx, &ly, &rx, &ry) == 8) {
+                r.b = (uint16_t)b; r.lt = (uint8_t)lt; r.rt = (uint8_t)rt; r.lx = (int16_t)lx; r.ly = (int16_t)ly; r.rx = (int16_t)rx; r.ry = (int16_t)ry; v.push_back(r);
+            }
+            fclose(f);
+        }
+        LOG("[input] playing %zu recorded states from %s\n", v.size(), path);
+        return v;
+    }();
+    static size_t i = 0;
+    const uint32_t now = (uint32_t)(GetTickCount64() - input_t0());
+    while (i + 1 < recs.size() && recs[i + 1].ms <= now) i++;
+    static uint32_t packet = 0;
+    if (!recs.empty() && recs[i].ms <= now) {
+        const PadRec& r = recs[i];
+        wr16(st + 4, r.b); g_base[st + 6] = r.lt; g_base[st + 7] = r.rt;
+        wr16(st + 8, (uint16_t)r.lx); wr16(st + 10, (uint16_t)r.ly); wr16(st + 12, (uint16_t)r.rx); wr16(st + 14, (uint16_t)r.ry);
+        packet = (uint32_t)i + 1;
+    }
+    wr32(st, packet);
+    return true;
+}
+static void input_record(const XINPUT_GAMEPAD& g) {
+    static const char* path = getenv("ASURA_INPUTREC");
+    if (!path) return;
+    static FILE* f = fopen(path, "w");
+    static XINPUT_GAMEPAD last{}; static bool any = false;
+    if (!f || (any && !memcmp(&last, &g, sizeof g))) return;
+    last = g; any = true;
+    fprintf(f, "%u %04X %u %u %d %d %d %d\n", (unsigned)(GetTickCount64() - input_t0()), g.wButtons, g.bLeftTrigger, g.bRightTrigger, g.sThumbLX, g.sThumbLY, g.sThumbRX, g.sThumbRY);
+    fflush(f);
 }
 // XamInputGetState(user, flags, XINPUT_STATE*): {u32 packet; u16 buttons; u8 lt, rt; s16 lx, ly, rx, ry}
 static void XamInputGetState_(PPCContext& ctx, uint8_t*) {
@@ -77,10 +127,12 @@ static void XamInputGetState_(PPCContext& ctx, uint8_t*) {
     if (user != 0 && user != 0xFF) { ctx.r3.u64 = ERROR_DEVICE_NOT_CONNECTED; return; }
     if (!st) { ctx.r3.u64 = 0; return; }
     memset(g_base + st, 0, 16);
-    if (!auto_input(st)) {
+    input_t0();
+    if (!input_play(st) && !auto_input(st)) {
         XINPUT_STATE xs;
         if (pad_read(xs)) {
             const XINPUT_GAMEPAD& g = xs.Gamepad;
+            input_record(g);
             wr32(st, xs.dwPacketNumber); wr16(st + 4, g.wButtons); g_base[st + 6] = g.bLeftTrigger; g_base[st + 7] = g.bRightTrigger;
             wr16(st + 8, (uint16_t)g.sThumbLX); wr16(st + 10, (uint16_t)g.sThumbLY); wr16(st + 12, (uint16_t)g.sThumbRX); wr16(st + 14, (uint16_t)g.sThumbRY);
         }

@@ -369,7 +369,7 @@ static bool device_init() {
         D3D11_BUFFER_DESC d{}; d.ByteWidth = size; d.Usage = D3D11_USAGE_DYNAMIC; d.BindFlags = D3D11_BIND_CONSTANT_BUFFER; d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         g_dev->CreateBuffer(&d, nullptr, &out);
     };
-    mkcb(8192, g_cbFloat); mkcb(4096, g_cbState); mkcb(32, g_cbBlit);
+    mkcb(8192, g_cbFloat); mkcb(4096, g_cbState); mkcb(48, g_cbBlit);
     D3D11_BUFFER_DESC vb{}; vb.ByteWidth = kVbRingSize; vb.BindFlags = D3D11_BIND_SHADER_RESOURCE; vb.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
     if (g_noOverwriteSrv) { vb.Usage = D3D11_USAGE_DYNAMIC; vb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE; }
     else vb.Usage = D3D11_USAGE_DEFAULT;
@@ -400,8 +400,8 @@ static bool device_init() {
     const char* blitVs = "float4 main(uint i : SV_VertexID) : SV_Position { float2 t=float2((i<<1)&2,i&2); return float4(t.x*2-1,1-t.y*2,0,1); }\n";
     if (auto b = compile_cached(blitVs, "main", "vs_5_0")) g_dev->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_vsBlit);
     const char* blitPs =
-        "Texture2D src:register(t0); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; };\n"
-        "float4 main(float4 p:SV_Position):SV_Target { float4 c=src.Load(int3(int2(p.xy*scale+ofs),0)); return swaprb? c.bgra : c; }\n";
+        "Texture2D src:register(t0); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; float gam; float pv; float aa; float es; };\n"
+        "float4 main(float4 p:SV_Position):SV_Target { float4 c=src.Load(int3(int2(p.xy*scale+ofs),0)); if(es!=0.0) c*=es; return swaprb? c.bgra : c; }\n";
     if (auto b = compile_cached(blitPs, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_psBlit);
     const char* blitDs =
         "Texture2D src:register(t0); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; };\n"
@@ -566,6 +566,14 @@ float4 texfix(float4 t, int n) {
   uint4 g = tfsg[n];
   float4 b = t * 2.0 - 1.0;
   float4 s = (t >= 0.5) ? (t * 255.0 - 256.0) / 127.0 : t * 255.0 / 127.0;
+  // 16-bit data (tfi.w): 1 = held as unorm16, signed is two's complement on 16 bits; 2 = held as snorm16 (a resolve to snorm),
+  // unsigned reads those bits as unorm; 3 = float (16-bit float formats and _EXPAND), the sign setting doesn't apply
+  if (tfi[n].w > 2.5) { s = t; b = t; }
+  else if (tfi[n].w > 1.5) { s = t; t = (t >= 0.0) ? t * (32767.0 / 65535.0) : 1.0 + t * (32767.0 / 65535.0); }
+  else if (tfi[n].w > 0.5) {
+    float4 i = floor(t * 65535.0 + 0.5), si = i - ((i >= 32768.0) ? 65536.0 : 0.0);
+    s = max(si / 32767.0, -1.0);
+  }
   // Xenos piecewise-linear gamma to linear
   float4 lin = (t < 0.25) ? t * 0.25 : ((t < 0.375) ? t * 0.5 - 0.0625 : ((t < 0.75) ? t - 0.25 : t * 2.0 - 1.0));
   t = (g == 1) ? s : ((g == 2) ? b : ((g == 3) ? lin : t));
@@ -1117,8 +1125,9 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
         // 8_8_8_8_GAMMA targets store piecewise-linear gamma (colour only). Inverse of the ramp in texfix.
         src += " if(alpha.z!=0.0){ float3 lc=saturate(oC[0].rgb);\n"
                "  oC[0].rgb=(lc<0.0625)?lc*4.0:((lc<0.125)?lc*2.0+0.125:((lc<0.5)?lc+0.25:lc*0.5+0.5)); }\n";
-        // 16_16 and 16_16_16_16 targets hold -32..32 as signed 16-bit. Stored here as the unorm an unsigned fetch of those bits reads.
-        src += " if(alpha.w!=0.0) oC[0]*=alpha.w;\n";
+        // Colour exponent bias of the target (RB_COLOR_INFO 20-25): output times 2^bias. Negative alpha.w also clamps to -32..32,
+        // the range of the 16_16 / 16_16_16_16 targets (kept as half floats).
+        src += " if(alpha.w!=0.0) { oC[0]*=abs(alpha.w); if(alpha.w<0.0) oC[0]=clamp(oC[0],-32.0,32.0); }\n";
         // BCR2_DBGPS="<ps hash>:<hlsl float4 expr>" replaces that pixel shader's first output, to view one input at a time
         if (const char* dbg = getenv("ASURA_DBGPS")) {
             std::string ds = dbg, hs = S("%016llX:", (unsigned long long)h);
@@ -1179,10 +1188,10 @@ static bool pack_load() {
 }
 static void manifest_read() {
     if (const char* e = getenv("ASURA_SHADERMANIFEST")) g_manifestPath = e;
-    else {                                                                   // beside the exe, or in the host folder above it during development
-        g_manifestPath = exe_dir() + "\\shader_manifest.txt";
-        const std::string up = bcr2_data_root() + "\\shader_manifest.txt";
-        if (GetFileAttributesA(g_manifestPath.c_str()) == INVALID_FILE_ATTRIBUTES && GetFileAttributesA(up.c_str()) != INVALID_FILE_ATTRIBUTES) g_manifestPath = up;
+    else {                                                                   // Asura: cache\shader_manifest.txt under the data root (out of git: it holds game microcode)
+        const std::string dir = bcr2_data_root() + "\\cache";
+        CreateDirectoryA(dir.c_str(), nullptr);
+        g_manifestPath = dir + "\\shader_manifest.txt";
     }
     if (FILE* f = fopen(g_manifestPath.c_str(), "r")) {
         char line[8192];
@@ -1192,7 +1201,15 @@ static void manifest_read() {
 }
 // Records a shader the game used: its container, plus the words that differ from it.
 static void shader_record(const std::vector<uint32_t>& code, bool isVs, uint32_t paramGen) {
-    if (!shader_recording() || !pack_load()) return;
+    if (!shader_recording()) return;
+    if (!pack_load()) {                                                      // Asura has no shader bundle: record the whole microcode ("V"/"P" lines)
+        if (g_manifestPath.empty()) manifest_read();
+        std::string line = S("%c %08X %zu", isVs ? 'V' : 'P', paramGen, code.size());
+        for (uint32_t w : code) line += S(" %08X", w);
+        if (!g_manifestLines.insert(line).second) return;
+        if (FILE* f = fopen(g_manifestPath.c_str(), "a")) { fprintf(f, "%s\n", line.c_str()); fclose(f); }
+        return;
+    }
     const PackShader* best = nullptr; size_t bestDiff = (size_t)-1;
     for (const PackShader& p : g_pack) {
         if (p.isVs != isVs || p.words != code.size()) continue;
@@ -1221,15 +1238,27 @@ static void shader_precompile() {
         char b[128] = {}; const size_t n = fread(b, 1, sizeof b - 1, f); fclose(f);
         if (stampWant == std::string(b, n)) { fprintf(stderr, "[shader] already compiled ahead of time\n"); return; }
     }
-    if (!pack_load()) return;
+    const bool havePack = pack_load();
     LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
     std::unordered_map<uint64_t, const PackShader*> byKey;
     for (const PackShader& p : g_pack) byKey.emplace(pack_key(p), &p);
     std::vector<uint32_t> code;
     auto load = [&](const PackShader& p) { code.resize(p.words); const uint32_t* w = (const uint32_t*)&g_packData[p.offset]; for (uint32_t i = 0; i < p.words; i++) code[i] = _byteswap_ulong(w[i]); };
     size_t nPs = 0, nManifest = 0, nMissing = 0;
-    for (const auto& kv : byKey) if (!kv.second->isVs) { load(*kv.second); build_shader(code, false, 0xFFFFFFFFu); nPs++; }
+    if (havePack) for (const auto& kv : byKey) if (!kv.second->isVs) { load(*kv.second); build_shader(code, false, 0xFFFFFFFFu); nPs++; }
     for (const std::string& line : g_manifestLines) {
+        if (line[0] == 'V' || line[0] == 'P') {                              // whole microcode (Asura)
+            unsigned pg = 0; size_t n = 0; int used = 0;
+            if (sscanf(line.c_str() + 1, " %x %zu%n", &pg, &n, &used) != 2 || n == 0 || n > 65536) { nMissing++; continue; }
+            code.resize(n);
+            const char* p = line.c_str() + 1 + used; size_t k = 0; unsigned val = 0; int adv = 0;
+            while (k < n && sscanf(p, " %x%n", &val, &adv) == 1) { code[k++] = val; p += adv; }
+            if (k != n) { nMissing++; continue; }
+            build_shader(code, line[0] == 'V', pg);
+            nManifest++;
+            continue;
+        }
+        if (!havePack) continue;
         char kind = 0; unsigned long long key = 0; unsigned pg = 0; int used = 0;
         if (sscanf(line.c_str(), "%c %llx %x%n", &kind, &key, &pg, &used) != 3) continue;
         auto it = byKey.find(key);
@@ -1248,13 +1277,13 @@ static void shader_precompile() {
     while (g_compilePending.load() > 0) {
         const int left = g_compilePending.load();
         if (left != shown) {
-            shown = left; SetWindowTextA(g_hwnd, S("Bionic Commando Rearmed 2 - preparing shaders (%d of %d)", total - left, total).c_str());
+            shown = left; SetWindowTextA(g_hwnd, S("Asura's Wrath - preparing shaders (%d of %d)", total - left, total).c_str());
             if (showProgress) show_compile_progress((total - left) * 100 / total);
         }
         Sleep(50);
     }
     if (showProgress) { show_compile_progress(100); Sleep(400); show_compile_progress(-1); }
-    SetWindowTextA(g_hwnd, "Bionic Commando Rearmed 2 (recomp)");
+    SetWindowTextA(g_hwnd, "Asura's Wrath (recomp)");
     QueryPerformanceCounter(&t1);
     fprintf(stderr, "[shader] done in %.1f s\n", (double)(t1.QuadPart - t0.QuadPart) * g_perfTicksToMs / 1000.0);
     if (FILE* f = fopen(stampPath.c_str(), "w")) { fputs(stampWant.c_str(), f); fclose(f); }
@@ -1280,8 +1309,8 @@ static DXGI_FORMAT rt_dxgi(uint32_t f) {
       case 0: case 1: return DXGI_FORMAT_R8G8B8A8_UNORM;
       case 2: case 10: return DXGI_FORMAT_R10G10B10A2_UNORM;
       case 3: case 12: return DXGI_FORMAT_R16G16B16A16_FLOAT;
-      case 4: return DXGI_FORMAT_R16G16_UNORM;
-      case 5: return DXGI_FORMAT_R16G16B16A16_UNORM;
+      case 4: return DXGI_FORMAT_R16G16_FLOAT;                          // 16_16 / 16_16_16_16 hold -32..32 on the console: kept as the value
+      case 5: return DXGI_FORMAT_R16G16B16A16_FLOAT;
       case 6: return DXGI_FORMAT_R16G16_FLOAT;
       case 7: return DXGI_FORMAT_R16G16B16A16_FLOAT;
       case 14: return DXGI_FORMAT_R32_FLOAT;
@@ -1347,8 +1376,26 @@ static uint64_t guest_sample_hash(uint32_t addr, uint32_t size) {
 }
 
 static Surface* make_surface(uint32_t base, uint32_t pitch, uint32_t height, uint32_t bytes, DXGI_FORMAT fmt) {
+    // The game resolves one buffer in two formats every frame (B130000: float, then unorm). Retired surfaces are kept by
+    // address, size and format and taken back, instead of creating textures twice a frame.
+    static std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, int>, Surface*> spare;
     auto it = g_surfaces.find(base);
-    if (it != g_surfaces.end()) { delete it->second; g_surfaces.erase(it); }
+    if (it != g_surfaces.end()) {
+        Surface* old = it->second; g_surfaces.erase(it);
+        auto k = std::make_tuple(old->base, old->pitch, old->h, old->end - old->base, (int)old->fmt);
+        auto sp = spare.find(k);
+        if (sp != spare.end()) { delete sp->second; sp->second = old; }
+        else if (spare.size() < 64) spare[k] = old;
+        else delete old;
+    }
+    {   auto sp = spare.find(std::make_tuple(base, pitch, height, bytes, (int)fmt));
+        if (sp != spare.end()) {
+            Surface* s = sp->second; spare.erase(sp);
+            g_surfaces[base] = s;
+            s->guestHash = guest_sample_hash(base, bytes);
+            return s;
+        }
+    }
     Surface* s = new Surface(); s->base = base; s->end = base + bytes; s->w = pitch; s->h = height; s->pitch = pitch; s->fmt = fmt;
     D3D11_TEXTURE2D_DESC d{}; d.Width = pitch * g_resScale; d.Height = height * g_resScale; d.MipLevels = 1; d.ArraySize = 1; d.Format = fmt; d.SampleDesc.Count = 1;
     d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -1405,6 +1452,9 @@ static bool tex_fmt(uint32_t f, TexFmt& o) {
       case 21: case 26: o = { 8, 1, DXGI_FORMAT_R16G16B16A16_UNORM, 0 }; return true;
       case 22: case 23: case 33: case 36: o = { 4, 1, DXGI_FORMAT_R32_FLOAT, 0 }; return true;
       case 24: o = { 2, 1, DXGI_FORMAT_R16_UNORM, 0 }; return true;
+      case 27: o = { 2, 1, DXGI_FORMAT_R16_FLOAT, 0 }; return true;           // _EXPAND: 16-bit floats (as Xenia)
+      case 28: o = { 4, 1, DXGI_FORMAT_R16G16_FLOAT, 0 }; return true;
+      case 29: o = { 8, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, 0 }; return true;
       case 30: o = { 2, 1, DXGI_FORMAT_R16_FLOAT, 0 }; return true;
       case 31: o = { 4, 1, DXGI_FORMAT_R16G16_FLOAT, 0 }; return true;
       case 32: o = { 8, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, 0 }; return true;
@@ -1509,7 +1559,9 @@ static void dump_texture_bmp(const char* dir, uint32_t base, uint32_t fmt, uint3
     auto it = last.find(base);
     if (it != last.end() && it->second == hs) return;
     last[base] = hs;
-    if (count++ >= 400) return;
+    const bool decodable = tf.conv || tf.dxgi == DXGI_FORMAT_R8G8B8A8_UNORM || tf.dxgi == DXGI_FORMAT_BC1_UNORM || tf.dxgi == DXGI_FORMAT_BC2_UNORM || tf.dxgi == DXGI_FORMAT_BC3_UNORM;
+    if (!decodable) return;                                                 // (movie planes, 8-bit: would use up the count)
+    if (count++ >= 2000) return;
     std::vector<uint8_t> rgba((size_t)w * h * 4, 0);
     if (tf.conv || tf.dxgi == DXGI_FORMAT_R8G8B8A8_UNORM) memcpy(rgba.data(), data, rgba.size());
     else if (tf.dxgi == DXGI_FORMAT_BC1_UNORM || tf.dxgi == DXGI_FORMAT_BC2_UNORM || tf.dxgi == DXGI_FORMAT_BC3_UNORM) {
@@ -1667,16 +1719,23 @@ static HostTex* get_texture(const FetchInfo& fi) {
     if (!slot) slot = new HostTex();
     HostTex* ht = slot;
     if (!g_buttonKeys.empty() && g_buttonKeys.count(key)) if (HostTex* o = button_override()) return o;
-    if (g_trace > 1000) {
+    static const bool kTexDbgWide = getenv("ASURA_TEXDBGWIDE") != nullptr;   // also, at any frame: 2:1 DXT textures up to 256 wide
+    const bool wide21 = kTexDbgWide && fi.w <= 256 && fi.w == 2 * fi.h && (fi.fmt == 18 || fi.fmt == 20);
+    if (g_trace > 1000 || wide21) {
         static std::set<uint64_t> seen;
-        if (seen.insert(key).second && fi.w <= 32 && fi.h <= 32) {                // small textures: show their layout and raw blocks
+        if (seen.insert(key).second && ((fi.w <= 32 && fi.h <= 32) || wide21)) {                // small textures: show their layout and raw blocks
             fprintf(stderr, "[texdbg] base=%08X fmt=%u %ux%u pitch=%u tiled=%d packed=%d endian=%u off=%u,%u raw@off:", fi.base, fi.fmt, fi.w, fi.h, fi.pitch, (int)fi.tiled, (int)fi.packed, fi.endian, offX, offY);
             uint32_t a0 = fi.tiled ? tiled2d(offX, offY, pitchAligned, bl2) : offY * rowBytes + offX * tf.bpb;
             for (uint32_t k = 0; k < 2; k++) fprintf(stderr, " %08X", *(const uint32_t*)phys(fi.base + a0 + k * 4));
             fprintf(stderr, " raw@0:");
             for (uint32_t k = 0; k < 2; k++) fprintf(stderr, " %08X", *(const uint32_t*)phys(fi.base + k * 4));
             uint32_t nz = 0; for (uint32_t k = 0; k < total; k += 4) if (*(const uint32_t*)phys(fi.base + k)) nz++;
-            fprintf(stderr, " nonzero dwords=%u of %u\n", nz, total / 4);
+            fprintf(stderr, " nonzero dwords=%u of %u map:", nz, total / 4);
+            for (uint32_t k = 0; k < total && k < 32768; k += 256) {         // one character per 256 bytes: '#' all set, '+' some, '.' none
+                uint32_t c = 0; for (uint32_t j = 0; j < 256; j += 4) if (*(const uint32_t*)phys(fi.base + k + j)) c++;
+                fputc(c == 64 ? '#' : c ? '+' : '.', stderr);
+            }
+            fputc('\n', stderr);
         }
     }
     if (ht->lastFrame == g_frame && ht->srv) return ht;
@@ -2184,6 +2243,8 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         fprintf(stderr, " c509=%g,%g,%g,%g c256=%g,%g,%g,%g c267=%g,%g,%g,%g colfmt=%u", reg_f(R_CONST + 509 * 4), reg_f(R_CONST + 509 * 4 + 1), reg_f(R_CONST + 509 * 4 + 2), reg_f(R_CONST + 509 * 4 + 3),
                 reg_f(R_CONST + 256 * 4), reg_f(R_CONST + 256 * 4 + 1), reg_f(R_CONST + 256 * 4 + 2), reg_f(R_CONST + 256 * 4 + 3),
                 reg_f(R_CONST + 267 * 4), reg_f(R_CONST + 267 * 4 + 1), reg_f(R_CONST + 267 * 4 + 2), reg_f(R_CONST + 267 * 4 + 3), (g_regs[R_COLOR_INFO] >> 16) & 0xF);
+        for (int k : { 259, 263, 508, 510, 511 })                           // post-process constants (tone map: c263 bloom, c508 gamma, c511 decode)
+            fprintf(stderr, " c%d=%g,%g,%g,%g", k, reg_f(R_CONST + k * 4), reg_f(R_CONST + k * 4 + 1), reg_f(R_CONST + k * 4 + 2), reg_f(R_CONST + k * 4 + 3));
         static const char* traceVC = getenv("ASURA_TRACEVC");                // hash of a vertex shader: print its transform constants, once per frame
         if (traceVC && S("%016llX", (unsigned long long)vs->hash) == traceVC) {
             static uint64_t lastF = ~0ull;
@@ -2385,6 +2446,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         for (int i = 0; i < 4; i++) cb.tfsg[u.slot * 4 + i] = (tf[0] >> (2 + i * 2)) & 3;
         cb.tfp[u.slot * 4 + 2] = (float)std::ldexp(1.0, sext((tf[3] >> 13) & 63, 6));
         cb.tfi[u.slot * 4] = 1.0f / w; cb.tfi[u.slot * 4 + 1] = 1.0f / h;
+        cb.tfi[u.slot * 4 + 3] = (fmt >= 24 && fmt <= 26) ? 1.0f : (fmt >= 27 && fmt <= 32) ? 3.0f : 0.0f;   // 16-bit decode in texfix
         ID3D11SamplerState* smp = get_sampler(tf, u);
         samps[u.slot] = smp;
         // a resolve destination?
@@ -2399,6 +2461,12 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         if (sf && u.dim != 3) {
             bool wantsRaw = sf->rawSrv && fmt != 22 && fmt != 23;           // depth read as bytes, not as a depth format
             srvs[u.slot] = wantsRaw ? sf->rawSrv.Get() : sf->srv.Get();
+            switch (sf->fmt) {                                              // 16-bit decode in texfix follows what the surface holds
+              case DXGI_FORMAT_R16_UNORM: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16G16B16A16_UNORM: cb.tfi[u.slot * 4 + 3] = 1.0f; break;
+              case DXGI_FORMAT_R16_SNORM: case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R16G16B16A16_SNORM: cb.tfi[u.slot * 4 + 3] = 2.0f; break;
+              case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16B16A16_FLOAT: cb.tfi[u.slot * 4 + 3] = (fmt == 54 || fmt == 7) ? 0.0f : 3.0f; break;
+              default: cb.tfi[u.slot * 4 + 3] = 0.0f; break;
+            }
             uint32_t depth = 1;
             if (dim == 2) { w = (tf[2] & 0x7FF) + 1; h = ((tf[2] >> 11) & 0x7FF) + 1; depth = (tf[2] >> 22) + 1; }   // 3D
             else if (dim == 1) depth = ((tf[2] >> 26) & 63) + 1;                                                      // 2D, stacked
@@ -2416,8 +2484,8 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
             static const bool kNoFill = getenv("ASURA_NOCHANFILL") != nullptr;
             int fill = 0;
             switch (fmt) {
-              case 2: case 8: case 9: case 24: case 30: case 39: case 59: fill = 1; break;
-              case 10: case 13: case 25: case 31: case 40: case 49: fill = 2; break;
+              case 2: case 8: case 9: case 24: case 27: case 30: case 39: case 59: fill = 1; break;
+              case 10: case 13: case 25: case 28: case 31: case 40: case 49: fill = 2; break;
             }
             if (fill && !kNoFill) for (int i = 0; i < 4; i++) {
                 int32_t& sel = cb.tfsw[u.slot * 4 + i];
@@ -2487,10 +2555,13 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     cb.alpha[0] = (colorCtl & 8) ? (float)(colorCtl & 7) : 7.0f; cb.alpha[1] = reg_f(R_ALPHA_REF); cb.alpha[3] = 0;
     cb.alpha[2] = (!depthOnly && ((g_regs[R_COLOR_INFO] >> 16) & 0xF) == 1) ? 1.0f : 0.0f;
     if (g_trace > 0 && cb.alpha[2] != 0) logf_once("gammart", "gamma colour target in use");
-    {   // see the 16_16(_16_16) note in the pixel shader epilogue: value/32 as int16, read back as unorm16
-        static const bool kNoFixed16 = getenv("ASURA_NOFIXED16") != nullptr;
-        const uint32_t cf = (g_regs[R_COLOR_INFO] >> 16) & 0xF;
-        if (!depthOnly && !kNoFixed16 && (cf == 4 || cf == 5)) cb.alpha[3] = 32767.0f / (32.0f * 65535.0f);
+    if (!depthOnly) {   // colour exponent bias and the -32..32 clamp of 16_16(_16_16): see the pixel shader epilogue
+        static const bool kNoExpBias = getenv("ASURA_NOEXPBIAS") != nullptr;
+        const uint32_t ci = g_regs[R_COLOR_INFO], cf = (ci >> 16) & 0xF;
+        const int bias = kNoExpBias ? 0 : sext((ci >> 20) & 63, 6);
+        const bool fixed16 = cf == 4 || cf == 5;
+        if (bias || fixed16) cb.alpha[3] = (float)std::ldexp(1.0, bias) * (fixed16 ? -1.0f : 1.0f);
+        if (bias) logf_once(S("rtexp%d_%u", bias, cf).c_str(), "colour target exponent bias %d on format %u", bias, cf);
     }
     memcpy(cb.bools, &g_regs[R_BOOL], 32);
     memcpy(cb.loops, &g_regs[R_LOOP], 128);
@@ -2689,7 +2760,7 @@ static void draw_sprites(int px, int py, int pw, int ph) {
         ID3D11RenderTargetView* rtv = g_backRtv.Get();
         g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
         invalidate_binds();
-        struct { float ofs[2]; float scale[2]; uint32_t sw; float gam; float pv; float aa; } p{ { dx0, dy0 }, { dw, dh }, 0u, 1.0f, 0.0f, 0.0f };
+        struct { float ofs[2]; float scale[2]; uint32_t sw; float gam; float pv; float aa; float es, pad[3]; } p{ { dx0, dy0 }, { dw, dh }, 0u, 1.0f, 0.0f, 0.0f, 0.0f, {} };
         upload_cb(g_cbBlit.Get(), &p, sizeof(p));
         ID3D11Buffer* cb = g_cbBlit.Get();
         g_ctx->PSSetConstantBuffers(2, 1, &cb);
@@ -2740,13 +2811,14 @@ static void show_compile_progress(int pct) {
 
 // ---- resolve ----
 static ID3D11ShaderResourceView* g_blitExtra = nullptr;                        // bound to t2 for the next blit: the gamma screen's sample picture
+static float g_blitExpScale = 0;   // resolve blits: 2^(copy exponent bias), 0 = none
 static void blit(ID3D11ShaderResourceView* src, ID3D11PixelShader* ps, ID3D11RenderTargetView* dst, uint32_t dw, uint32_t dh,
                  int dx0, int dy0, int dx1, int dy1, int sx, int sy, bool swaprb, float scaleX = 1, float scaleY = 1, ID3D11ShaderResourceView* src2 = nullptr, const float* ofsOverride = nullptr) {
     ID3D11ShaderResourceView* nul[32] = {};
     g_ctx->PSSetShaderResources(0, 32, nul);
     g_ctx->OMSetRenderTargets(1, &dst, nullptr);
     invalidate_binds();
-    struct { float ofs[2]; float scale[2]; uint32_t sw; float gam; float pv; float aa; } p{ { (float)(sx - dx0), (float)(sy - dy0) }, { scaleX, scaleY }, swaprb ? 1u : 0u, g_gamma.load(), (g_blitExtra ? 1.0f : 0.0f), (float)g_aaMode.load() };
+    struct { float ofs[2]; float scale[2]; uint32_t sw; float gam; float pv; float aa; float es, pad[3]; } p{ { (float)(sx - dx0), (float)(sy - dy0) }, { scaleX, scaleY }, swaprb ? 1u : 0u, g_gamma.load(), (g_blitExtra ? 1.0f : 0.0f), (float)g_aaMode.load(), g_blitExpScale, {} };
     if (ofsOverride) { p.ofs[0] = ofsOverride[0]; p.ofs[1] = ofsOverride[1]; }
     upload_cb(g_cbBlit.Get(), &p, sizeof(p));
     ID3D11Buffer* cb = g_cbBlit.Get();
@@ -2935,12 +3007,33 @@ static void do_resolve() {
 
     static int nlog = 0;
     if (nlog++ < 60 || g_trace > 0)
-        fprintf(stderr, "[gfx] resolve src=%u cmd=%u rect=%d,%d-%d,%d dest=%X pitch=%u h=%u fmt=%u swap=%d clr=%d/%d win=%08X surf=%08X col=%08X dep=%08X cc=%08X dc=%08X\n",
-                srcSel, cmd, x0, y0, x1, y1, destBase, destPitch, destH, destFmt, (int)destSwap, (int)colorClear, (int)depthClear, g_regs[R_WINDOW_OFFSET], surf, ci, g_regs[R_DEPTH_INFO], g_regs[R_COLOR_CLEAR], g_regs[R_DEPTH_CLEAR]);
+        fprintf(stderr, "[gfx] resolve src=%u cmd=%u rect=%d,%d-%d,%d dest=%X pitch=%u h=%u fmt=%u exp=%d num=%u swap=%d clr=%d/%d win=%08X surf=%08X col=%08X dep=%08X cc=%08X dc=%08X\n",
+                srcSel, cmd, x0, y0, x1, y1, destBase, destPitch, destH, destFmt, sext((di >> 16) & 63, 6), (di >> 13) & 7, (int)destSwap, (int)colorClear, (int)depthClear, g_regs[R_WINDOW_OFFSET], surf, ci, g_regs[R_DEPTH_INFO], g_regs[R_COLOR_CLEAR], g_regs[R_DEPTH_CLEAR]);
 
     if (cmd != 3 && destBase != 0 && destPitch != 0) {
         Rt* src = isDepth ? depthRt : colorSrc;
         DXGI_FORMAT fmt = isDepth ? DXGI_FORMAT_R32_FLOAT : src->fmt;
+        // 16-bit destinations: the resolve converts to the destination format and number type (RB_COPY_DEST_INFO 13-15:
+        // 0 unorm, 1 snorm, 7 float) after scaling by 2^(exponent bias, bits 16-21). The game copies its 16_16_16_16 post
+        // buffers out as float, and as unorm with bias -5 (they were drawn with colour bias +5).
+        static const bool kNoResolveConv = getenv("ASURA_NORESOLVECONV") != nullptr;
+        const uint32_t destNum = (di >> 13) & 7;
+        const int destExp = sext((di >> 16) & 63, 6);
+        g_blitExpScale = 0;
+        if (!isDepth && !kNoResolveConv) {
+            static const DXGI_FORMAT k16[3][3] = {                         // [channels 1/2/4][unorm, snorm, float]
+                { DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16_SNORM, DXGI_FORMAT_R16_FLOAT },
+                { DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16G16_SNORM, DXGI_FORMAT_R16G16_FLOAT },
+                { DXGI_FORMAT_R16G16B16A16_UNORM, DXGI_FORMAT_R16G16B16A16_SNORM, DXGI_FORMAT_R16G16B16A16_FLOAT } };
+            int ch = -1, nt = destNum == 0 ? 0 : destNum == 1 ? 1 : destNum == 7 ? 2 : -1;
+            switch (destFmt) {
+              case 24: ch = 0; break; case 25: ch = 1; break; case 26: ch = 2; break;
+              case 30: ch = 0; nt = 2; break; case 31: ch = 1; nt = 2; break; case 32: ch = 2; nt = 2; break;
+            }
+            if (ch >= 0 && nt >= 0) fmt = k16[ch][nt];
+            if (destExp) g_blitExpScale = (float)std::ldexp(1.0, destExp);
+            if (ch >= 0 || destExp) logf_once(S("rcv%u_%u_%d", destFmt, destNum, destExp).c_str(), "resolve to format %u number %u exponent %d", destFmt, destNum, destExp);
+        }
         uint32_t bytesPerPx = 4; { TexFmt t; if (tex_fmt(destFmt, t) && t.block == 1) bytesPerPx = t.bpb; }
         uint32_t bl2 = bytesPerPx == 1 ? 0 : bytesPerPx == 2 ? 1 : bytesPerPx == 4 ? 2 : bytesPerPx == 8 ? 3 : 4;
         uint32_t pitchAligned = align_up(destPitch, 32);
@@ -2971,6 +3064,7 @@ static void do_resolve() {
             sf->guestHash = guest_sample_hash(sf->base, sf->end - sf->base);
             sf->swapped = destSwap && !isDepth;
         }
+        g_blitExpScale = 0;
     }
     if (colorClear && colorSrc) {
         uint32_t cv = g_regs[R_COLOR_CLEAR];
@@ -3195,9 +3289,24 @@ static void dump_surfaces() {
             std::vector<uint8_t> row(d.Width * 4);
             for (uint32_t y = 0; y < d.Height; y++) {
                 const uint8_t* src = (const uint8_t*)ms.pData + y * ms.RowPitch;
+                auto u8 = [](float v) { return (uint8_t)std::clamp(v * 255.0f + 0.5f, 0.0f, 255.0f); };
+                auto half = [](uint16_t h) {                       // half float to float (denormals flushed; good enough for a picture)
+                    const uint32_t e = (h >> 10) & 31, m = h & 1023, sgn = (uint32_t)(h >> 15) << 31;
+                    uint32_t b = e == 0 ? sgn : e == 31 ? (sgn | 0x7F800000 | (m << 13)) : (sgn | ((e + 112) << 23) | (m << 13));
+                    float f; memcpy(&f, &b, 4); return f; };
                 for (uint32_t x = 0; x < d.Width; x++) {
                     uint8_t r, g, b;
-                    if (d.Format == DXGI_FORMAT_R32_FLOAT) { float v; memcpy(&v, src + x * 4, 4); r = g = b = (uint8_t)std::clamp(v * 255.0f, 0.0f, 255.0f); }
+                    // Decoded per format, so the picture is the surface's value clamped to 0..1 (half floats and 10-bit used to come out as raw bytes)
+                    if (d.Format == DXGI_FORMAT_R32_FLOAT) { float v; memcpy(&v, src + x * 4, 4); r = g = b = u8(v); }
+                    else if (d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) { uint16_t h[4]; memcpy(h, src + x * 8, 8); r = u8(half(h[0])); g = u8(half(h[1])); b = u8(half(h[2])); }
+                    else if (d.Format == DXGI_FORMAT_R16G16B16A16_UNORM) { uint16_t h[4]; memcpy(h, src + x * 8, 8); r = h[0] >> 8; g = h[1] >> 8; b = h[2] >> 8; }
+                    else if (d.Format == DXGI_FORMAT_R16G16_FLOAT) { uint16_t h[2]; memcpy(h, src + x * 4, 4); r = u8(half(h[0])); g = u8(half(h[1])); b = 0; }
+                    else if (d.Format == DXGI_FORMAT_R16G16_UNORM) { uint16_t h[2]; memcpy(h, src + x * 4, 4); r = h[0] >> 8; g = h[1] >> 8; b = 0; }
+                    else if (d.Format == DXGI_FORMAT_R10G10B10A2_UNORM) { uint32_t w; memcpy(&w, src + x * 4, 4); r = (w >> 2) & 255; g = (w >> 12) & 255; b = (w >> 22) & 255; }
+                    else if (d.Format == DXGI_FORMAT_R32G32_FLOAT) { float v[2]; memcpy(v, src + x * 8, 8); r = u8(v[0]); g = u8(v[1]); b = 0; }
+                    else if (d.Format == DXGI_FORMAT_R32G32B32A32_FLOAT) { float v[4]; memcpy(v, src + x * 16, 16); r = u8(v[0]); g = u8(v[1]); b = u8(v[2]); }
+                    else if (d.Format == DXGI_FORMAT_R8G8_UNORM) { r = src[x * 2]; g = src[x * 2 + 1]; b = 0; }
+                    else if (d.Format == DXGI_FORMAT_R8_UNORM) { r = g = b = src[x]; }
                     else { r = src[x * 4]; g = src[x * 4 + 1]; b = src[x * 4 + 2]; }
                     row[x * 4] = b; row[x * 4 + 1] = g; row[x * 4 + 2] = r; row[x * 4 + 3] = 255;
                 }
@@ -3586,6 +3695,8 @@ void gpu_packet(uint8_t* base, uint32_t op, const uint32_t* b, uint32_t cnt) {
         uint32_t* c = (uint32_t*)phys(addr & ~3u);                          // Total_A/B, ZFail_A/B, ZPass_A/B, StencilFail_A/B
         const uint32_t kDone = _byteswap_ulong(0xFFFFFEEDu);
         bool endZPass = c[4] == kDone && c[5] == kDone, endZFail = c[2] == kDone && c[3] == kDone;
+        if (g_trace > 0) fprintf(stderr, "[zpd] f=%llu at %08X before: %08X %08X %08X %08X %08X %08X %08X %08X%s\n", (unsigned long long)g_frame, addr,
+                                 c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], (endZPass || endZFail) ? " end" : "");
         memset(c, 0, 32);
         if (endZPass || endZFail) { c[4] = 1000; c[0] = 1000; }
         static int nl = 0;

@@ -416,13 +416,15 @@ static void monitor_thread() {
             if (since) {
                 uint32_t o = s.waitObj.load();
                 fprintf(stderr, "[monitor] thread %u: %s wait on %08X (type %u state %d) from lr=%08X for %llu ms, cpu +%llu ms\n", tid, s.waitKind, o,
-                        o ? g_base[o] : 0, o ? (int)rd32(o + 4) : 0, s.waitLr.load(), (unsigned long long)(now - since), (unsigned long long)(cpu - s.lastCpu));
+                        (o && !IsBadReadPtr(g_base + o, 8)) ? g_base[o] : 0, (o && !IsBadReadPtr(g_base + o, 8)) ? (int)rd32(o + 4) : 0, s.waitLr.load(), (unsigned long long)(now - since), (unsigned long long)(cpu - s.lastCpu));
             } else {
                 fprintf(stderr, "[monitor] thread %u: running, lr=%08X r1=%08X r3=%08X, cpu +%llu ms, stack:", tid, x ? (uint32_t)x->lr : 0, x ? x->r1.u32 : 0, x ? x->r3.u32 : 0,
                         (unsigned long long)(cpu - s.lastCpu));
+                // r1 is a snapshot of a running thread and can be stale: check every read (an unmapped stack page took the process down)
                 for (uint32_t sp = x ? x->r1.u32 : 0, k = 0; k < 12 && sp >= 0x40000000u && sp < 0x7F000000u; k++) {
+                    if (IsBadReadPtr(g_base + sp, 4)) break;
                     uint32_t next = rd32(sp);
-                    if (next <= sp || next - sp > 0x100000) break;
+                    if (next <= sp || next - sp > 0x100000 || IsBadReadPtr(g_base + next - 8, 4)) break;
                     fprintf(stderr, " %08X", rd32(next - 8));
                     sp = next;
                 }
