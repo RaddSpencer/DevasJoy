@@ -118,7 +118,28 @@ Ruled out since (2026-11-10, later): VMX translations used in culling (vmsum3/4f
 
 Tiled textures whose fetch pitch is at least twice their width (64x32 DXT1 with pitch 128, 32x32 with pitch 128) hold the image at block (width, height) of the tile: decoding a raw tile (`ASURA_TEXDUMPMIPS` also saves `raw_*.bin` for 2:1 textures; `asura.exe --decode-dxt1 <file> <w> <h> <pitch> <tiled>`) showed a 64x32 image at texel (64, 32) and its small mips at the top left. get_texture now reads the base level from there (`ASURA_NOSUBRECT` turns it off). Explosion puffs and Gohma swarm glows draw correctly with it. Not derived from a known rule (Xenia's packing rule doesn't place it there), so other sizes may still be off. Ruled out on the way: stale E0 page marks (no texture is on an E0 page; `ASURA_TEXE0LOG`), mip addresses (always right after the base level). `ASURA_PHYSWATCH=<physical>` logs writes to a physical page through any window.
 
-Open: distant ships look glassy white, fading as they come closer (the user: not intended). Next suspect: the environment cube map they reflect.
+Distant ships glassy white, fading as they came closer: fixed by memexport (next section).
+
+Update after memexport: every texture this rule touches now has its image at the origin and nothing at (width, height) (`ASURA_SUBRECTLOG=1` logs each with both counts), so the raw tiles above were textures caught mid-move. Always reading from (w, h) had removed Asura's flame aura in the shooting segment; the offset is now used only when (w, h) holds more data than the origin. Flames and round explosion puffs both check out (logs\flame3).
+
+### Vertex streams split across ring buffers (fixed 2026-11-10)
+
+One-frame flicker on faces, the Gohma torso and ships (wrong surface on the right shape, different frames every run): vb_alloc moves to the next of the vertex ring buffers when one fills, and a draw's streams were allocated one at a time. When the move fell between two streams, the draw bound the new buffer and read its earlier stream at the old offset from it. issue_draw now reserves room for all of a draw's streams first (vb_reserve). User check: "Flicker is gone".
+
+### Debug aids added late 2026-11-10
+
+- F9 (with --log) saves every frame, 105 before the press and 45 after (`ASURA_SHOTRINGAFTER`), plus draws_<frame>.txt: each draw's shaders, vertex stream, constant hashes and pixel texture addresses with content hashes. An input replay pauses its clock while a capture is saved, and hands the pad back when the recording ends.
+- `ASURA_TEXFLIP=1`: one-frame texture swaps per draw, and draws present or missing for one frame (`[texflip]`, `[drawflip]`).
+- `ASURA_MONSAMPLE=1`: samples guest thread stacks every 2 ms and logs where frames over 120 ms went (`[sample]`). Critical-section waits over 100 ms log how often others took the lock meanwhile (`[cs]`).
+- `[texzero]` (on with --log): textures of 64x64 and up whose base level is all zero at upload. `ASURA_TEXDUMPONLY=addr,...` limits the texture dumps.
+
+Open: scene-cut hitches of 0.1 to 0.4 s (present before memexport, vary per run); ships sometimes dark and without detail in some runs only (timing, likely streaming); speckle on Asura at pilot7 frames 5119 to 5198; colour banding.
+
+### Memexport: UE3 moves texture memory with the GPU (fixed 2026-11-10)
+
+White distant ships (wrong mip levels), one-frame texture swaps on ships, walls and the Gohma torso (even on a paused, still scene), and the Episode Menu's broken visuals all had one cause. The game runs a vertex shader (vs 32F7068C769B5B04, point lists of 64 to 16384 points) whose exports go to eA/eM (export registers 32 to 37) instead of a position: Xenos memexport. UE3's texture pool uses it to move and copy texture memory (8 KB to 1 MB per draw, 16 bytes per point, format 32_32_32_32_FLOAT). The renderer ignored those exports, so moved textures kept stale or other textures' data at their new place, worst in the small mips.
+
+Now: the translator marks such shaders (`XShader::memexport`), keeps eA/eM in locals, and flushes them at each `alloc` and at the end (`mx_flush` in kMemExport, decoding eA as Xenia does: x = 0x40000000 | base in dwords, y = 2^23 + index, z = format word, w = 2^23 + count). Moves keep raw bits (`max(a,a)` becomes a copy in these shaders, or denormal patterns would flush to zero). The vertex shader writes (address, value, mask) records to a UAV (needs feature level 11_1); issue_draw draws the vertices as points with no target, reads the records back (a GPU sync per memexport draw) and writes them into guest memory; textures used earlier in the frame re-check their data (`g_mxEpoch`). `[mx]` lines log the first 20 draws (`ASURA_MXLOG=1` all of them); `ASURA_NOMEMEXPORT` turns it off for comparison. Shaders without memexport compile from the same source as before.
 
 ### Broken small textures (earlier notes)
 

@@ -83,6 +83,9 @@ static bool auto_input(uint32_t st) {
 // Timing is wall-clock, so a playback drifts with loading times; start both runs the same way (ASURA_SKIPINTRO and the same save).
 struct PadRec { uint32_t ms; uint16_t b; uint8_t lt, rt; int16_t lx, ly, rx, ry; };
 static ULONGLONG input_t0() { static const ULONGLONG t0 = GetTickCount64(); return t0; }
+// Time the game spent stalled by debug captures (F9 saving images): playback leaves it out, so a capture does not make it run ahead of the game.
+static std::atomic<uint64_t> g_inputPauseMs{0};
+void input_clock_pause(uint64_t ms) { g_inputPauseMs += ms; }
 static bool input_play(uint32_t st) {
     static const char* path = getenv("ASURA_INPUTPLAY");
     if (!path) return false;
@@ -99,8 +102,13 @@ static bool input_play(uint32_t st) {
         return v;
     }();
     static size_t i = 0;
-    const uint32_t now = (uint32_t)(GetTickCount64() - input_t0());
+    const uint32_t now = (uint32_t)(GetTickCount64() - input_t0() - g_inputPauseMs.load());
     while (i + 1 < recs.size() && recs[i + 1].ms <= now) i++;
+    if (!recs.empty() && i + 1 == recs.size() && now > recs[i].ms + 2000) {   // the recording is over: hand the pad back
+        static bool said = false;
+        if (!said) { said = true; LOG("[input] recording played to the end; the pad is live again\n"); }
+        return false;
+    }
     static uint32_t packet = 0;
     if (!recs.empty() && recs[i].ms <= now) {
         const PadRec& r = recs[i];

@@ -3,6 +3,8 @@
 #include "kernel.h"
 #include <windows.h>
 #include <bcrypt.h>
+#include <timeapi.h>
+#include <string>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -439,7 +441,59 @@ static void monitor_thread() {
         fflush(stderr);
     }
 }
-void monitor_start() { if (g_logging) std::thread(monitor_thread).detach(); }
+// ASURA_MONSAMPLE=1 (with --log): every 2 ms, the stack of each running guest thread (lr and three callers) and what waiting threads wait in.
+// When a frame takes over 120 ms (ASURA_MONSAMPLEMS to change), logs the most frequent ones for that frame: where a long frame went.
+uint64_t gpu_frame_number();
+static void sampler_thread() {
+    static const double kMs = getenv("ASURA_MONSAMPLEMS") ? atof(getenv("ASURA_MONSAMPLEMS")) : 120.0;
+    timeBeginPeriod(1);
+    std::map<std::string, uint32_t> counts;
+    uint64_t frame = gpu_frame_number(); ULONGLONG t0 = GetTickCount64(); uint32_t samples = 0;
+    for (;;) {
+        Sleep(2);
+        const uint64_t f = gpu_frame_number();
+        const ULONGLONG now = GetTickCount64();
+        if (f != frame) {
+            if ((double)(now - t0) >= kMs && samples) {
+                std::vector<std::pair<uint32_t, std::string>> v;
+                for (auto& kv : counts) v.push_back({ kv.second, kv.first });
+                std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.first > b.first; });
+                fprintf(stderr, "[sample] frame %llu took %llu ms, %u samples:\n", (unsigned long long)frame, (unsigned long long)(now - t0), samples);
+                for (size_t i = 0; i < v.size() && i < 14; i++) fprintf(stderr, "[sample]   %4u %s\n", v[i].first, v[i].second.c_str());
+                fflush(stderr);
+            }
+            counts.clear(); samples = 0; frame = f; t0 = now;
+        }
+        samples++;
+        for (int i = 0; i < g_monN.load() && i < 256; i++) {
+            MonSlot& s = g_mon[i];
+            DWORD code = 0; if (s.h && GetExitCodeThread(s.h, &code) && code != STILL_ACTIVE) continue;
+            const uint32_t tid = s.kthread && !IsBadReadPtr(g_base + s.kthread + 0x14C, 4) ? rd32(s.kthread + 0x14C) : 0;
+            char b[200];
+            if (s.waitSince.load()) {
+                if (now - s.waitSince.load() > 1000) continue;                  // long idle waits: not this frame's story
+                snprintf(b, sizeof b, "t%u wait %s from %08X", tid, s.waitKind, s.waitLr.load());
+            } else {
+                PPCContext* x = s.ctx.load();
+                if (!x) continue;
+                int n = snprintf(b, sizeof b, "t%u run lr=%08X <", tid, (uint32_t)x->lr);
+                for (uint32_t sp = x->r1.u32, k = 0; k < 3 && sp >= 0x40000000u && sp < 0x7F000000u; k++) {
+                    if (IsBadReadPtr(g_base + sp, 4)) break;
+                    uint32_t next = rd32(sp);
+                    if (next <= sp || next - sp > 0x100000 || IsBadReadPtr(g_base + next - 8, 4)) break;
+                    n += snprintf(b + n, sizeof b - n, " %08X", rd32(next - 8));
+                    sp = next;
+                }
+            }
+            counts[b]++;
+        }
+    }
+}
+void monitor_start() {
+    if (!g_logging) return;
+    std::thread(monitor_thread).detach();
+    if (getenv("ASURA_MONSAMPLE")) std::thread(sampler_thread).detach();
+}
 
 // ---- APCs: I/O completion routines queue on the thread that started the I/O and run at its next alertable wait or sleep ----
 struct Apc { uint32_t routine, a1, a2, a3; };
@@ -671,23 +725,28 @@ void file_close(uint32_t handle);   // kfile.cpp
 static void NtClose_(PPCContext& ctx, uint8_t*) { file_close(ctx.r3.u32); handle_close(ctx.r3.u32); ctx.r3.u64 = STATUS_SUCCESS; }
 
 // critical sections: one host recursive mutex per guest critical section
+struct GuestCs { std::recursive_mutex m; std::atomic<uint64_t> takes{0}; };
 static std::mutex g_csMapLock;
-static std::unordered_map<uint32_t, std::unique_ptr<std::recursive_mutex>> g_cs;
-static std::recursive_mutex& cs_mutex(uint32_t cs) {
+static std::unordered_map<uint32_t, std::unique_ptr<GuestCs>> g_cs;
+static GuestCs& cs_get(uint32_t cs) {
     std::lock_guard<std::mutex> g(g_csMapLock);
     auto& p = g_cs[cs];
-    if (!p) p = std::make_unique<std::recursive_mutex>();
+    if (!p) p = std::make_unique<GuestCs>();
     return *p;
 }
-static void RtlInitializeCriticalSection_(PPCContext& ctx, uint8_t*) { cs_mutex(ctx.r3.u32); ctx.r3.u64 = 0; }
+static void RtlInitializeCriticalSection_(PPCContext& ctx, uint8_t*) { cs_get(ctx.r3.u32); ctx.r3.u64 = 0; }
 static void RtlEnterCriticalSection_(PPCContext& ctx, uint8_t*) {
-    auto& m = cs_mutex(ctx.r3.u32);
-    if (m.try_lock()) return;
+    auto& c = cs_get(ctx.r3.u32);
+    if (c.m.try_lock()) { c.takes++; return; }
     MonWait mw("critical section", ctx.r3.u32);
-    m.lock();
+    const uint64_t before = c.takes.load(); const ULONGLONG t0 = GetTickCount64();
+    c.m.lock(); c.takes++;
+    const ULONGLONG ms = GetTickCount64() - t0;
+    if (ms >= 100 && g_logging)                                             // a long wait: was the lock held throughout, or taken by others meanwhile?
+        fprintf(stderr, "[cs] %08X: waited %llu ms (lr %08X); others took it %llu times meanwhile\n", ctx.r3.u32, (unsigned long long)ms, (uint32_t)ctx.lr, (unsigned long long)(c.takes.load() - before - 1));
 }
-static void RtlLeaveCriticalSection_(PPCContext& ctx, uint8_t*) { cs_mutex(ctx.r3.u32).unlock(); }
-static void RtlTryEnterCriticalSection_(PPCContext& ctx, uint8_t*) { ctx.r3.u64 = cs_mutex(ctx.r3.u32).try_lock() ? 1 : 0; }
+static void RtlLeaveCriticalSection_(PPCContext& ctx, uint8_t*) { cs_get(ctx.r3.u32).m.unlock(); }
+static void RtlTryEnterCriticalSection_(PPCContext& ctx, uint8_t*) { auto& c = cs_get(ctx.r3.u32); const bool ok = c.m.try_lock(); if (ok) c.takes++; ctx.r3.u64 = ok ? 1 : 0; }
 
 // spin locks: a guest word, 0 = free
 static void spin_acquire(uint32_t a) {

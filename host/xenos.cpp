@@ -130,11 +130,13 @@ static std::atomic<int> g_shotBurstLeft{0};
 static std::atomic<int> g_shotStep{1};
 static std::atomic<bool> g_ringDump{false};
 bool bcr2_log_requested();   // main.cpp: true when --log was given, also before main() runs
-static const int g_shotRingSize = getenv("ASURA_SHOTRING") ? atoi(getenv("ASURA_SHOTRING")) : (bcr2_log_requested() ? 90 : 0);   // with --log, F9 saves the last 3 s by default
+static const int g_shotRingSize = getenv("ASURA_SHOTRING") ? atoi(getenv("ASURA_SHOTRING")) : (bcr2_log_requested() ? 150 : 0);   // with --log, F9 saves 150 frames (every frame): 3.5 s before the press and 1.5 s after
 static uint64_t g_frame = 0;
 static ComPtr<ID3D11Device> g_dev;
 static ComPtr<ID3D11DeviceContext> g_ctx;
 static ComPtr<ID3D11DeviceContext1> g_ctx1;
+static D3D_FEATURE_LEVEL g_featureLevel = D3D_FEATURE_LEVEL_11_0;           // 11_1 lets vertex shaders write UAVs (memexport)
+static uint64_t g_mxEpoch = 0;                                               // bumped when memexport writes guest memory: textures re-check their data
 static ComPtr<IDXGISwapChain> g_swap;
 static ComPtr<ID3D11RenderTargetView> g_backRtv;
 static ComPtr<ID3D11Texture2D> g_backTex;
@@ -346,6 +348,7 @@ static bool device_init() {
     HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, want, 2, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, &got, &g_ctx);
     if (FAILED(hr)) hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, want + 1, 1, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, &got, &g_ctx);
     if (FAILED(hr)) { fprintf(stderr, "[gfx] D3D11 device creation failed: %08lX; running without rendering\n", hr); return false; }
+    g_featureLevel = got;
     g_ctx.As(&g_ctx1);
     {   // Queue at most one finished frame ahead of the display. The default of three adds visible input lag.
         ComPtr<IDXGIDevice1> dxgi;
@@ -476,6 +479,7 @@ struct XShader {
     std::vector<TexUse> tex;
     std::vector<VfUse> vf;
     bool ok = false;
+    bool memexport = false;                                                  // vertex shader writes memory (eA/eM exports): drawn through issue_memexport
     uint64_t hash = 0;
     std::atomic<bool> ready{false};                                          // false while a worker is compiling it; ok, vs and ps are valid once true
 };
@@ -595,11 +599,85 @@ float3 cubedir(float3 u) {
 }
 )";
 
+// Memexport (vertex shaders that write memory through eA/eM, as Xenia decodes them). UE3 moves texture memory this way (its texture pool
+// defragmenter and mip copies). Each write goes to MX as a record (byte address, value, byte mask); issue_draw reads them back after the draw
+// and applies them to guest memory. MX dword 0 counts the records; records start at byte 16.
+// eA: x = 0x40000000 | base address in dwords, y = 2^23 + element index, z = format word (bits 0-2 endian, 8-13 colour format, 16 signed,
+// 17 integer, 19 red/blue swap, 20-31 0x4B0), w = 2^23 + element count. eM0..eM4 go to elements index+0..index+4.
+static const uint32_t kMxCap = 1u << 21;                                     // records per draw
+static const char* kMemExport = R"(
+RWByteAddressBuffer MX : register(u1);
+void mx_put(uint addr, uint val, uint mask) {
+  uint slot; MX.InterlockedAdd(0, 1u, slot);
+  if (slot < 2097152u) MX.Store3(16u + slot * 16u, uint3(addr, val, mask));
+}
+uint mx_sw(uint v, uint e) {
+  if (e == 1u) return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+  if (e == 2u || e == 4u || e == 5u) return (v << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) | (v >> 24);
+  if (e == 3u) return (v << 16) | (v >> 16);
+  return v;
+}
+uint mx_n(float f, uint w, uint sgn, uint integ) {
+  if (isnan(f)) f = 0.0;
+  uint m = (1u << w) - 1u;
+  if (integ != 0u) {
+    if (sgn != 0u) { float h = (float)(1u << (w - 1u)); float g = clamp(f, -h, h - 1.0); return (uint)(int)(g + (g < 0.0 ? -0.5 : 0.5)) & m; }
+    return (uint)(clamp(f, 0.0, (float)m) + 0.5) & m;
+  }
+  if (sgn != 0u) { float g = clamp(f, -1.0, 1.0) * (float)((1u << (w - 1u)) - 1u); return (uint)(int)(g + (g < 0.0 ? -0.5 : 0.5)) & m; }
+  return (uint)(saturate(f) * (float)m + 0.5) & m;
+}
+void mx_flush(float4 eA, float4 eM[5], uint emw) {
+  uint4 a = asuint(eA);
+  if ((a.x >> 30) != 1u || (a.y >> 23) != 0x96u || (a.z >> 23) != 0x96u || (a.w >> 23) != 0x96u) return;
+  uint idx = a.y & 0x7FFFFFu, cnt = a.w & 0x7FFFFFu, base = (a.x & 0x3FFFFFFFu) << 2;
+  uint e = a.z & 7u, fmt = (a.z >> 8) & 63u, sg = (a.z >> 16) & 1u, it = (a.z >> 17) & 1u, rbs = (a.z >> 19) & 1u;
+  uint lb = 9u;
+  if (fmt == 2u || fmt == 8u || fmt == 9u) lb = 0u;
+  else if (fmt == 4u || fmt == 10u || fmt == 24u || fmt == 30u) lb = 1u;
+  else if (fmt == 6u || fmt == 14u || fmt == 50u || fmt == 7u || fmt == 54u || fmt == 25u || fmt == 31u || fmt == 36u) lb = 2u;
+  else if (fmt == 26u || fmt == 32u || fmt == 37u) lb = 3u;
+  else if (fmt == 38u) lb = 4u;
+  if (lb == 9u) { if (emw != 0u) mx_put(0xFFFFFFFFu, fmt, a.z); return; }
+  [unroll] for (uint n = 0u; n < 5u; n++) {
+    if (((emw >> n) & 1u) == 0u || idx + n >= cnt) continue;
+    float4 v = eM[n]; if (rbs != 0u) v = v.zyxw;
+    uint d[4] = { 0u, 0u, 0u, 0u };
+    if (fmt == 38u) { d[0] = asuint(v.x); d[1] = asuint(v.y); d[2] = asuint(v.z); d[3] = asuint(v.w); }
+    else if (fmt == 37u) { d[0] = asuint(v.x); d[1] = asuint(v.y); }
+    else if (fmt == 36u) d[0] = asuint(v.x);
+    else if (fmt == 6u || fmt == 14u || fmt == 50u) d[0] = mx_n(v.x, 8u, sg, it) | (mx_n(v.y, 8u, sg, it) << 8) | (mx_n(v.z, 8u, sg, it) << 16) | (mx_n(v.w, 8u, sg, it) << 24);
+    else if (fmt == 7u || fmt == 54u) d[0] = mx_n(v.x, 10u, sg, it) | (mx_n(v.y, 10u, sg, it) << 10) | (mx_n(v.z, 10u, sg, it) << 20) | (mx_n(v.w, 2u, sg, it) << 30);
+    else if (fmt == 26u) { d[0] = mx_n(v.x, 16u, sg, it) | (mx_n(v.y, 16u, sg, it) << 16); d[1] = mx_n(v.z, 16u, sg, it) | (mx_n(v.w, 16u, sg, it) << 16); }
+    else if (fmt == 25u) d[0] = mx_n(v.x, 16u, sg, it) | (mx_n(v.y, 16u, sg, it) << 16);
+    else if (fmt == 24u) d[0] = mx_n(v.x, 16u, sg, it);
+    else if (fmt == 32u) { d[0] = f32tof16(v.x) | (f32tof16(v.y) << 16); d[1] = f32tof16(v.z) | (f32tof16(v.w) << 16); }
+    else if (fmt == 31u) d[0] = f32tof16(v.x) | (f32tof16(v.y) << 16);
+    else if (fmt == 30u) d[0] = f32tof16(v.x);
+    else if (fmt == 10u) d[0] = mx_n(v.x, 8u, sg, it) | (mx_n(v.y, 8u, sg, it) << 8);
+    else if (fmt == 4u) d[0] = mx_n(v.x, 5u, sg, it) | (mx_n(v.y, 6u, sg, it) << 5) | (mx_n(v.z, 5u, sg, it) << 11);
+    else d[0] = mx_n(v.x, 8u, sg, it);
+    uint addr = base + ((idx + n) << lb);
+    if (lb >= 2u) {
+      uint nd = lb == 2u ? 1u : (lb == 3u ? 2u : 4u);
+      if (e == 4u && nd >= 2u) { uint t = d[0]; d[0] = d[1]; d[1] = t; t = d[2]; d[2] = d[3]; d[3] = t; }
+      if (e == 5u && nd == 4u) { uint t = d[0]; d[0] = d[3]; d[3] = t; t = d[1]; d[1] = d[2]; d[2] = t; }
+      [unroll] for (uint k = 0u; k < 4u; k++) if (k < nd) mx_put(addr + 4u * k, mx_sw(d[k], e), 0xFFFFFFFFu);
+    } else {
+      uint sh = (addr & 3u) * 8u, m = (lb == 0u ? 0xFFu : 0xFFFFu);
+      mx_put(addr & ~3u, (mx_sw(d[0], e) & m) << sh, m << sh);
+    }
+  }
+}
+)";
+static const char* kMxFlush = "{ if (emw != 0u) { mx_flush(eA, eM, emw); emw = 0u; } }";   // what each MX_FLUSH(); marker becomes
+
 struct Translator {
     const uint32_t* ucode; uint32_t words; bool isVs;
     std::string body;
     std::set<int> usedRegs;
-    bool useArray = false, needRel = false, writesDepth = false, hasLoop = false;
+    bool useArray = false, needRel = false, writesDepth = false, hasLoop = false, memexport = false;
+    bool exact = false;                                                     // memexport shaders: moves keep raw bits (set on a second walk)
     XShader* out;
     std::map<uint32_t, TexUse> texs; std::map<uint32_t, uint32_t> vfs;
     int uniq = 0;
@@ -668,7 +746,8 @@ struct Translator {
             switch (vop) {
               case 0: B += " v=s1+s2;\n"; break;
               case 1: B += " v=s1*s2;\n"; break;
-              case 2: B += " v=max(s1,s2);\n"; break;
+              case 2:   // max of a value with itself is the console's mov; memexport copies raw bits that float max would change (denormals)
+                B += (exact && src_vec(d, 1) == src_vec(d, 2)) ? " v=s1;\n" : " v=max(s1,s2);\n"; break;
               case 3: B += " v=min(s1,s2);\n"; break;
               case 4: B += " v=(s1==s2)?1.0:0.0;\n"; break;
               case 5: B += " v=(s1>s2)?1.0:0.0;\n"; break;
@@ -738,7 +817,7 @@ struct Translator {
               case 2: case 42: case 43: B += " sr=a*b;\n"; break;
               case 3: B += " sr=a*ps;\n"; break;
               case 4: B += S(" sr=(ps==-%s||isinf(ps)||isnan(ps)||isnan(b)||b<=0.0)?-%s:a*ps;\n", FM, FM); break;
-              case 5: B += " sr=max(a,b);\n"; break;
+              case 5: B += (exact && ca == cb) ? " sr=a;\n" : " sr=max(a,b);\n"; break;
               case 6: B += " sr=min(a,b);\n"; break;
               case 7: B += " sr=(a==0.0)?1.0:0.0;\n"; break;
               case 8: B += " sr=(a>0.0)?1.0:0.0;\n"; break;
@@ -788,7 +867,9 @@ struct Translator {
                 if (vdst == 62) dst = "oPos";
                 else if (vdst == 63) dst = "oPts";
                 else if (vdst < 16) dst = S("oI[%u]", vdst);
-                else { logf_once(S("vexp%u", vdst).c_str(), "ignored VS export register %u (memexport?)", vdst); }
+                else if (vdst == 32) { dst = "eA"; memexport = true; }                   // memexport: address (see mx_flush)
+                else if (vdst >= 33 && vdst <= 37) { dst = S("eM[%u]", vdst - 33); memexport = true; }   // memexport: data
+                else { logf_once(S("vexp%u", vdst).c_str(), "ignored VS export register %u", vdst); }
             } else {
                 if (vdst < 4) dst = S("oC[%u]", vdst);
                 else if (vdst == 61) { dst = "oDepth"; writesDepth = true; }
@@ -802,6 +883,7 @@ struct Translator {
                     if (sRes) B += " " + dst + "." + maskstr(sRes) + "=sr;\n";
                     if (c0Mask) B += " " + dst + "." + maskstr(c0Mask) + "=0.0;\n";
                     if (c1Mask) B += " " + dst + "." + maskstr(c1Mask) + "=1.0;\n";
+                    if (dst[0] == 'e' && dst[1] == 'M') B += S(" emw|=%uu;\n", 1u << (vdst - 33));
                 }
             }
         } else {
@@ -1000,7 +1082,8 @@ struct Translator {
                 return S("(((bools[%u].%c>>%u)&1)==%uu)", b >> 7, comp((b >> 5) & 3), b & 31, cond ? 1 : 0);
             };
             switch (op) {
-              case 0: case 12: case 15: break;                              // nop, alloc, mark fetch done
+              case 12: if (isVs) B += "/*mx*/" + guard + "MX_FLUSH();\n"; break;   // alloc: ends the previous memexport block; the line is removed from shaders without memexport
+              case 0: case 15: break;                                       // nop, mark fetch done
               case 1: case 2: case 3: case 4: case 5: case 6: case 13: case 14: {
                 uint32_t addr = w0 & 0xFFF, cnt = (w0 >> 12) & 7, seq = (w0 >> 16) & 0xFFF;
                 bool isEnd = op == 2 || op == 4 || op == 6 || op == 14;
@@ -1052,6 +1135,7 @@ struct Translator {
         if (useArray) d += " float4 r[64]; for(int ri=0;ri<64;ri++) r[ri]=0;\n";
         else for (int n : usedRegs) d += S(" float4 r%d=0;\n", n);
         d += " bool p=false; int a0=0; int aL=0; float ps=0.0; float lodReg=0.0; int pc=0;\n";
+        if (isVs && memexport) d += " float4 eA=0; float4 eM[5]; for(int ei=0;ei<5;ei++) eM[ei]=0; uint emw=0;\n";
         return d;
     }
 };
@@ -1110,7 +1194,24 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
     T.decode_cf();
     T.walk();
     if (T.needRel) { T.useArray = true; T.usedRegs.clear(); T.needRel = false; memset(T.prevFull, 0, sizeof(T.prevFull)); T.walk(); }
+    if (T.memexport) { T.exact = true; T.usedRegs.clear(); T.needRel = false; memset(T.prevFull, 0, sizeof(T.prevFull)); T.walk(); }
+    sh->memexport = T.memexport;
+    if (T.memexport) fprintf(stderr, "[mx] memexport shader %016llX (%u dwords)\n", (unsigned long long)h, T.words);
+    {   // alloc markers: the memexport flush in memexport shaders, nothing (no line at all, so the source and its cached compile stay the same) elsewhere
+        std::string b; b.reserve(T.body.size());
+        size_t pos = 0;
+        while (pos < T.body.size()) {
+            size_t e = T.body.find('\n', pos); if (e == std::string::npos) e = T.body.size() - 1;
+            if (T.body.compare(pos, 6, "/*mx*/") == 0) {
+                if (T.memexport) { std::string l = T.body.substr(pos + 6, e + 1 - pos - 6); size_t k = l.find("MX_FLUSH();"); if (k != std::string::npos) l.replace(k, 11, kMxFlush); b += l; }
+            }
+            else b.append(T.body, pos, e + 1 - pos);
+            pos = e + 1;
+        }
+        T.body.swap(b);
+    }
     std::string src = std::string(kCommon) + uv_helper() + kVOut;
+    if (T.memexport) src += kMemExport;
     if (isVs) {
         // VTE: optionally divide-undo, then map guest screen space onto the full host render target
         src += "VOut main(uint vid : SV_VertexID) {\n float4 oI[16]; for(int i=0;i<16;i++) oI[i]=0; float4 oPos=float4(0,0,0,1), oPts=0;\n";
@@ -1118,6 +1219,7 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
         if (T.useArray) src += " r[0].x=(float)((int)vid+(int)vpW.y);\n";
         else if (T.usedRegs.count(0)) src += " r0.x=(float)((int)vid+(int)vpW.y);\n";
         src += T.body;
+        if (T.memexport) src += std::string(" ") + kMxFlush + "\n";
         src += " VOut o; for(int i=0;i<16;i++) o.o[i]=oI[i];\n"
                " float w=oPos.w; if(vpW.x==0.0) w=1.0/w;\n"
                " float2 xy=oPos.xy; if(vpZ.z!=0.0) xy*=w;\n"
@@ -1619,7 +1721,7 @@ static void unpack_rgba8(int conv, const uint8_t* s, uint8_t* d) {
 
 struct HostTex {
     ComPtr<ID3D11Texture2D> tex; ComPtr<ID3D11ShaderResourceView> srv;
-    uint64_t hash = 0, lastFrame = ~0ull; uint32_t hostW = 0, hostH = 0, levels = 0;
+    uint64_t hash = 0, lastFrame = ~0ull, mxEpoch = 0; uint32_t hostW = 0, hostH = 0, levels = 0;
 };
 static std::unordered_map<uint64_t, HostTex*> g_texCache;
 
@@ -1828,6 +1930,13 @@ static void splash_override(std::vector<uint8_t>& out) {
     if (!ok || out.size() != (size_t)1024 * 256 * 4) return;
     for (size_t i = 0; i < (size_t)1024 * 256; i++) { out[i * 4] = c[i * 4]; out[i * 4 + 1] = c[i * 4 + 1]; out[i * 4 + 2] = c[i * 4 + 2]; out[i * 4 + 3] = a[i * 4]; }
 }
+// ASURA_TEXDUMPONLY=addr,addr,... (hex): ASURA_TEXDUMP and ASURA_TEXDUMPMIPS save only textures at these addresses
+static bool texdump_wanted(uint32_t base) {
+    static const char* only = getenv("ASURA_TEXDUMPONLY");
+    if (!only) return true;
+    for (const char* p = only; *p;) { char* e; const uint32_t a = (uint32_t)strtoul(p, &e, 16); if (e == p) break; if (a == base) return true; p = (*e == ',') ? e + 1 : e; }
+    return false;
+}
 static HostTex* get_texture(const FetchInfo& fi) {
     TexFmt tf;
     if (!tex_fmt(fi.fmt, tf)) { logf_once(S("texf%u", fi.fmt).c_str(), "unsupported texture format %u (%ux%u at %X)", fi.fmt, fi.w, fi.h, fi.base); return nullptr; }
@@ -1844,11 +1953,29 @@ static HostTex* get_texture(const FetchInfo& fi) {
         uint32_t lw = log2_ceil(fi.w), lh = log2_ceil(fi.h), lmin = std::min(lw, lh);
         if (lmin <= 4) { if (lw > lh) offY = 16; else offX = 16; offX /= tf.block; offY /= tf.block; }
     }
-    // Tiled textures whose fetch pitch is at least twice their width hold the image at (width, height) inside the tile: a 64x32
-    // DXT1 with pitch 128 sits at texel 64,32 (found from the raw tiles; the game's loader writes the cooked tile as is). Without
-    // this they decode as scrambled squares (explosion sprites, Gohma swarms). Empirical rule; ASURA_NOSUBRECT turns it off.
+    // Tiled textures whose fetch pitch is at least twice their width were once found with the image at (width, height) inside the tile
+    // (explosion sprites, Gohma swarms, before memexport was implemented). Now only a fallback, used when that is where the data is (see below).
+    // ASURA_NOSUBRECT turns it off; ASURA_SUBRECTLOG logs each such texture.
     static const bool kSubRect = getenv("ASURA_NOSUBRECT") == nullptr;
-    if (kSubRect && fi.tiled && fi.pitch >= 2 * fi.w && !offX && !offY) { offX = fi.w / tf.block; offY = fi.h / tf.block; }
+    if (fi.tiled && fi.pitch >= 2 * fi.w && !offX && !offY) {
+        {   // which textures the rule touches: their shape, and how much data sits at the origin versus at (w, h)
+            auto filled = [&](uint32_t bx, uint32_t by) {
+                const uint32_t bw = std::max(1u, align_up(fi.w, tf.block) / tf.block), bh = std::max(1u, align_up(fi.h, tf.block) / tf.block);
+                uint32_t n = 0, all = 0;
+                for (uint32_t y = 0; y < bh; y += std::max(1u, bh / 8)) for (uint32_t x = 0; x < bw; x += std::max(1u, bw / 8)) {
+                    all++; if (*(const uint32_t*)phys(fi.base + tiled2d(bx + x, by + y, pitchAligned, bl2))) n++;
+                }
+                return std::pair<uint32_t, uint32_t>(n, all);
+            };
+            auto a = filled(0, 0), b = filled(fi.w / tf.block, fi.h / tf.block);
+            static const bool kLog = getenv("ASURA_SUBRECTLOG") != nullptr;
+            if (kLog) logf_once(S("subr%X_%u_%u", fi.base, fi.w, fi.h).c_str(), "sub-rect candidate %08X fmt %u %ux%u pitch %u packed %d mips %u: data at origin %u/%u, at (w,h) %u/%u",
+                                fi.base, fi.fmt, fi.w, fi.h, fi.pitch, (int)fi.packed, fi.maxLevel, a.first, a.second, b.first, b.second);
+            // Since memexport is done, every such texture has its image at the origin and nothing at (w, h): the earlier finding was textures caught
+            // mid-move. Read from (w, h) only if that is where the data is; always reading there lost Asura's flames.
+            if (kSubRect && b.first > a.first) { offX = fi.w / tf.block; offY = fi.h / tf.block; }
+        }
+    }
     uint64_t key = fnv64(&fi, sizeof(fi));
     auto& slot = g_texCache[key];
     if (!slot) slot = new HostTex();
@@ -1873,8 +2000,8 @@ static HostTex* get_texture(const FetchInfo& fi) {
             fputc('\n', stderr);
         }
     }
-    if (ht->lastFrame == g_frame && ht->srv) return ht;
-    ht->lastFrame = g_frame;
+    if (ht->lastFrame == g_frame && ht->mxEpoch == g_mxEpoch && ht->srv) return ht;
+    ht->lastFrame = g_frame; ht->mxEpoch = g_mxEpoch;
     PerfScope perfTex(g_tTex);
     static const bool kNoMips = getenv("ASURA_NOMIPS") != nullptr;           // for comparison: draw every texture from its full-size image only
     const uint32_t maxLevel = kNoMips ? 0 : fi.maxLevel, packedLevel = fi.packed ? packed_mip_level(fi.w, fi.h) : ~0u;
@@ -1920,7 +2047,16 @@ static HostTex* get_texture(const FetchInfo& fi) {
         if (seenSplash.insert(h).second) fprintf(stderr, "[splash] 1024x256 RGBA texture at %08X hash %016llX%s\n", fi.base, (unsigned long long)h, (kSplashHash && h == kSplashHash) ? " (the save warning)" : "");
         if (kSplashHash && h == kSplashHash) splash_override(out);
     }
-    { static const char* kDump = getenv("ASURA_TEXDUMP"); if (kDump) dump_texture_bmp(kDump, fi.base, fi.fmt, hw, hh, tf, out.data()); }
+    { static const char* kDump = getenv("ASURA_TEXDUMP"); if (kDump && texdump_wanted(fi.base)) dump_texture_bmp(kDump, fi.base, fi.fmt, hw, hh, tf, out.data()); }
+    {   // ASURA_TEXZERO=1: log textures (64x64 and up) whose base level is all zero bytes in guest memory when uploaded: data that never arrived
+        static const bool kZero = getenv("ASURA_TEXZERO") != nullptr || bcr2_log_requested();   // on with --log (stops at the first nonzero word, so cheap)
+        static int zeroLines = 0;
+        if (kZero && fi.w >= 64 && fi.h >= 64 && zeroLines < 2000) {
+            bool zero = true;
+            for (uint32_t o = 0; o < total && zero; o += 4) zero = *(const uint32_t*)phys(fi.base + o) == 0;
+            if (zero && ++zeroLines) fprintf(stderr, "[texzero] frame %llu base=%08X %ux%u fmt=%u mipBase=%08X levels=%u\n", (unsigned long long)g_frame, fi.base, fi.w, fi.h, fi.fmt, fi.mipBase, fi.maxLevel);
+        }
+    }
     const uint32_t levels = maxLevel + 1;
     bool same = ht->tex && ht->hostW == hw && ht->hostH == hh && ht->levels == levels;
     if (!same) {
@@ -1958,11 +2094,11 @@ static HostTex* get_texture(const FetchInfo& fi) {
             }
             g_ctx->UpdateSubresource(ht->tex.Get(), D3D11CalcSubresource(l, f, levels), nullptr, lvl.data(), hbw * outBpb, hbw * hbh * outBpb);
             static const char* kDumpMips = getenv("ASURA_TEXDUMPMIPS");      // dir: every mip level too (files <base + level>_f<fmt>_<w>x<h>)
-            if (kDumpMips && f == 0 && hbw * tf.block >= 8) {
+            if (kDumpMips && f == 0 && hbw * tf.block >= 8 && texdump_wanted(fi.base)) {
                 if (l == 1) {
                     fprintf(stderr, "[mipdump] base=%08X %ux%u fmt=%u mipBase=%08X (base + %X; base level %X bytes) levels=%u packedLevel=%u tiled=%d\n",
                             fi.base, fi.w, fi.h, fi.fmt, fi.mipBase, fi.mipBase - fi.base, total, maxLevel, packedLevel, (int)fi.tiled);
-                    if (fi.w == 2 * fi.h && fi.w <= 256) {                    // the raw tile(s), to work out the layout offline: base level then mips
+                    if (fi.w <= 256 && fi.h <= 256 && tf.block == 4) {                    // the raw tile(s), to work out the layout offline: base level then mips
                         std::string p = std::string(kDumpMips) + S("\\raw_%08X_f%u_%ux%u.bin", fi.base, fi.fmt, fi.w, fi.h);
                         if (FILE* rf = fopen(p.c_str(), "wb")) { for (uint32_t o = 0; o < total + mipBytes; o += 4) { uint32_t v = *(const uint32_t*)phys(fi.base + o); fwrite(&v, 4, 1, rf); } fclose(rf); }
                     }
@@ -2175,6 +2311,11 @@ static uint32_t vb_alloc(uint32_t size, uint8_t*& ptr) {
     uint32_t r = g_vbPos; g_vbPos += size;
     return r;
 }
+// Makes the next vb_alloc start a fresh ring buffer if this many bytes would not fit in the current one (see issue_draw).
+static void vb_reserve(uint64_t bytes) {
+    static uint64_t moves = 0;
+    if (g_noOverwriteSrv && g_vbPos > 0 && g_vbPos + bytes > kVbRingSize) { g_vbPos = kVbRingSize; if (++moves <= 3) fprintf(stderr, "[gfx] vertex ring: a draw's %llu bytes start the next buffer\n", (unsigned long long)bytes); }
+}
 static void vb_commit(uint32_t off, uint32_t size, const uint8_t* ptr) {
     if (g_noOverwriteSrv) { g_ctx->Unmap(g_vbRing.Get(), 0); return; }
     D3D11_BOX box{ off, 0, 0, off + align_up(size, 16), 1, 1 };
@@ -2231,21 +2372,153 @@ static void watch_surface(const char* where) {
 static ID3D11RenderTargetView* g_curRtv[4] = {}; static ID3D11DepthStencilView* g_curDsv = nullptr;
 static void invalidate_binds() { memset(g_curRtv, 0, sizeof(g_curRtv)); g_curDsv = nullptr; }
 
+// ASURA_TEXFLIP=1: finds one-frame texture swaps. Each draw (shaders, first vertex stream, its order among such draws in the frame) and texture slot
+// remembers what it sampled on the last frames; a value that differs for one frame only and then comes back is logged, saying whether the game bound
+// another address (fetch) or the same address held other data (data).
+struct FlipVal { uint32_t base = 0, mip = 0, w = 0, h = 0, fmt = 0, src = 0; uint64_t data = 0; bool operator==(const FlipVal& o) const { return base == o.base && mip == o.mip && w == o.w && h == o.h && fmt == o.fmt && src == o.src && data == o.data; } };
+struct FlipHist { uint64_t frame = 0; FlipVal v[3]; };
+static uint64_t g_flipDraw = 0;                                               // set per draw in issue_draw
+static uint64_t g_flipFrame = ~0ull;
+static std::unordered_map<uint64_t, uint32_t> g_flipOrd, g_flipOrd1, g_flipOrd2;      // draws per family this frame, last frame, the one before
+static uint64_t g_flipFam = 0; static uint32_t g_flipIdx = 0;
+static std::unordered_map<uint64_t, FlipHist> g_flipHist;
+static bool texflip_on() { static const bool on = getenv("ASURA_TEXFLIP") != nullptr; return on; }
+// Also: draws that appear for one frame only, or are missing for one frame only (another LOD or material for a frame). Draws of 300 indices or
+// more; frames with more than 40 such changes (camera cuts) are counted, not listed.
+struct FlipFam { uint64_t vs, ps; uint32_t vf, idx, num; };
+static std::unordered_map<uint64_t, FlipFam> g_flipFams;
+static void drawflip_frame() {                                                // at the start of a frame: g_flipOrd = last frame, g_flipOrd1 = the one before, g_flipOrd2 = before that
+    std::vector<std::pair<const char*, uint64_t>> ev;
+    for (auto& kv : g_flipOrd1) if (!g_flipOrd2.count(kv.first) && !g_flipOrd.count(kv.first)) ev.push_back({ "only", kv.first });
+    for (auto& kv : g_flipOrd2) if (!g_flipOrd1.count(kv.first) && g_flipOrd.count(kv.first)) ev.push_back({ "missing", kv.first });
+    std::vector<std::pair<const char*, uint64_t>> big;
+    for (auto& e : ev) { auto it = g_flipFams.find(e.second); if (it != g_flipFams.end() && it->second.num >= 300) big.push_back(e); }
+    if (big.empty()) return;
+    if (big.size() > 40) { fprintf(stderr, "[drawflip] frame %llu: %zu draws changed for one frame (camera cut?)\n", (unsigned long long)(g_frame - 2), big.size()); return; }
+    for (auto& e : big) {
+        const FlipFam& f = g_flipFams[e.second];
+        fprintf(stderr, "[drawflip] frame %llu %s for one frame: vs %016llX ps %016llX vf %08X idx %08X num %u\n", (unsigned long long)(g_frame - 2), e.first,
+                (unsigned long long)f.vs, (unsigned long long)f.ps, f.vf, f.idx, f.num);
+    }
+}
+static void texflip_draw(uint64_t vsHash, uint64_t psHash, uint32_t vf0, uint32_t idxBase, uint32_t num) {
+    if (g_flipFrame != g_frame) {
+        if (g_flipFrame + 1 == g_frame) drawflip_frame();
+        g_flipOrd2.swap(g_flipOrd1); g_flipOrd1.swap(g_flipOrd); g_flipOrd.clear(); if (g_flipFrame + 1 != g_frame) { g_flipOrd1.clear(); g_flipOrd2.clear(); } g_flipFrame = g_frame;
+    }
+    uint64_t k = (vsHash * 0x9E3779B97F4A7C15ull ^ psHash ^ ((uint64_t)vf0 << 20)) * 0x100000001B3ull ^ ((uint64_t)idxBase << 24) ^ num;
+    if (!g_flipFams.count(k)) g_flipFams[k] = { vsHash, psHash, vf0, idxBase, num };
+    g_flipFam = k; g_flipIdx = g_flipOrd[k]++;
+    g_flipDraw = k * 31 + g_flipIdx;
+}
+static void texflip_note(uint32_t slot, const FlipVal& v) {
+    FlipHist& h = g_flipHist[g_flipDraw * 64 + slot];
+    if (h.frame == g_frame) return;
+    if (h.frame + 1 != g_frame) { h = FlipHist{}; h.v[2] = v; h.frame = g_frame; h.v[0].base = h.v[1].base = 0xFFFFFFFFu; return; }
+    h.v[0] = h.v[1]; h.v[1] = h.v[2]; h.v[2] = v; h.frame = g_frame;
+    // only draws that are alone in their family (same shaders, vertex and index data) on all three frames: others shift when the draw order does
+    auto one = [](const std::unordered_map<uint64_t, uint32_t>& m, uint64_t k) { auto it = m.find(k); return it != m.end() && it->second == 1; };
+    const bool alone = g_flipIdx == 0 && one(g_flipOrd1, g_flipFam) && one(g_flipOrd2, g_flipFam);
+    if (alone && h.v[0].base != 0xFFFFFFFFu && h.v[0] == h.v[2] && !(h.v[1] == h.v[2])) {
+        const FlipVal& a = h.v[2]; const FlipVal& b = h.v[1];
+        const bool fetch = a.base != b.base || a.mip != b.mip || a.w != b.w || a.h != b.h || a.fmt != b.fmt || a.src != b.src;
+        fprintf(stderr, "[texflip] frame %llu (%s) slot %u draw %016llX: %08X/%08X %ux%u fmt %u src %u data %016llX -> for one frame %08X/%08X %ux%u fmt %u src %u data %016llX\n",
+                (unsigned long long)(g_frame - 1), fetch ? "fetch" : "data", slot, (unsigned long long)g_flipDraw, a.base, a.mip, a.w, a.h, a.fmt, a.src, (unsigned long long)a.data,
+                b.base, b.mip, b.w, b.h, b.fmt, b.src, (unsigned long long)b.data);
+    }
+}
+
+// ---- memexport draws (see kMemExport) ----
+static ComPtr<ID3D11Buffer> g_mxBuf, g_mxStage;
+static ComPtr<ID3D11UnorderedAccessView> g_mxUav;
+static uint64_t g_mxDraws = 0, g_mxWrites = 0;
+static bool mx_ready() {
+    static int ok = -1;
+    if (ok >= 0) return ok == 1;
+    ok = 0;
+    if (getenv("ASURA_NOMEMEXPORT")) { fprintf(stderr, "[mx] memexport off (ASURA_NOMEMEXPORT)\n"); return false; }
+    if (g_featureLevel < D3D_FEATURE_LEVEL_11_1) { fprintf(stderr, "[mx] feature level 11_1 needed for memexport; those draws are left out\n"); return false; }
+    const uint32_t bytes = 16 + kMxCap * 16;
+    D3D11_BUFFER_DESC d{}; d.ByteWidth = bytes; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_UNORDERED_ACCESS; d.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+    if (FAILED(g_dev->CreateBuffer(&d, nullptr, &g_mxBuf))) { fprintf(stderr, "[mx] buffer creation failed\n"); return false; }
+    D3D11_UNORDERED_ACCESS_VIEW_DESC u{}; u.Format = DXGI_FORMAT_R32_TYPELESS; u.ViewDimension = D3D11_UAV_DIMENSION_BUFFER; u.Buffer.NumElements = bytes / 4; u.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+    if (FAILED(g_dev->CreateUnorderedAccessView(g_mxBuf.Get(), &u, &g_mxUav))) { fprintf(stderr, "[mx] UAV creation failed\n"); return false; }
+    D3D11_BUFFER_DESC s{}; s.ByteWidth = bytes; s.Usage = D3D11_USAGE_STAGING; s.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(g_dev->CreateBuffer(&s, nullptr, &g_mxStage))) { fprintf(stderr, "[mx] staging buffer creation failed\n"); return false; }
+    fprintf(stderr, "[mx] memexport on: vertex shader writes are read back and applied to guest memory\n");
+    ok = 1;
+    return true;
+}
+static void mx_bind() {
+    static const uint32_t zero[4] = {};
+    D3D11_BOX hb{ 0, 0, 0, 16, 1, 1 };
+    g_ctx->UpdateSubresource(g_mxBuf.Get(), 0, &hb, zero, 16, 16);
+    ID3D11UnorderedAccessView* u = g_mxUav.Get(); UINT init = 0;
+    g_ctx->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, 1, 1, &u, &init);
+}
+// After the draw: unbind, read the records back and write them into guest memory.
+static void mx_finish(uint64_t vsHash, uint32_t prim, uint32_t num) {
+    ID3D11UnorderedAccessView* nu = nullptr;
+    g_ctx->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr, 1, 1, &nu, nullptr);
+    D3D11_BOX hb{ 0, 0, 0, 16, 1, 1 };
+    g_ctx->CopySubresourceRegion(g_mxStage.Get(), 0, 0, 0, 0, g_mxBuf.Get(), 0, &hb);
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (FAILED(g_ctx->Map(g_mxStage.Get(), 0, D3D11_MAP_READ, 0, &ms))) return;
+    const uint32_t count = *(const uint32_t*)ms.pData;
+    g_ctx->Unmap(g_mxStage.Get(), 0);
+    const uint32_t n = std::min(count, kMxCap);
+    if (count > kMxCap) logf_once("mxcap", "memexport draw wrote %u records, more than the %u kept; the rest are lost", count, kMxCap);
+    uint32_t lo = 0xFFFFFFFFu, hi = 0, applied = 0;
+    if (n) {
+        D3D11_BOX rb{ 16, 0, 0, 16 + n * 16, 1, 1 };
+        g_ctx->CopySubresourceRegion(g_mxStage.Get(), 0, 16, 0, 0, g_mxBuf.Get(), 0, &rb);
+        if (FAILED(g_ctx->Map(g_mxStage.Get(), 0, D3D11_MAP_READ, 0, &ms))) return;
+        const uint32_t* r = (const uint32_t*)((const uint8_t*)ms.pData + 16);
+        for (uint32_t i = 0; i < n; i++, r += 4) {
+            const uint32_t a = r[0], v = r[1], m = r[2];
+            if (a == 0xFFFFFFFFu) { logf_once(S("mxfmt%u", v).c_str(), "memexport to unsupported format %u (format word %08X)", v, m); continue; }
+            if (a >= 0x20000000u) { logf_once("mxaddr", "memexport address %08X outside physical memory", a); continue; }
+            uint32_t* p = (uint32_t*)phys(a);
+            *p = (*p & ~m) | (v & m);
+            lo = std::min(lo, a); hi = std::max(hi, a + 4); applied++;
+        }
+        g_ctx->Unmap(g_mxStage.Get(), 0);
+    }
+    g_mxDraws++; g_mxWrites += applied;
+    if (applied) g_mxEpoch++;
+    static const bool kLog = getenv("ASURA_MXLOG") != nullptr;
+    if (g_mxDraws <= 20 || kLog)
+        fprintf(stderr, "[mx] f=%llu vs=%016llX prim=%u num=%u dwords=%u range=%08X-%08X\n", (unsigned long long)g_frame, (unsigned long long)vsHash, prim, num, applied, applied ? lo : 0, hi);
+}
+
 static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBase, uint32_t dmaSize);
 // Draw ring (BCR2_SHOTRING): every draw of the last 240 frames, written to draws.txt in the capture folder when F9 is pressed.
-struct RingDraw { uint32_t vs, ps, num, vf, pitch, edram, win, vfw, vzero, vhash; };
+struct RingDraw { uint32_t vs, ps, num, vf, pitch, edram, win, vfw, vzero, vhash; uint32_t cvs = 0, cps = 0; uint32_t tex[8] = {}, texh[8] = {}; };
 static std::map<uint64_t, std::vector<RingDraw>> g_drawRing;
 static void draw_ring_add(uint64_t frame, uint32_t vs, uint32_t ps, uint32_t num, uint32_t vf, uint32_t pitch, uint32_t edram, uint32_t win, uint32_t vfw, uint32_t vzero, uint32_t vhash) {
     auto& v = g_drawRing[frame];
-    v.push_back({ vs, ps, num, vf, pitch, edram, win, vfw, vzero, vhash });
+    RingDraw r{ vs, ps, num, vf, pitch, edram, win, vfw, vzero, vhash };
+    r.cvs = (uint32_t)fnv64(&g_regs[R_CONST], 64 * 16); r.cps = (uint32_t)fnv64(&g_regs[R_CONST + 256 * 4], 32 * 16);   // vertex c0-63, pixel c256-287
+    v.push_back(r);
     while (g_drawRing.size() > 240) g_drawRing.erase(g_drawRing.begin());
 }
+// the textures the current draw samples (pixel shader slots 0-7): address and a content hash
+static void draw_ring_tex(uint32_t slot, uint32_t base, uint64_t hash) {
+    if (slot >= 8) return;
+    auto it = g_drawRing.find(g_frame);
+    if (it == g_drawRing.end() || it->second.empty()) return;
+    it->second.back().tex[slot] = base; it->second.back().texh[slot] = (uint32_t)(hash ^ (hash >> 32));
+}
 static void draw_ring_dump(const char* dir) {
-    FILE* f = fopen((std::string(dir) + "\\draws.txt").c_str(), "w");
+    FILE* f = fopen((std::string(dir) + S("\\draws_%06llu.txt", (unsigned long long)g_frame)).c_str(), "w");   // one file per capture
     if (!f) return;
     for (auto& kv : g_drawRing) {
         fprintf(f, "F %llu %zu\n", (unsigned long long)kv.first, kv.second.size());
-        for (auto& d : kv.second) fprintf(f, "%08X %08X %u %08X %u %u %08X %u %u %08X\n", d.vs, d.ps, d.num, d.vf, d.pitch, d.edram, d.win, d.vfw, d.vzero, d.vhash);
+        for (auto& d : kv.second) {                                         // ... c=<vertex consts>,<pixel consts> t=<slot 0-7 address:content hash>
+            fprintf(f, "%08X %08X %u %08X %u %u %08X %u %u %08X c=%08X,%08X t=", d.vs, d.ps, d.num, d.vf, d.pitch, d.edram, d.win, d.vfw, d.vzero, d.vhash, d.cvs, d.cps);
+            for (int i = 0; i < 8; i++) fprintf(f, "%s%08X:%08X", i ? "," : "", d.tex[i], d.texh[i]);
+            fputc('\n', f);
+        }
     }
     fclose(f);
 }
@@ -2334,7 +2607,10 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     if (edram == 6) { PerfScope perfRes(g_tResolve); do_resolve(); watch_surface("after resolve"); return; }
     PerfScope perfDraw(g_tDraw);
     WorstDraw worstDraw(num);
-    if (edram == 0 || num == 0 || prim == 0) return;
+    if (num == 0 || prim == 0) return;
+    if (edram == 0) {                                                       // no EDRAM output: only a memexport draw does anything
+        if (g_vsCode.empty() || !build_shader(g_vsCode, true, 0xFFFFFFFFu)->memexport) return;
+    }
     if (prim >= 0x10) { logf_once(S("prim%u", prim).c_str(), "unsupported primitive type %u", prim); return; }
     if (prim == 1) logf_once("points", "point list drawn as 1-pixel points (no sprite expansion yet)");
     if (g_vsCode.empty()) return;
@@ -2362,6 +2638,9 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
 
     XShader* vs = build_shader(g_vsCode, true, 0xFFFFFFFFu);
     g_vsHash = (uint32_t)((unsigned long long)vs->hash >> 32);
+    // A memexport draw: run its vertex shader once per vertex, writing guest memory, with no render target and no pixel shader.
+    const bool mx = vs->memexport && mx_ready();
+    if (vs->memexport && !mx) return;
     if (g_shotRingSize > 0) {   // the draw ring: what was drawn in each of the last frames, saved beside the F9 images
         const uint32_t vf0 = vs->vf.empty() ? 0 : (g_regs[R_FETCH + vs->vf[0].slot * 2] & ~3u);
         uint32_t vfw = 0, vzero = 0, vhash = 0;   // the first vertex stream: its size in words, how many are zero, and a checksum (to tell a draw fed stale or empty vertices)
@@ -2382,7 +2661,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     static const bool kDepthKeepPs = getenv("ASURA_DEPTHKEEPPS") != nullptr;
     static const char* kDepthSolid = getenv("ASURA_DEPTHSOLID");              // comma-separated vertex shader hashes: only these depth-only draws skip the pixel shader
     const bool skipPs = depthOnly && !kDepthKeepPs && (!kDepthSolid || strstr(kDepthSolid, S("%016llX", (unsigned long long)vs->hash).substr(0, 8).c_str()));
-    XShader* ps = (g_psCode.empty() || skipPs) ? nullptr : build_shader(g_psCode, false, paramGen);
+    XShader* ps = (g_psCode.empty() || skipPs || mx) ? nullptr : build_shader(g_psCode, false, paramGen);
     if (g_trace > 0) {
         fprintf(stderr, "[gfx]   shaders vs=%016llX ok=%d ps=%016llX ok=%d vte=%08X mode=%08X blend0=%08X cc=%08X psconst=%08X tf:", (unsigned long long)vs->hash, (int)vs->ok,
                 ps ? (unsigned long long)ps->hash : 0ull, ps ? (int)ps->ok : -1, g_regs[R_VTE_CNTL], g_regs[R_MODE_CNTL], g_regs[R_BLEND0], g_regs[R_COLORCONTROL], g_regs[0x2308]);
@@ -2414,17 +2693,18 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         for (auto& u : vs->vf) { uint32_t f0 = g_regs[R_FETCH + u.slot * 2], f1 = g_regs[R_FETCH + u.slot * 2 + 1]; fprintf(stderr, " %u:addr=%08X,words=%u,end=%u,stride=%u", u.slot, f0 & ~3u, (f1 >> 2) & 0xFFFFFF, f1 & 3, u.stride); }
         fprintf(stderr, "\n");
     }
-    if (!shaders_ready(vs, ps, prim == 8)) return;
+    if (!shaders_ready(vs, ps, prim == 8 || mx)) return;                    // a memexport draw left out would lose the memory it writes
     if (!vs->ok) return;
     if (ps && !ps->ok) ps = nullptr;
 
     // ---- render targets ----
     uint32_t surf = g_regs[R_SURFACE_INFO], pitch = surf & 0x3FFF;
-    if (pitch == 0) { logf_once("pitch0", "draw with surface pitch 0 ignored"); return; }
+    if (pitch == 0 && !mx) { logf_once("pitch0", "draw with surface pitch 0 ignored"); return; }
     uint32_t mask = g_regs[R_COLOR_MASK];
     ID3D11RenderTargetView* rtvs[4] = {};
     uint32_t rw = 0, rh = 0;
-    if (!depthOnly) {
+    if (mx) rw = rh = 1;                                                    // no targets; the points rasterise to nothing that is kept
+    else if (!depthOnly) {
         static const uint32_t regs[4] = { R_COLOR_INFO, R_COLOR1_INFO, R_COLOR2_INFO, R_COLOR3_INFO };
         for (int i = 0; i < 4; i++) {
             if (((mask >> (4 * i)) & 0xF) == 0) continue;
@@ -2442,7 +2722,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     }
     uint32_t dc = g_regs[R_DEPTHCONTROL];
     ID3D11DepthStencilView* dsv = nullptr;
-    if (dc & 3) {
+    if ((dc & 3) && !mx) {
         uint32_t depthBase = g_regs[R_DEPTH_INFO] & 0xFFF;
         Rt* d = get_depth_rt(depthBase, pitch);
         sync_depth_alias(d, depthBase, pitch);
@@ -2512,6 +2792,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
       case 12: topo = D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP; for (uint32_t i = 0; i < num; i++) conv.push_back(vert(i)); conv.push_back(vert(0)); break;
       default: logf_once(S("prim%u", prim).c_str(), "unsupported primitive type %u", prim); return;
     }
+    if (mx) { topo = D3D11_PRIMITIVE_TOPOLOGY_POINTLIST; rect = false; conv.clear(); }   // each vertex once
     const std::vector<uint32_t>* useIdx = !conv.empty() ? &conv : (hasIdx ? &idx : nullptr);
     uint32_t drawCount = useIdx ? (uint32_t)useIdx->size() : num;
     if (drawCount == 0) return;
@@ -2538,6 +2819,16 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     indexOffset = sext(indexOffset, 24);
     static StateCb cb;
     memset(cb.vfo, 0, sizeof(cb.vfo));
+    {   // All of a draw's streams must land in the same ring buffer: the draw binds one. vb_alloc moves to the next buffer when the current one
+        // is full, and when that happened between two streams, the earlier stream was read from the new buffer at its old offset: one draw in one
+        // frame got another mesh's UVs or normals (faces and ships flickering to other surfaces, differently each run). Reserve the room first.
+        uint64_t total = 0;
+        for (auto& u : vs->vf) {
+            uint32_t f0 = g_regs[R_FETCH + u.slot * 2], f1 = g_regs[R_FETCH + u.slot * 2 + 1];
+            if ((f0 & 3) == 3) total += align_up((uint32_t)std::min<uint64_t>((uint64_t)((f1 >> 2) & 0xFFFFFF) * 4 + 64, kVbRingSize / 2), 16);
+        }
+        vb_reserve(total);
+    }
     for (auto& u : vs->vf) {
         uint32_t f0 = g_regs[R_FETCH + u.slot * 2], f1 = g_regs[R_FETCH + u.slot * 2 + 1];
         if ((f0 & 3) != 3) { logf_once("vfbad", "vertex fetch constant %u has type %u", u.slot, f0 & 3); continue; }
@@ -2582,6 +2873,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     for (int s = 0; s < 16; s++) {
         cb.tfp[s * 4] = 1; cb.tfp[s * 4 + 1] = 1; cb.tfp[s * 4 + 2] = 1; cb.tfp[s * 4 + 3] = 0;
     }
+    bool ringPs = false;                                                    // binding the pixel shader's textures: noted in the draw ring
     auto bind_tex = [&](const TexUse& u) {
         const uint32_t* tf = &g_regs[R_FETCH + u.slot * 6];
         if ((tf[0] & 3) != 2) return;
@@ -2606,6 +2898,8 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
             }
         }
         if (sf && u.dim != 3) {
+            if (texflip_on()) { FlipVal fv; fv.base = base; fv.w = w; fv.h = h; fv.fmt = fmt; fv.src = 1; texflip_note(u.slot, fv); }
+            if (ringPs && g_shotRingSize > 0) draw_ring_tex(u.slot, base, sf->guestHash ^ 0x5F);
             bool wantsRaw = sf->rawSrv && fmt != 22 && fmt != 23;           // depth read as bytes, not as a depth format
             srvs[u.slot] = wantsRaw ? sf->rawSrv.Get() : sf->srv.Get();
             switch (sf->fmt) {                                              // 16-bit decode in texfix follows what the surface holds
@@ -2665,6 +2959,8 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         if ((u.dim == 3) != (dim == 3)) { logf_once("texdim", "texture dimension mismatch shader=%u fetch=%u", u.dim, dim); return; }
         HostTex* ht = get_texture(fi);
         if (!ht) return;
+        if (texflip_on()) { FlipVal fv; fv.base = base; fv.mip = fi.mipBase; fv.w = w; fv.h = h; fv.fmt = fmt; fv.data = ht->hash; texflip_note(u.slot, fv); }
+        if (ringPs && g_shotRingSize > 0) draw_ring_tex(u.slot, base, ht->hash);
         {   // one line per distinct fetch while tracing, to check the mip chain and filter a draw really gets
             static std::set<uint64_t> seenFetch;
             if (g_trace > 1000 && seenFetch.insert(((uint64_t)base << 8) | u.slot).second)
@@ -2676,7 +2972,10 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         TexFmt t; tex_fmt(fmt, t);
         if (t.block > 1) { cb.tfp[u.slot * 4] = (float)w / ht->hostW; cb.tfp[u.slot * 4 + 1] = (float)h / ht->hostH; }
     };
+    if (texflip_on()) texflip_draw(vs->hash, ps ? ps->hash : 0, vs->vf.empty() ? 0 : (g_regs[R_FETCH + vs->vf[0].slot * 2] & ~3u), srcSel == 0 ? dmaBase : 0, num);
+    ringPs = true;
     if (ps) for (auto& u : ps->tex) bind_tex(u);
+    ringPs = false;
     {
         ID3D11ShaderResourceView* vsr[32] = {};
         ID3D11SamplerState* vsm[16] = {};
@@ -2833,10 +3132,13 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         g_ctx->Unmap(g_ibRing.Get(), 0);
         g_ctx->IASetIndexBuffer(g_ibRing.Get(), DXGI_FORMAT_R32_UINT, g_ibPos);
         g_ibPos += bytes;
+        if (mx) mx_bind();
         { PerfScope t(g_sCall); g_ctx->DrawIndexed(drawCount, 0, 0); }
     } else {
+        if (mx) mx_bind();
         PerfScope t(g_sCall); g_ctx->Draw(drawCount, 0);
     }
+    if (mx) mx_finish(vs->hash, prim, drawCount);
     {   // BCR2_DRAWPRINT=<surface info hex>, with BCR2_PROBEQLIGHT: a fingerprint of each draw to that target, to compare a frame's draws against another frame's
         static const char* kPrint = getenv("ASURA_DRAWPRINT");
         static const uint32_t kPrintSurf = kPrint ? (uint32_t)strtoul(kPrint, nullptr, 16) : 0;
@@ -3325,7 +3627,8 @@ static void save_shot(ID3D11Texture2D* st, const D3D11_TEXTURE2D_DESC& d, uint64
     }
     g_ctx->Unmap(st, 0);
 }
-// BCR2_SHOTRING=n with BCR2_SHOTDIR: keep the last n images, one every 2 frames, in memory. F9 then saves them, so something rare can be caught after it is seen.
+// BCR2_SHOTRING=n with BCR2_SHOTDIR: keep the last n images, every frame, in memory. F9 saves them ASURA_SHOTRINGAFTER frames later (default 45),
+// so a one-frame glitch seen just before the press is inside.
 // BCR2_SHOTRINGAT=frame does the same as pressing F9 at that frame, for testing.
 // Where F9 captures go: BCR2_SHOTDIR if set, else a new folder _debug_capture\f9_<frame> beside the exe.
 static std::string capture_session_dir(uint64_t frame) {
@@ -3343,14 +3646,18 @@ static void shot_ring() {
     D3D11_TEXTURE2D_DESC d; g_backTex->GetDesc(&d);
     d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
     if (d.Width != w || d.Height != h) { tex.clear(); frames.clear(); tex.resize(kN); frames.assign(kN, ~0ull); next = 0; w = d.Width; h = d.Height; }
-    if (g_frame % 2 == 0) {
+    static uint64_t dumpAt = ~0ull;                                          // F9 keeps recording this long after the press, so what was just seen is inside
+    static const uint64_t kAfter = getenv("ASURA_SHOTRINGAFTER") ? _atoi64(getenv("ASURA_SHOTRINGAFTER")) : 45;
+    {
         ComPtr<ID3D11Texture2D>& t = tex[next];
         if (!t && FAILED(g_dev->CreateTexture2D(&d, nullptr, &t))) return;
         g_ctx->CopyResource(t.Get(), g_backTex.Get());
         frames[next] = g_frame;
         next = (next + 1) % kN;
     }
-    if (g_ringDump.exchange(false) || (kAt && g_frame == kAt)) {
+    if ((g_ringDump.exchange(false) || (kAt && g_frame == kAt)) && dumpAt == ~0ull) { dumpAt = g_frame + kAfter; fprintf(stderr, "[capture] F9 at frame %llu: saving at frame %llu\n", (unsigned long long)g_frame, (unsigned long long)dumpAt); }
+    if (g_frame == dumpAt) {
+        dumpAt = ~0ull;
         LARGE_INTEGER a, b; QueryPerformanceCounter(&a);
         int saved = 0;
         const std::string dirS = capture_session_dir(g_frame); const char* dir = dirS.c_str();
@@ -3358,6 +3665,8 @@ static void shot_ring() {
         for (int i = 0; i < kN; i++) { const int k = (next + i) % kN; if (frames[k] != ~0ull) { save_shot(tex[k].Get(), d, frames[k], dir); saved++; } }
         QueryPerformanceCounter(&b);
         fprintf(stderr, "[capture] frame %llu: saved the previous %d images in %.1f s\n", (unsigned long long)g_frame, saved, (double)(b.QuadPart - a.QuadPart) * g_perfTicksToMs / 1000.0);
+        void input_clock_pause(uint64_t ms);
+        input_clock_pause((uint64_t)((double)(b.QuadPart - a.QuadPart) * g_perfTicksToMs));   // an input replay waits out the stall
     }
 }
 // F12: save what is on screen as a PNG in <exe>\..\screenshots. The copy is made here, in the frame; encoding and writing happen on another thread.
