@@ -89,6 +89,18 @@ Fixed on the way:
 - XAPI's heap: `MEM_RESERVE` must not commit, `NtQueryVirtualMemory` must report the run of pages in one state (not the whole allocation), and commits in a 64K-page range cover whole 64K pages. Each was an intermittent heap crash on a worker thread.
 - WAIT_REG_MEM on memory now waits (up to 3 s), EVENT_WRITE_EXT is packet 0x5A with full-screen extents, and occlusion queries are answered by the renderer, as in BCR2.
 
+### 3D colour (2026-11-10)
+
+In-game 3D first came out solid green, then green-tinted. Three renderer fixes, each found from frame dumps:
+- **10-bit EDRAM aliasing.** The scene renders as 2_10_10_10_FLOAT (7e3, host half floats) and the game rebinds the same EDRAM base as 2_10_10_10 / 10_10_10_10 to resolve the raw bits; a post shader decodes the 7e3 itself. `sync_color_alias()` carries the newest contents between those formats (re-encoding half floats to 7e3 bits and back, Xenia's conversion).
+- **Colour grading table.** The tone-map pass ends in a lookup into a 16x16x16 table that the game draws as 16 slices of 16x16 (each padded to 32 rows) and samples with a 3D fetch (fetch constant: 2D, stacked). The translator had treated it as 2D and ignored blue. Shader 3D fetches of resolved surfaces now blend the two nearest slices (`tfp.w` depth, `tfi.z` slice stride).
+- **Small targets above render scale 1.** The table's shader works from interpolated coordinates per guest pixel; at scale 2 host pixel centres sit a quarter guest pixel off, so the first row of each slice took the previous slice's padding (green = 255) and black came out bright green. For targets 256 pixels wide or less: the viewport uses a guest half pixel, the vertex nudge for upscaling is off, and interpolators and the pixel position are moved to the guest pixel's centre (`vpW.z`, along `ddx_fine`/`ddy_fine`).
+- Also: 16_16 and 16_16_16_16 targets hold -32..32 as signed 16-bit on the console. Pixel output to them is scaled to the unorm an unsigned fetch of those bits reads (value / 64); the game fetches them unsigned with no exponent bias. `ASURA_NOFIXED16` turns this off. Not checked against hardware.
+
+Checked with scripted input (episode 1 opening, logs\auto9): space, planet, explosions, the title card and the HUD in natural colours. Still seen in earlier dumps: green/black vertical streaks at the right edge of the scene (in the scene buffer, before post-processing; not yet looked at). The frame dumper writes 10-bit and float surfaces as raw bytes, so decode them by hand.
+
+Scripted input: `ASURA_AUTOINPUT="S.....A.....A.....A.....A.....A.....A.....|U.A....b..D.A..U.A........"` with `ASURA_AUTOINPUTMS=1000` reaches the opening of episode 1 from the completed save, whatever state the "Start episode?" dialog is in. `ASURA_CMDLINE=BC-S000` (map name) is ignored; the front end loads anyway.
+
 ### Input (2026-11-09)
 
 The pad works (XInput slot 0 is user 0). The main menu had stopped responding because the game opens a system message box ("saved data does not exist") and then ignores input until it hears the system UI close: every XamShow*UI now sends XN_SYS_UI 1 then 0 to the listeners. After that: the save is created (`saves\SAVEDATA.DAT`), all five DLC packs mount (DLC0-DLC4) and the Episode Menu works. Seen: a checkered garbage band along the top of the Episode Menu (a rendering bug, not yet looked at).

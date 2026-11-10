@@ -912,14 +912,24 @@ struct Translator {
             B += " float3 uv=cubedir(" + uvw + ");\n";
             smp = explicitLod ? S("TC[%u].SampleLevel(SS[%u],uv,%s)", slot, slot, lod.c_str()) : S("TC[%u].Sample(SS[%u],uv)", slot, slot);
         } else {
-            B += " float2 uv=" + uvw + ".xy;\n";
+            B += " float3 uw=" + uvw + ";\n";
+            B += " float2 uv=uw.xy;\n";
             if (dim == 0) B += " uv.y=0.5;\n";
             if (denorm) B += S(" uv*=tfi[%u].xy;\n", slot);
             else B += S(" uv*=tfscale(%u);\n", slot);
             if (ox != 0 || oy != 0) B += S(" uv+=float2(%g,%g)*tfi[%u].xy;\n", ox, oy, slot);
-            if (explicitLod) smp = S("T2[%u].SampleLevel(SS[%u],uv,%s)", slot, slot, lod.c_str());
-            else if (bias) smp = S("T2[%u].SampleBias(SS[%u],uv,%g)", slot, slot, bias / 16.0f);
-            else smp = S("T2[%u].Sample(SS[%u],uv)", slot, slot);
+            auto one = [&](const std::string& c) {
+                if (explicitLod) return S("T2[%u].SampleLevel(SS[%u],%s,%s)", slot, slot, c.c_str(), lod.c_str());
+                if (bias) return S("T2[%u].SampleBias(SS[%u],%s,%g)", slot, slot, c.c_str(), bias / 16.0f);
+                return S("T2[%u].Sample(SS[%u],%s)", slot, slot, c.c_str());
+            };
+            if (dim == 2) {
+                // 3D or stacked fetch. Supported for resolved surfaces, whose slices sit one under another (tfp.w = depth,
+                // tfi.z = slice stride in surface v): the two nearest slices, blended, with v kept inside the slice.
+                B += S(" float ld=max(tfp[%u].w,1.0), lz=clamp(uw.z*ld-0.5,0.0,ld-1.0), l0=floor(lz), lf=lz-l0, l1=min(l0+1.0,ld-1.0);\n", slot);
+                B += S(" uv.y=clamp(uv.y,0.5*tfscale(%u).y*tfi[%u].y,tfscale(%u).y*(1.0-0.5*tfi[%u].y));\n", slot, slot, slot, slot);
+                smp = "lerp(" + one(S("uv+float2(0,l0*tfi[%u].z)", slot)) + "," + one(S("uv+float2(0,l1*tfi[%u].z)", slot)) + ",lf)";
+            } else smp = one("uv");
         }
         if (op == 17) {                                                     // getCompTexLOD
             if (dim == 3 || explicitLod) B += " float4 t=0;\n";
@@ -1086,13 +1096,19 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
         // Interpolators arrive in r0..r15. Registers used only as temps get harmless initial values.
         std::string d = T.decls();
         src += d;
+        // vpW.z set (small targets above render scale 1): interpolators are moved from the host pixel's centre to the guest pixel's,
+        // along their screen derivatives, so lookup-table passes compute the values the game laid out per guest pixel.
+        src += S(" float2 gd=(floor(In.pos.xy/%d.0)+0.5)*%d.0-In.pos.xy; if(vpW.z==0.0) gd=0;\n", g_resScale, g_resScale);
         for (int i = 0; i < 16; i++) {
-            if (T.useArray) src += S(" r[%d]=In.o[%d];\n", i, i);
-            else if (T.usedRegs.count(i)) src += S(" r%d=In.o[%d];\n", i, i);
+            if (T.useArray) src += S(" r[%d]=In.o[%d]+ddx_fine(In.o[%d])*gd.x+ddy_fine(In.o[%d])*gd.y;\n", i, i, i, i);
+            else if (T.usedRegs.count(i)) src += S(" r%d=In.o[%d]+ddx_fine(In.o[%d])*gd.x+ddy_fine(In.o[%d])*gd.y;\n", i, i, i, i);
         }
         if (paramGen < 16) {
-            if (T.useArray) src += S(" r[%u]=float4(In.pos.xy/%d.0,0,0);\n", paramGen, g_resScale);       // the game expects guest pixels
-            else if (T.usedRegs.count(paramGen)) src += S(" r%u=float4(In.pos.xy/%d.0,0,0);\n", paramGen, g_resScale);
+            // The game expects guest pixels. vpW.z set: the guest pixel's centre, for small targets (lookup tables) whose shaders
+            // turn the position into integer rows and slices; otherwise the host pixel's own position, for finer upscaled passes.
+            std::string pos = S("(vpW.z!=0.0?floor(In.pos.xy/%d.0)+0.5:In.pos.xy/%d.0)", g_resScale, g_resScale);
+            if (T.useArray) src += S(" r[%u]=float4(%s,0,0);\n", paramGen, pos.c_str());
+            else if (T.usedRegs.count(paramGen)) src += S(" r%u=float4(%s,0,0);\n", paramGen, pos.c_str());
         }
         src += T.body;
         src += " uint af=(uint)alpha.x; if(af!=7){ float aa=oC[0].a, rf=alpha.y; bool atok=true;\n"
@@ -1101,6 +1117,8 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
         // 8_8_8_8_GAMMA targets store piecewise-linear gamma (colour only). Inverse of the ramp in texfix.
         src += " if(alpha.z!=0.0){ float3 lc=saturate(oC[0].rgb);\n"
                "  oC[0].rgb=(lc<0.0625)?lc*4.0:((lc<0.125)?lc*2.0+0.125:((lc<0.5)?lc+0.25:lc*0.5+0.5)); }\n";
+        // 16_16 and 16_16_16_16 targets hold -32..32 as signed 16-bit. Stored here as the unorm an unsigned fetch of those bits reads.
+        src += " if(alpha.w!=0.0) oC[0]*=alpha.w;\n";
         // BCR2_DBGPS="<ps hash>:<hlsl float4 expr>" replaces that pixel shader's first output, to view one input at a time
         if (const char* dbg = getenv("ASURA_DBGPS")) {
             std::string ds = dbg, hs = S("%016llX:", (unsigned long long)h);
@@ -2027,6 +2045,7 @@ static void draw_ring_dump(const char* dir) {
 }
 static void do_resolve();
 static void sync_depth_alias(Rt* depth, uint32_t base, uint32_t pitch);
+static void sync_color_alias(Rt* r, uint32_t base, uint32_t fmt, uint32_t pitch);
 
 // The game's fast clear: a depth-only rectangle with z always passing and writing, at half pitch with 4x MSAA. It writes a
 // constant dword (D24 << 8 | S8) over that part of EDRAM, which also clears any colour target sharing the base. Host targets are
@@ -2161,7 +2180,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     if (g_trace > 0) {
         fprintf(stderr, "[gfx]   shaders vs=%016llX ok=%d ps=%016llX ok=%d vte=%08X mode=%08X blend0=%08X cc=%08X psconst=%08X tf:", (unsigned long long)vs->hash, (int)vs->ok,
                 ps ? (unsigned long long)ps->hash : 0ull, ps ? (int)ps->ok : -1, g_regs[R_VTE_CNTL], g_regs[R_MODE_CNTL], g_regs[R_BLEND0], g_regs[R_COLORCONTROL], g_regs[0x2308]);
-        if (ps) for (auto& u : ps->tex) { const uint32_t* t = &g_regs[R_FETCH + u.slot * 6]; fprintf(stderr, " %u:fmt=%u,base=%08X,%ux%u,sw=%03X,sg=%02X", u.slot, t[1] & 63, t[1] & 0xFFFFF000u, (t[2] & 0x1FFF) + 1, ((t[2] >> 13) & 0x1FFF) + 1, (t[3] >> 1) & 0xFFF, (t[0] >> 2) & 0xFF); }
+        if (ps) for (auto& u : ps->tex) { const uint32_t* t = &g_regs[R_FETCH + u.slot * 6]; fprintf(stderr, " %u:fmt=%u,base=%08X,%ux%u,sw=%03X,sg=%02X,exp=%d", u.slot, t[1] & 63, t[1] & 0xFFFFF000u, (t[2] & 0x1FFF) + 1, ((t[2] >> 13) & 0x1FFF) + 1, (t[3] >> 1) & 0xFFF, (t[0] >> 2) & 0xFF, sext((t[3] >> 13) & 63, 6)); }
         fprintf(stderr, " c509=%g,%g,%g,%g c256=%g,%g,%g,%g c267=%g,%g,%g,%g colfmt=%u", reg_f(R_CONST + 509 * 4), reg_f(R_CONST + 509 * 4 + 1), reg_f(R_CONST + 509 * 4 + 2), reg_f(R_CONST + 509 * 4 + 3),
                 reg_f(R_CONST + 256 * 4), reg_f(R_CONST + 256 * 4 + 1), reg_f(R_CONST + 256 * 4 + 2), reg_f(R_CONST + 256 * 4 + 3),
                 reg_f(R_CONST + 267 * 4), reg_f(R_CONST + 267 * 4 + 1), reg_f(R_CONST + 267 * 4 + 2), reg_f(R_CONST + 267 * 4 + 3), (g_regs[R_COLOR_INFO] >> 16) & 0xF);
@@ -2203,6 +2222,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
             if (((mask >> (4 * i)) & 0xF) == 0) continue;
             uint32_t ci = g_regs[regs[i]];
             Rt* r = get_color_rt(ci & 0xFFF, (ci >> 16) & 0xF, pitch);
+            sync_color_alias(r, ci & 0xFFF, (ci >> 16) & 0xF, pitch);
             // Slots can share an EDRAM base. D3D11 rejects a view bound twice and silently keeps the previous targets,
             // which sent such draws into whatever surface the last resolve had bound. Bind each target once.
             bool dup = false;
@@ -2379,7 +2399,16 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         if (sf && u.dim != 3) {
             bool wantsRaw = sf->rawSrv && fmt != 22 && fmt != 23;           // depth read as bytes, not as a depth format
             srvs[u.slot] = wantsRaw ? sf->rawSrv.Get() : sf->srv.Get();
+            uint32_t depth = 1;
+            if (dim == 2) { w = (tf[2] & 0x7FF) + 1; h = ((tf[2] >> 11) & 0x7FF) + 1; depth = (tf[2] >> 22) + 1; }   // 3D
+            else if (dim == 1) depth = ((tf[2] >> 26) & 63) + 1;                                                      // 2D, stacked
             cb.tfp[u.slot * 4] = (float)w / sf->w; cb.tfp[u.slot * 4 + 1] = (float)h / sf->h;
+            cb.tfi[u.slot * 4] = 1.0f / w; cb.tfi[u.slot * 4 + 1] = 1.0f / h;
+            if (u.dim == 2) {                                               // slices one under another, 32-row aligned
+                cb.tfp[u.slot * 4 + 3] = (float)depth;
+                cb.tfi[u.slot * 4 + 2] = (float)align_up(h, 32) / sf->h;
+                logf_once(S("stk%X", base).c_str(), "3D/stacked fetch of resolved surface %X: %ux%ux%u, fetch dim %u", base, w, h, depth, dim);
+            }
             return;
         }
         {   // The console fills the channels a format doesn't store: one channel reads as RRRR, two channels as RGGG. D3D gives (R,0,0,1) and (R,G,0,1).
@@ -2445,18 +2474,24 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     // Tiled depth passes are matched later by an untiled pass with depth EQUAL. Shifted geometry, in the transform or by the viewport, gets slightly
     // different depth, and the lower tile speckled where the test missed.
     // Half a host pixel, not half a guest pixel: at a higher scale the larger shift would leave the first row and column of fullscreen passes unwritten.
-    if (!(g_regs[R_VTX_CNTL] & 1)) { xo += 0.5f / g_resScale; yo += 0.5f / g_resScale; }
+    if (!(g_regs[R_VTX_CNTL] & 1)) { const float hp = (g_regs[R_SURFACE_INFO] & 0x3FFF) <= 256 ? 0.5f : 0.5f / g_resScale; xo += hp; yo += hp; }   // small targets: a guest half pixel, as on the console
     cb.vpNdc[0] = xs * 2.0f / rw; cb.vpNdc[1] = -ys * 2.0f / rh; cb.vpNdc[2] = xo * 2.0f / rw - 1.0f; cb.vpNdc[3] = 1.0f - yo * 2.0f / rh;
     cb.vpZ[0] = zs; cb.vpZ[1] = zo; cb.vpZ[2] = (float)((vte >> 8) & 1); cb.vpZ[3] = (float)((vte >> 9) & 1);
     {   // Finishes the half pixel for vertices on half a guest pixel, in the vertex shader. Render scale 1 has nothing left to finish.
-        const bool snap = g_resScale > 1 && !(g_regs[R_VTX_CNTL] & 1);
+        const bool snap = g_resScale > 1 && !(g_regs[R_VTX_CNTL] & 1) && (g_regs[R_SURFACE_INFO] & 0x3FFF) > 256;   // small targets: see vpW.z
         cb.vpSnap[0] = snap ? (float)rw : 0.0f; cb.vpSnap[1] = (float)rh; cb.vpSnap[2] = 0.5f - 0.5f / g_resScale; cb.vpSnap[3] = 0.5f / g_resScale;
     }
-    cb.vpW[0] = (float)((vte >> 10) & 1); cb.vpW[1] = (float)indexOffset; cb.vpW[2] = 0; cb.vpW[3] = 0;
+    cb.vpW[0] = (float)((vte >> 10) & 1); cb.vpW[1] = (float)indexOffset; cb.vpW[3] = 0;
+    cb.vpW[2] = (g_resScale > 1 && (g_regs[R_SURFACE_INFO] & 0x3FFF) <= 256) ? 1.0f : 0.0f;   // snap the pixel position on small targets
     uint32_t colorCtl = g_regs[R_COLORCONTROL];
     cb.alpha[0] = (colorCtl & 8) ? (float)(colorCtl & 7) : 7.0f; cb.alpha[1] = reg_f(R_ALPHA_REF); cb.alpha[3] = 0;
     cb.alpha[2] = (!depthOnly && ((g_regs[R_COLOR_INFO] >> 16) & 0xF) == 1) ? 1.0f : 0.0f;
     if (g_trace > 0 && cb.alpha[2] != 0) logf_once("gammart", "gamma colour target in use");
+    {   // see the 16_16(_16_16) note in the pixel shader epilogue: value/32 as int16, read back as unorm16
+        static const bool kNoFixed16 = getenv("ASURA_NOFIXED16") != nullptr;
+        const uint32_t cf = (g_regs[R_COLOR_INFO] >> 16) & 0xF;
+        if (!depthOnly && !kNoFixed16 && (cf == 4 || cf == 5)) cb.alpha[3] = 32767.0f / (32.0f * 65535.0f);
+    }
     memcpy(cb.bools, &g_regs[R_BOOL], 32);
     memcpy(cb.loops, &g_regs[R_LOOP], 128);
     upload_cb(g_cbState.Get(), &cb, sizeof(cb));
@@ -2789,6 +2824,71 @@ static void sync_depth_alias(Rt* depth, uint32_t base, uint32_t pitch) {
     }
 }
 
+// The 10-bit colour formats share EDRAM bits: 2_10_10_10 (2), its 10_10_10_10 resolve view (10), 2_10_10_10_FLOAT (3, the 7e3
+// float format, 3-bit exponent and 7-bit mantissa per channel) and its 16_16_16_16 resolve view (12). UE3 draws its scene as
+// format 3, rebinds the same base as format 2 and resolves that, so a later shader can read the raw 7e3 bits and decode them
+// itself; until this the format 2 target never got the scene and the whole 3D view came out flat green. Host targets are
+// separate per format, so when one of these is bound, the newest one at the same base and pitch is carried over: copied when
+// the host formats match, re-encoded between half floats and 7e3 bits when they don't (Xenia's conversion).
+static bool is_10bit_family(uint32_t f) { return f == 2 || f == 3 || f == 10 || f == 12; }
+static bool is_7e3_float(uint32_t f) { return f == 3 || f == 12; }
+static void sync_color_alias(Rt* r, uint32_t base, uint32_t fmt, uint32_t pitch) {
+    if (!is_10bit_family(fmt)) return;
+    Rt* src = nullptr; uint32_t srcFmt = 0;
+    for (uint32_t f : { 2u, 3u, 10u, 12u }) {
+        if (f == fmt) continue;
+        auto it = g_rts.find(((uint64_t)base << 32) | ((uint64_t)f << 16) | (pitch & 0xFFFF));
+        if (it != g_rts.end() && it->second->seq > r->seq && (!src || it->second->seq > src->seq)) { src = it->second; srcFmt = f; }
+    }
+    if (!src) return;
+    if (is_7e3_float(fmt) == is_7e3_float(srcFmt)) {
+        g_ctx->CopyResource(r->tex.Get(), src->tex.Get());
+    } else {
+        static ComPtr<ID3D11PixelShader> toBits, toFloat;
+        if (!toBits) {
+            const char* common =
+                "Texture2D<float4> S : register(t0);\n"
+                "uint to7e3(float f) { uint u = asuint(clamp(f, 0.0, 31.875)); uint b;\n"
+                "  if (u < 0x3E800000u) { uint sh = min(125u - (u >> 23), 24u); b = ((u & 0x7FFFFFu) | 0x800000u) >> sh; } else b = u + 0xC2000000u;\n"
+                "  return ((b + 0x7FFFu + ((b >> 16) & 1u)) >> 16) & 0x3FFu; }\n"
+                "float from7e3(uint v) { uint m = v & 0x7Fu, e = v >> 7; return e == 0 ? m / 512.0 : (1.0 + m / 128.0) * exp2((float)e - 3.0); }\n";
+            std::string a = std::string(common) + "float4 main(float4 p : SV_Position) : SV_Target0 { float4 c = S.Load(int3(p.xy, 0));\n"
+                "  return float4(to7e3(c.r) / 1023.0, to7e3(c.g) / 1023.0, to7e3(c.b) / 1023.0, saturate(c.a)); }\n";
+            std::string b = std::string(common) + "float4 main(float4 p : SV_Position) : SV_Target0 { float4 c = S.Load(int3(p.xy, 0));\n"
+                "  uint3 v = (uint3)round(saturate(c.rgb) * 1023.0); return float4(from7e3(v.r), from7e3(v.g), from7e3(v.b), c.a); }\n";
+            if (auto bl = compile_cached(a, "main", "ps_5_0")) g_dev->CreatePixelShader(bl->GetBufferPointer(), bl->GetBufferSize(), nullptr, &toBits);
+            if (auto bl = compile_cached(b, "main", "ps_5_0")) g_dev->CreatePixelShader(bl->GetBufferPointer(), bl->GetBufferSize(), nullptr, &toFloat);
+        }
+        ID3D11PixelShader* ps = is_7e3_float(srcFmt) ? toBits.Get() : toFloat.Get();
+        if (!ps) return;
+        ID3D11ShaderResourceView* nul[32] = {};
+        g_ctx->PSSetShaderResources(0, 32, nul);
+        ID3D11RenderTargetView* rtv = r->rtv.Get();
+        g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+        invalidate_binds();
+        g_ctx->VSSetShader(g_vsBlit.Get(), nullptr, 0);
+        g_ctx->PSSetShader(ps, nullptr, 0);
+        g_ctx->GSSetShader(nullptr, nullptr, 0);
+        g_ctx->IASetInputLayout(nullptr);
+        g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+        g_ctx->OMSetDepthStencilState(get_ds(0, 0, 0), 0);
+        g_ctx->RSSetState(get_rs(0, true, true, 0, 0));
+        D3D11_VIEWPORT vp{ 0, 0, (float)(r->w * g_resScale), (float)(r->h * g_resScale), 0, 1 };
+        g_ctx->RSSetViewports(1, &vp);
+        D3D11_RECT sc{ 0, 0, (LONG)(r->w * g_resScale), (LONG)(r->h * g_resScale) };
+        g_ctx->RSSetScissorRects(1, &sc);
+        ID3D11ShaderResourceView* s = src->srv.Get();
+        g_ctx->PSSetShaderResources(0, 1, &s);
+        g_ctx->Draw(3, 0);
+        g_ctx->PSSetShaderResources(0, 1, nul);
+        ID3D11RenderTargetView* none[1] = { nullptr };
+        g_ctx->OMSetRenderTargets(1, none, nullptr);
+    }
+    r->seq = src->seq;
+    logf_once(S("alias10_%u_%u", srcFmt, fmt).c_str(), "EDRAM base %X: format %u carried into format %u (shared 10-bit bits)", base, srcFmt, fmt);
+}
+
 static void do_resolve() {
     g_resolves++;
     uint32_t cc = g_regs[R_COPY_CONTROL], surf = g_regs[R_SURFACE_INFO], pitch = surf & 0x3FFF;
@@ -2830,6 +2930,7 @@ static void do_resolve() {
     static const uint32_t regsC[4] = { R_COLOR_INFO, R_COLOR1_INFO, R_COLOR2_INFO, R_COLOR3_INFO };
     uint32_t ci = g_regs[regsC[srcSel & 3]];
     Rt* colorSrc = (!isDepth || colorClear) ? get_color_rt(ci & 0xFFF, (ci >> 16) & 0xF, pitch) : nullptr;
+    if (colorSrc) sync_color_alias(colorSrc, ci & 0xFFF, (ci >> 16) & 0xF, pitch);
     Rt* depthRt = (isDepth || depthClear) ? get_depth_rt(g_regs[R_DEPTH_INFO] & 0xFFF, pitch) : nullptr;
 
     static int nlog = 0;
@@ -3068,7 +3169,7 @@ static void write_shot() {
 }
 
 // BCR2_DUMPFRAME=n with BCR2_SHOTDIR: log frame n's draws and resolves, then write each resolved surface as a BMP.
-static const int64_t g_dumpFrame = getenv("ASURA_DUMPFRAME") ? _atoi64(getenv("ASURA_DUMPFRAME")) : -1;
+static int64_t g_dumpFrame = getenv("ASURA_DUMPFRAME") ? _atoi64(getenv("ASURA_DUMPFRAME")) : -1;   // also set by F10 (with --log): the next frame
 static void dump_surfaces() {
     const char* dir = getenv("ASURA_SHOTDIR");
     if (!dir) return;
@@ -3286,6 +3387,11 @@ static void do_swap(uint32_t front) {
             const bool d = kbm_reserved_down(VK_F9);
             if (d && !f9Prev && g_frame > g_lastF9 + 90) { if (g_shotRingSize > 0) g_ringDump = true; else { g_shotBurstLeft = 180; g_shotStep = 3; } fprintf(stderr, "[capture] F9 pressed (polled) at frame %llu\n", (unsigned long long)g_frame); }
             f9Prev = d;
+            // F10: dump the next frame in full (every surface, and the per-draw trace in the log), as ASURA_DUMPFRAME would
+            static bool f10Prev = false;
+            const bool d10 = kbm_reserved_down(VK_F10);
+            if (d10 && !f10Prev) { g_dumpFrame = (int64_t)g_frame + 2; fprintf(stderr, "[capture] F10: dumping frame %lld\n", (long long)g_dumpFrame); }
+            f10Prev = d10;
         }
     }
     write_shot();
