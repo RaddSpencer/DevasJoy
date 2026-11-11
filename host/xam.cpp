@@ -148,36 +148,70 @@ static void input_record(const XINPUT_GAMEPAD& g) {
 // ASURA_AUTOQTE=1: while the renderer sees a QTE prompt (xenos.cpp, qte_active), add its answer to the pad state, whatever the input
 // source. Buttons are tapped at about 10 presses a second, which both answers a single press and mashes; triggers and stick pushes are held.
 uint32_t qte_active();   // xenos.cpp
-static void qte_apply(uint32_t st) {
-    static const bool kOn = getenv("ASURA_AUTOQTE") != nullptr;
-    if (!kOn) return;
+// The answer to put on the pad: buttons tapped, triggers held, a stick direction held (0 left, 1 down, 2 right, 3 up) or circled.
+struct QteAnswer { uint16_t buttons = 0; bool lt = false, rt = false, lRot = false, rRot = false; int lDir = -1, rDir = -1; bool any() const { return buttons || lt || rt || lRot || rRot || lDir >= 0 || rDir >= 0; } };
+// From the game's QTE judge (hooks.cpp): its active prompts and their input codes. Codes seen in episode 1 (NOTES.md "QTE judge"):
+// 7 LT, 8 RT, 30 B, 17-20 left stick left/down/right/up, 21-24 right stick, 37 rotate the left stick. Returns false if a code is
+// unknown, so the icon detection answers instead.
+uint32_t qte_judge();   // hooks.cpp
+static bool qte_from_judge(QteAnswer& a) {
+    const uint32_t j = qte_judge();
+    if (!j) return true;
+    const uint32_t data = rd32(j + 0x1C4), n = rd32(j + 0x1C8);
+    bool known = true;
+    for (uint32_t i = 0; i < n && i < 8 && data; i++) {
+        const uint32_t e = data + i * 92, cp = rd32(e), cn = rd32(e + 4), kind = g_base[e + 12], pos = rd32(e + 52);
+        if (!cp || cn == 0 || cn > 8) continue;
+        const uint32_t from = kind == 0 ? pos : 0, to = kind == 0 ? pos + 1 : (kind == 1 ? 1 : cn);
+        for (uint32_t k = from; k < to && k < cn; k++) {
+            const uint8_t c = g_base[cp + k];
+            if (c == 7) a.lt = true;
+            else if (c == 8) a.rt = true;
+            else if (c == 30) a.buttons |= 0x2000;                          // B
+            else if (c >= 17 && c <= 20) a.lDir = c - 17;
+            else if (c >= 21 && c <= 24) a.rDir = c - 21;
+            else if (c == 37) a.lRot = true;
+            else { static uint32_t warned[8] = {}; if (!(warned[c >> 5] & (1u << (c & 31)))) { warned[c >> 5] |= 1u << (c & 31); LOG("[qte] judge asks for unknown input code %u (kind %u): answering from the prompt icons\n", c, kind); } known = false; }
+        }
+    }
+    return known;
+}
+static void qte_from_icons(QteAnswer& a) {                                  // the renderer's prompt detection (xenos.cpp kQteTex)
     const uint32_t m = qte_active();
-    if (!m) return;
+    if (m & 1) a.buttons |= 0x1000;
+    if (m & 2) a.buttons |= 0x2000;
+    if (m & 4) a.buttons |= 0x4000;
+    if (m & 8) a.buttons |= 0x8000;
+    if (m & 16) a.lt = true;
+    if (m & 32) a.rt = true;
+    if (m & 256) { if ((m & 64) || !(m & 128)) a.lRot = true; if (m & 128) a.rRot = true; }
+    else { if (m & 64) a.lDir = 1; if (m & 128) a.rDir = 1; }
+}
+// ASURA_AUTOQTE=1: answer QTEs from the judge (icons where it asks for something unknown); ASURA_AUTOQTE=icons: from the icons only.
+// Buttons are tapped at about 10 presses a second (answers presses and mashing); triggers and stick directions are held.
+static void qte_apply(uint32_t st) {
+    static const char* kMode = getenv("ASURA_AUTOQTE");
+    if (!kMode) return;
+    static const bool kIconsOnly = !strcmp(kMode, "icons");
+    QteAnswer a;
+    if (kIconsOnly || !qte_from_judge(a)) { a = QteAnswer(); qte_from_icons(a); }
+    if (!a.any()) return;
     const bool tapDown = (GetTickCount64() / 50) % 2 == 0;                 // 50 ms down, 50 ms up
-    uint16_t b = rd16(st + 4);
-    if (tapDown) {
-        if (m & 1) b |= 0x1000;                                             // A
-        if (m & 2) b |= 0x2000;                                             // B
-        if (m & 4) b |= 0x4000;                                             // X
-        if (m & 8) b |= 0x8000;                                             // Y
-    }
-    wr16(st + 4, b);
-    if (m & 16) g_base[st + 6] = 255;                                       // LT
-    if (m & 32) g_base[st + 7] = 255;                                       // RT
-    if (m & 256) {                                                          // rotate: circle the prompted stick(s) counterclockwise, about 2 turns a second
-        const double a = (double)(GetTickCount64() % 500) / 500.0 * 6.283185307;
-        const int16_t x = (int16_t)(cos(a) * 32000.0), y = (int16_t)(sin(a) * 32000.0);
-        const bool left = (m & 64) || !(m & 128);
-        if (left) { wr16(st + 8, (uint16_t)x); wr16(st + 10, (uint16_t)y); }
-        if (m & 128) { wr16(st + 12, (uint16_t)x); wr16(st + 14, (uint16_t)y); }
-    } else {
-        if (m & 64) wr16(st + 10, (uint16_t)(int16_t)-32767);               // left stick down
-        if (m & 128) wr16(st + 14, (uint16_t)(int16_t)-32767);              // right stick down
-    }
+    if (tapDown) wr16(st + 4, rd16(st + 4) | a.buttons);
+    if (a.lt) g_base[st + 6] = 255;
+    if (a.rt) g_base[st + 7] = 255;
+    static const int16_t dx[4] = { -32767, 0, 32767, 0 }, dy[4] = { 0, -32767, 0, 32767 };
+    const double ang = (double)(GetTickCount64() % 500) / 500.0 * 6.283185307;   // counterclockwise, about 2 turns a second
+    const int16_t cx = (int16_t)(cos(ang) * 32000.0), cy = (int16_t)(sin(ang) * 32000.0);
+    if (a.lRot) { wr16(st + 8, (uint16_t)cx); wr16(st + 10, (uint16_t)cy); }
+    else if (a.lDir >= 0) { wr16(st + 8, (uint16_t)dx[a.lDir]); wr16(st + 10, (uint16_t)dy[a.lDir]); }
+    if (a.rRot) { wr16(st + 12, (uint16_t)cx); wr16(st + 14, (uint16_t)cy); }
+    else if (a.rDir >= 0) { wr16(st + 12, (uint16_t)dx[a.rDir]); wr16(st + 14, (uint16_t)dy[a.rDir]); }
     static uint32_t packet = 0x40000000;
     wr32(st, ++packet);                                                     // a new packet number, so the game reads it as changed
-    static uint32_t lastM = 0;
-    if (m != lastM) { LOG("[qte] answering mask %X\n", m); lastM = m; }
+    static uint64_t lastSig = 0;
+    const uint64_t sig = a.buttons | (uint64_t)a.lt << 16 | (uint64_t)a.rt << 17 | (uint64_t)a.lRot << 18 | (uint64_t)a.rRot << 19 | (uint64_t)(a.lDir + 1) << 20 | (uint64_t)(a.rDir + 1) << 24;
+    if (sig != lastSig) { LOG("[qte] answering: buttons %04X%s%s%s%s left stick %d right stick %d\n", a.buttons, a.lt ? " LT" : "", a.rt ? " RT" : "", a.lRot ? " rotate-L" : "", a.rRot ? " rotate-R" : "", a.lDir, a.rDir); lastSig = sig; }
 }
 // XamInputGetState(user, flags, XINPUT_STATE*): {u32 packet; u16 buttons; u8 lt, rt; s16 lx, ly, rx, ry}
 static void XamInputGetState_(PPCContext& ctx, uint8_t*) {

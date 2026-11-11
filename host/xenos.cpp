@@ -1269,6 +1269,10 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
         // Colour exponent bias of the target (RB_COLOR_INFO 20-25): output times 2^bias. Negative alpha.w also clamps to -32..32,
         // the range of the 16_16 / 16_16_16_16 targets (kept as half floats).
         src += " if(alpha.w!=0.0) { oC[0]*=abs(alpha.w); if(alpha.w<0.0) oC[0]=clamp(oC[0],-32.0,32.0); }\n";
+        // vpW.w: the target is the console's 2_10_10_10_FLOAT (7e3), held here as 16-bit float. The console's format can't hold more than
+        // 31.875, nor NaN or infinity (NaN becomes 0); without this, a lighting shader's occasional huge or NaN value survived as a white
+        // speck after bloom and tone mapping (the planet at the start of episode 1, Asura's armour).
+        src += " if(vpW.w>0.5) { oC[0].rgb=min(max(oC[0].rgb,0.0),31.875); oC[0].a=saturate(oC[0].a); }\n";
         // BCR2_DBGPS="<ps hash>:<hlsl float4 expr>" replaces that pixel shader's first output, to view one input at a time
         if (const char* dbg = getenv("ASURA_DBGPS")) {
             std::string ds = dbg, hs = S("%016llX:", (unsigned long long)h);
@@ -3132,7 +3136,12 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         const bool snap = g_resScale > 1 && !(g_regs[R_VTX_CNTL] & 1) && (g_regs[R_SURFACE_INFO] & 0x3FFF) > 256;   // small targets: see vpW.z
         cb.vpSnap[0] = snap ? (float)rw : 0.0f; cb.vpSnap[1] = (float)rh; cb.vpSnap[2] = 0.5f - 0.5f / g_resScale; cb.vpSnap[3] = 0.5f / g_resScale;
     }
-    cb.vpW[0] = (float)((vte >> 10) & 1); cb.vpW[1] = (float)indexOffset; cb.vpW[3] = 0;
+    cb.vpW[0] = (float)((vte >> 10) & 1); cb.vpW[1] = (float)indexOffset;
+    {   // colour target 0 is the console's 7e3 float format: clamp the output to its range (pixel shader epilogue). ASURA_NO7E3CLAMP to compare.
+        static const bool kNo7e3 = getenv("ASURA_NO7E3CLAMP") != nullptr;
+        const uint32_t cf = (g_regs[R_COLOR_INFO] >> 16) & 0xF;
+        cb.vpW[3] = (!kNo7e3 && !depthOnly && (cf == 3 || cf == 12)) ? 1.0f : 0.0f;
+    }
     cb.vpW[2] = (g_resScale > 1 && (g_regs[R_SURFACE_INFO] & 0x3FFF) <= 256) ? 1.0f : 0.0f;   // snap the pixel position on small targets
     uint32_t colorCtl = g_regs[R_COLORCONTROL];
     cb.alpha[0] = (colorCtl & 8) ? (float)(colorCtl & 7) : 7.0f; cb.alpha[1] = reg_f(R_ALPHA_REF); cb.alpha[3] = 0;

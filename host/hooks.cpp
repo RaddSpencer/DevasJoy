@@ -270,6 +270,19 @@ PPC_FUNC(sub_824BA210) {                                                    // A
             }
         }
     }
+    {   // the pressed-input mask the judge compares against (judge+468 -> +1056), and each active entry's input codes (bytes at *entry+0)
+        static uint32_t lastMask = 0xFFFFFFFFu;
+        const uint32_t src = rd32(self + 468), mask = src ? rd32(src + 1056) : 0;
+        std::string codes;
+        const uint32_t data = rd32(self + 0x1C4), n = rd32(self + 0x1C8);
+        for (uint32_t i = 0; i < n && i < 4 && data; i++) {
+            const uint32_t e = data + i * 92, cp = rd32(e), cn = rd32(e + 4);
+            codes += " [kind " + std::to_string(g_base[e + 12]) + " miss " + std::to_string(g_base[e + 28]) + " pos " + std::to_string(rd32(e + 52)) + " codes";
+            for (uint32_t k = 0; k < cn && k < 8 && cp; k++) codes += " " + std::to_string(g_base[cp + k]);
+            codes += "]";
+        }
+        if (mask != lastMask) { lastMask = mask; fprintf(stderr, "[qtemask] f=%llu mask=%08X%s\n", (unsigned long long)gpu_frame_number(), mask, codes.c_str()); }
+    }
     // Each frame of a QTE: when the judge's prompt lists change, dump their elements and each element's input list (+0x20 {data, count, max}).
     static uint32_t lastSig = 0;
     uint32_t sig = 0;
@@ -292,6 +305,12 @@ PPC_FUNC(sub_824BA210) {                                                    // A
             }
         }
     }
+}
+// The judge, for xam.cpp's QTE answers: null unless it still looks like one (its vtable), since the actor goes away between levels.
+uint32_t qte_judge() {
+    const uint32_t j = g_qteJudge.load();
+    if (!j || IsBadReadPtr(g_base + j, 0x200) || rd32(j) != 0x8219BBC8u) return 0;
+    return j;
 }
 // Called by the renderer when the on-screen QTE prompts change: dumps the judge object (ASURA_QTELOG), to find where it keeps the
 // expected input and its result.
@@ -323,3 +342,14 @@ QTE_HOOK(829293F8, "PlayerInput.SetPressedButton")
 QTE_HOOK(82929488, "PlayerInput.SetRepeatButton")
 QTE_HOOK(82929518, "PlayerInput.SetReleaseButton")
 QTE_HOOK(829295A8, "PlayerInput.ResetRepeatButton")
+// The judge's input code -> pressed-mask bit (an UnrealScript function called by name); logged once per code (ASURA_QTELOG).
+PPC_FUNC_IMPL(__imp__sub_8291C430);
+PPC_FUNC(sub_8291C430) {
+    const uint32_t code = ctx.r4.u32 & 0xFF;
+    __imp__sub_8291C430(ctx, base);
+    if (qtelog_on()) {
+        static std::mutex m; static std::map<uint32_t, uint32_t> seen;
+        std::lock_guard<std::mutex> g(m);
+        if (!seen.count(code) || seen[code] != ctx.r3.u32) { seen[code] = ctx.r3.u32; fprintf(stderr, "[qtecode] f=%llu code %u -> bit %d\n", (unsigned long long)gpu_frame_number(), code, (int)ctx.r3.u32); }
+    }
+}
