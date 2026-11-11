@@ -1965,7 +1965,12 @@ static void qte_note_texture(uint32_t base, uint64_t hash) {
 }
 static void qte_publish() {                                                 // at the swap
     static uint32_t last = 0;
-    if (g_qteFrame != last) fprintf(stderr, "[qte] frame %llu: prompt mask %X -> %X\n", (unsigned long long)g_frame, last, g_qteFrame);
+    if (g_qteFrame != last) {
+        fprintf(stderr, "[qte] frame %llu: prompt mask %X -> %X\n", (unsigned long long)g_frame, last, g_qteFrame);
+        void qte_judge_dump(const char* why);
+        char why[32]; snprintf(why, sizeof why, "mask=%X", g_qteFrame);
+        qte_judge_dump(why);
+    }
     last = g_qteFrame;
     g_qteActive = g_qteFrame;
     g_qteFrame = 0;

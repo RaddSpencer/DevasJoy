@@ -165,6 +165,17 @@ static void open_file(PPCContext& ctx, uint32_t outH, uint32_t access, uint32_t 
         for (const char* m : { "00_autosave_xenon.bik", "40_capcomlogo.bik", "40_cc2logo.bik", "20_ue3logo.bik", "20_speedtreelogo.bik" })
             if (low.size() >= strlen(m) && low.compare(low.size() - strlen(m), std::string::npos, m) == 0) skipped = true;
     }
+    // ASURA_SKIPMOVIES=name.bik,name.bik: more movies served as one frame the same way, for test runs (AW_S000_A000.bik is episode 1's
+    // 18.2 s opening; replays\complete_ep1_short.txt is the episode 1 recording shifted to match)
+    if (const char* list = getenv("ASURA_SKIPMOVIES")) {
+        const std::string low = lower(name), l = lower(list);
+        for (size_t p = 0; p < l.size();) {
+            size_t e = l.find(',', p); if (e == std::string::npos) e = l.size();
+            const std::string m = l.substr(p, e - p);
+            if (!m.empty() && low.size() >= m.size() && low.compare(low.size() - m.size(), std::string::npos, m) == 0) skipped = true;
+            p = e + 1;
+        }
+    }
     if (skipped) {   // serve cache\intro\<movie>: the original's header and first frame only (as tools\bink1frame.py makes them)
         std::string src; bool w = false;
         if (resolve_game_path(name, src, w)) {

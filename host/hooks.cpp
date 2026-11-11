@@ -2,6 +2,10 @@
 #include "kernel.h"
 #include <windows.h>
 #include <cmath>
+#include <atomic>
+#include <map>
+#include <string>
+#include <mutex>
 
 static std::string guest_wide(uint32_t p, size_t max = 2048) {
     std::string s;
@@ -219,3 +223,103 @@ PPC_FUNC(sub_8229BB28) {
     fflush(stderr);
     __imp__sub_8229BB28(ctx, base);
 }
+
+// ASURA_QTELOG=1: the natives behind QTEs ("Synchronic" cinematic tracks, BCPlayerInput's button bookkeeping, the input judge). Each
+// logs this, its result word and the frame, but only when the result changes for that object, so per-frame polling stays readable.
+// Native addresses come from the name table at 831FF598-831FF9DC (name, function pairs).
+static bool qtelog_on() { static const bool on = getenv("ASURA_QTELOG") != nullptr; return on; }
+static void qtelog(const char* name, uint32_t self, uint32_t result) {
+    static std::mutex m; static std::map<std::pair<const char*, uint32_t>, uint32_t> last;
+    std::lock_guard<std::mutex> g(m);
+    auto key = std::make_pair(name, self);
+    auto it = last.find(key);
+    if (it != last.end() && it->second == result) return;
+    last[key] = result;
+    fprintf(stderr, "[qtelog] f=%llu %s this=%08X -> %08X\n", (unsigned long long)gpu_frame_number(), name, self, result);
+}
+#define QTE_HOOK(addr, label) \
+    PPC_FUNC_IMPL(__imp__sub_##addr); \
+    PPC_FUNC(sub_##addr) { \
+        const uint32_t self = ctx.r3.u32, res = ctx.r5.u32; \
+        __imp__sub_##addr(ctx, base); \
+        if (qtelog_on()) qtelog(label, self, res ? rd32(res) : 0xFFFFFFFFu); \
+    }
+QTE_HOOK(82950A10, "Synchronic.IsStartTrack")
+QTE_HOOK(82950B50, "Synchronic.IsEndTrack")
+QTE_HOOK(82950C80, "Synchronic.IsInputOk")
+QTE_HOOK(82950DA8, "Synchronic.IsInputStart")
+QTE_HOOK(82950E60, "Synchronic.IsInputEnd")
+PPC_FUNC_IMPL(__imp__sub_824BA210);
+static std::atomic<uint32_t> g_qteJudge{0};
+PPC_FUNC(sub_824BA210) {                                                    // ABCInputJudgeSystem::execCheckMissInput: calls vtable+888
+    const uint32_t self = ctx.r3.u32, res = ctx.r5.u32;
+    __imp__sub_824BA210(ctx, base);
+    g_qteJudge = self;
+    if (!qtelog_on()) return;
+    static bool namesScanned = false;
+    if (!namesScanned) {                                                    // once: where the controller key names sit, and the words before them
+        namesScanned = true;
+        static const char kKey[] = "XboxTypeS_";
+        for (uint32_t pg = 0x40000000u; pg < 0x50000000u; pg += 0x10000) {
+            if (IsBadReadPtr(g_base + pg, 0x10000)) continue;
+            const uint8_t* p = g_base + pg;
+            for (uint32_t o = 16; o + 40 < 0x10000; o++) {
+                if (p[o] != 'X' || memcmp(p + o, kKey, 10)) continue;
+                char name[48] = {}; for (int k = 0; k < 47 && p[o + k] >= 32 && p[o + k] < 127; k++) name[k] = (char)p[o + k];
+                fprintf(stderr, "[qtename] %08X %-32s before: %08X %08X %08X %08X\n", pg + o, name, rd32(pg + o - 16), rd32(pg + o - 12), rd32(pg + o - 8), rd32(pg + o - 4));
+            }
+        }
+    }
+    // Each frame of a QTE: when the judge's prompt lists change, dump their elements and each element's input list (+0x20 {data, count, max}).
+    static uint32_t lastSig = 0;
+    uint32_t sig = 0;
+    for (uint32_t arr : { 0x1C4u, 0x1E4u }) sig = sig * 31 + rd32(self + arr) * 7 + rd32(self + arr + 4);
+    if (sig == lastSig) return;
+    lastSig = sig;
+    for (uint32_t arr : { 0x1C4u, 0x1E4u }) {
+        const uint32_t data = rd32(self + arr), n = rd32(self + arr + 4);
+        fprintf(stderr, "[qtelist] f=%llu list +%X: %u entries at %08X\n", (unsigned long long)gpu_frame_number(), arr, n, data);
+        for (uint32_t i = 0; i < n && i < 8 && data && !IsBadReadPtr(g_base + data + i * 0x60, 0x60); i++) {
+            std::string e = "[qtelist]   entry:"; char b[16];
+            for (uint32_t o = 0; o < 0x60; o += 4) { snprintf(b, sizeof b, " %08X", rd32(data + i * 0x60 + o)); e += b; }
+            fprintf(stderr, "%s\n", e.c_str());
+            for (uint32_t ao : { 0x00u, 0x20u }) {                           // the element's two arrays {data, count, max}: 0x20 bytes per item shown
+                const uint32_t in = rd32(data + i * 0x60 + ao), cnt = rd32(data + i * 0x60 + ao + 4);
+                if (!in || !cnt || cnt > 8 || IsBadReadPtr(g_base + in, cnt * 0x20)) continue;
+                std::string q = "[qtelist]     array +" + std::to_string(ao) + ":";
+                for (uint32_t o = 0; o < cnt * 0x20; o += 4) { snprintf(b, sizeof b, " %08X", rd32(in + o)); q += b; }
+                fprintf(stderr, "%s\n", q.c_str());
+            }
+        }
+    }
+}
+// Called by the renderer when the on-screen QTE prompts change: dumps the judge object (ASURA_QTELOG), to find where it keeps the
+// expected input and its result.
+void qte_judge_dump(const char* why) {
+    const uint32_t j = g_qteJudge.load();
+    if (!qtelog_on() || !j) return;
+    std::string s = "[qtejudge] f=" + std::to_string(gpu_frame_number()) + " " + why + " " ;
+    char b[16];
+    for (uint32_t o = 0; o < 0x600; o += 4) { snprintf(b, sizeof b, "%08X ", rd32(j + o)); s += b; }
+    fprintf(stderr, "%s\n", s.c_str());
+    for (uint32_t arr : { 0x19Cu, 0x1C4u, 0x1E4u }) {                       // TArrays {data, count, max}: their elements (0x60 bytes each shown)
+        const uint32_t data = rd32(j + arr), n = rd32(j + arr + 4);
+        if (!data || n == 0 || n > 16 || IsBadReadPtr(g_base + data, 0x60 * n)) continue;
+        std::string e = "[qtejudge]   array +" + std::to_string(arr) + " (" + std::to_string(n) + "):";
+        for (uint32_t o = 0; o < 0x60 * n && o < 0x200; o += 4) { snprintf(b, sizeof b, " %08X", rd32(data + o)); e += b; }
+        fprintf(stderr, "%s\n", e.c_str());
+        for (uint32_t po : { 0x00u, 0x20u }) {                               // the element's pointers: what they point at
+            const uint32_t p = rd32(data + po);
+            if (p < 0x40000000u || p >= 0x50000000u || IsBadReadPtr(g_base + p, 0x100)) continue;
+            std::string q = "[qtejudge]     *+" + std::to_string(po) + " " + std::to_string(p) + ":";
+            for (uint32_t o = 0; o < 0x100; o += 4) { snprintf(b, sizeof b, " %08X", rd32(p + o)); q += b; }
+            fprintf(stderr, "%s\n", q.c_str());
+        }
+    }
+}
+QTE_HOOK(824B8218, "PlayerInput.UpdateInputList")
+QTE_HOOK(82929340, "PlayerInput.UpdateButtonInputCondition")
+QTE_HOOK(829293F8, "PlayerInput.SetPressedButton")
+QTE_HOOK(82929488, "PlayerInput.SetRepeatButton")
+QTE_HOOK(82929518, "PlayerInput.SetReleaseButton")
+QTE_HOOK(829295A8, "PlayerInput.ResetRepeatButton")
