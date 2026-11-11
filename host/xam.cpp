@@ -104,6 +104,22 @@ static bool input_play(uint32_t st) {
     static size_t i = 0;
     const uint32_t now = (uint32_t)(GetTickCount64() - input_t0() - g_inputPauseMs.load());
     while (i + 1 < recs.size() && recs[i + 1].ms <= now) i++;
+    {   // ASURA_INPUTCAPTURE=ms,ms,...: an F9 capture when the replay clock passes each time (the capture also holds the 3.5 s before it)
+        static std::vector<uint32_t> at = [] {
+            std::vector<uint32_t> v;
+            if (const char* e = getenv("ASURA_INPUTCAPTURE")) for (const char* p = e; *p;) { char* x; const unsigned long t = strtoul(p, &x, 10); if (x == p) break; v.push_back((uint32_t)t); p = (*x == ',') ? x + 1 : x; }
+            return v;
+        }();
+        static size_t next = 0;
+        void capture_request();
+        while (next < at.size() && now >= at[next]) { capture_request(); next++; }
+    }
+    static const uint32_t kUntil = getenv("ASURA_INPUTPLAYUNTIL") ? (uint32_t)strtoul(getenv("ASURA_INPUTPLAYUNTIL"), nullptr, 10) : 0;   // stop the replay here (ms)
+    if (kUntil && now >= kUntil) {
+        static bool said = false;
+        if (!said) { said = true; LOG("[input] replay stopped at %u ms (ASURA_INPUTPLAYUNTIL); the pad is live again\n", kUntil); }
+        return false;
+    }
     if (!recs.empty() && i + 1 == recs.size() && now > recs[i].ms + 2000) {   // the recording is over: hand the pad back
         static bool said = false;
         if (!said) { said = true; LOG("[input] recording played to the end; the pad is live again\n"); }
@@ -129,6 +145,40 @@ static void input_record(const XINPUT_GAMEPAD& g) {
     fprintf(f, "%u %04X %u %u %d %d %d %d\n", (unsigned)(GetTickCount64() - input_t0()), g.wButtons, g.bLeftTrigger, g.bRightTrigger, g.sThumbLX, g.sThumbLY, g.sThumbRX, g.sThumbRY);
     fflush(f);
 }
+// ASURA_AUTOQTE=1: while the renderer sees a QTE prompt (xenos.cpp, qte_active), add its answer to the pad state, whatever the input
+// source. Buttons are tapped at about 10 presses a second, which both answers a single press and mashes; triggers and stick pushes are held.
+uint32_t qte_active();   // xenos.cpp
+static void qte_apply(uint32_t st) {
+    static const bool kOn = getenv("ASURA_AUTOQTE") != nullptr;
+    if (!kOn) return;
+    const uint32_t m = qte_active();
+    if (!m) return;
+    const bool tapDown = (GetTickCount64() / 50) % 2 == 0;                 // 50 ms down, 50 ms up
+    uint16_t b = rd16(st + 4);
+    if (tapDown) {
+        if (m & 1) b |= 0x1000;                                             // A
+        if (m & 2) b |= 0x2000;                                             // B
+        if (m & 4) b |= 0x4000;                                             // X
+        if (m & 8) b |= 0x8000;                                             // Y
+    }
+    wr16(st + 4, b);
+    if (m & 16) g_base[st + 6] = 255;                                       // LT
+    if (m & 32) g_base[st + 7] = 255;                                       // RT
+    if (m & 256) {                                                          // rotate: circle the prompted stick(s) counterclockwise, about 2 turns a second
+        const double a = (double)(GetTickCount64() % 500) / 500.0 * 6.283185307;
+        const int16_t x = (int16_t)(cos(a) * 32000.0), y = (int16_t)(sin(a) * 32000.0);
+        const bool left = (m & 64) || !(m & 128);
+        if (left) { wr16(st + 8, (uint16_t)x); wr16(st + 10, (uint16_t)y); }
+        if (m & 128) { wr16(st + 12, (uint16_t)x); wr16(st + 14, (uint16_t)y); }
+    } else {
+        if (m & 64) wr16(st + 10, (uint16_t)(int16_t)-32767);               // left stick down
+        if (m & 128) wr16(st + 14, (uint16_t)(int16_t)-32767);              // right stick down
+    }
+    static uint32_t packet = 0x40000000;
+    wr32(st, ++packet);                                                     // a new packet number, so the game reads it as changed
+    static uint32_t lastM = 0;
+    if (m != lastM) { LOG("[qte] answering mask %X\n", m); lastM = m; }
+}
 // XamInputGetState(user, flags, XINPUT_STATE*): {u32 packet; u16 buttons; u8 lt, rt; s16 lx, ly, rx, ry}
 static void XamInputGetState_(PPCContext& ctx, uint8_t*) {
     uint32_t user = ctx.r3.u32, st = ctx.r5.u32;
@@ -145,6 +195,7 @@ static void XamInputGetState_(PPCContext& ctx, uint8_t*) {
             wr16(st + 8, (uint16_t)g.sThumbLX); wr16(st + 10, (uint16_t)g.sThumbLY); wr16(st + 12, (uint16_t)g.sThumbRX); wr16(st + 14, (uint16_t)g.sThumbRY);
         }
     }
+    qte_apply(st);
     ctx.r3.u64 = 0;
 }
 static void XamInputSetState_(PPCContext& ctx, uint8_t*) {
@@ -253,7 +304,22 @@ static void XamUserCreateAchievementEnumerator_(PPCContext& ctx, uint8_t*) { emp
 static void XamUserCreateStatsEnumerator_(PPCContext& ctx, uint8_t*) { empty_enumerator(ctx, ctx.r9.u32, ctx.r10.u32, 0x10); }
 
 // ======================================================================== content: saves and DLC
-static std::string saves_dir() { std::string s = data_root() + "\\saves"; CreateDirectoryA(s.c_str(), nullptr); return s; }
+static std::string saves_dir() {
+    std::string s = data_root() + "\\saves"; CreateDirectoryA(s.c_str(), nullptr);
+    // ASURA_SAVESEED=<file>: before the game first touches its save, copy this file over saves\SAVEDATA.DAT\SAVEDATA.DAT, so every test run
+    // starts from the same state (saves_complete\SAVEDATA.DAT is the user's completed save, extracted from the CON package in the repo root).
+    static bool seeded = false;
+    if (!seeded) {
+        seeded = true;
+        if (const char* seed = getenv("ASURA_SAVESEED")) {
+            const std::string dir = s + "\\SAVEDATA.DAT";
+            CreateDirectoryA(dir.c_str(), nullptr);
+            const BOOL ok = CopyFileA(seed, (dir + "\\SAVEDATA.DAT").c_str(), FALSE);
+            LOG("[save] seeded %s from %s: %s\n", (dir + "\\SAVEDATA.DAT").c_str(), seed, ok ? "ok" : "FAILED");
+        }
+    }
+    return s;
+}
 static std::string dlc_dir() { return data_root() + "\\game\\dlc"; }
 static std::vector<uint8_t> content_item(uint32_t type, const std::string& file, const std::wstring& display) {
     std::vector<uint8_t> it(kContentDataSize, 0);

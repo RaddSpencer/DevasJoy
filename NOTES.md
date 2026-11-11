@@ -133,6 +133,12 @@ One-frame flicker on faces, the Gohma torso and ships (wrong surface on the righ
 - `ASURA_MONSAMPLE=1`: samples guest thread stacks every 2 ms and logs where frames over 120 ms went (`[sample]`). Critical-section waits over 100 ms log how often others took the lock meanwhile (`[cs]`).
 - `[texzero]` (on with --log): textures of 64x64 and up whose base level is all zero at upload. `ASURA_TEXDUMPONLY=addr,...` limits the texture dumps.
 
+### Auto-QTE and test runs from the completed save (2026-11-10)
+
+- `ASURA_SAVESEED=saves_complete\SAVEDATA.DAT` copies the user's completed save (extracted from the CON package `SAVEDATA.DAT` with tools\stfs.py; the copy in `saves\` had been rewritten by the game) over the installed one before the game reads it, so every test run starts the same. Use it for all test runs.
+- `replays\complete_ep1.txt`: the user's run through all of episode 1 from that save (10,445 states, 19 min). Timed by wall clock, so it drifts late in the episode. `ASURA_INPUTPLAYUNTIL=ms` stops a replay there and hands over; `ASURA_INPUTCAPTURE=ms,...` triggers F9 captures at replay times (with `ASURA_SHOTRINGNOIMG=1` only the draw list is saved, `ASURA_SHOTRINGAFTER=n` shortens the wait).
+- QTE prompts are UI draws (vs 4213EBD9) whose icon textures sit at fixed addresses in the UI package: B (01466000, 01496000, 014CA000, 014DA000, 014EE000), RT (01476000, 0147A000, 01482000, 014AE000, 014C2000), LT (014A6000, 014B6000), LS (01486000, 0148E000), RS (0148A000, 01492000), rotate arrows (01456000). Table kQteTex in xenos.cpp (address and content hash; LS and RS share a hash). The renderer publishes the prompt set each frame; `ASURA_AUTOQTE=1` makes xam.cpp add the answer: buttons tapped at 10 Hz (answers presses and mashing), triggers held, LS/RS pushed down, or circled counterclockwise with the rotate arrows. Checked (logs\aqte1): from 150 s of replay, the game ran through episode 1's QTE chain alone (LT+RT, LS+RS down, B, LS rotate, LS, two B mashes, RT) into the Augus cutscenes. Gameplay sections (shooting, fights) still need control. No A/X/Y prompts in episode 1, so those icons aren't in the table yet.
+
 Open: scene-cut hitches of 0.1 to 0.4 s (present before memexport, vary per run); ships sometimes dark and without detail in some runs only (timing, likely streaming); speckle on Asura at pilot7 frames 5119 to 5198; colour banding.
 
 ### Memexport: UE3 moves texture memory with the GPU (fixed 2026-11-10)

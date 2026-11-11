@@ -25,6 +25,7 @@ cache/
 *.log
 build_log*.txt
 saves_backup/
+saves_complete/
 SAVEDATA.DAT
 asura_logo*.png
 thirdparty/*

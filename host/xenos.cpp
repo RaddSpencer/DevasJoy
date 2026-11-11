@@ -129,6 +129,7 @@ static HWND g_hwnd = nullptr;
 static std::atomic<int> g_shotBurstLeft{0};
 static std::atomic<int> g_shotStep{1};
 static std::atomic<bool> g_ringDump{false};
+void capture_request() { g_ringDump = true; fprintf(stderr, "[capture] requested by the input replay\n"); }   // as if F9 were pressed (xam.cpp, ASURA_INPUTCAPTURE)
 bool bcr2_log_requested();   // main.cpp: true when --log was given, also before main() runs
 static const int g_shotRingSize = getenv("ASURA_SHOTRING") ? atoi(getenv("ASURA_SHOTRING")) : (bcr2_log_requested() ? 150 : 0);   // with --log, F9 saves 150 frames (every frame): 3.5 s before the press and 1.5 s after
 static uint64_t g_frame = 0;
@@ -1937,10 +1938,48 @@ static void splash_override(std::vector<uint8_t>& out) {
     for (size_t i = 0; i < (size_t)1024 * 256; i++) { out[i * 4] = c[i * 4]; out[i * 4 + 1] = c[i * 4 + 1]; out[i * 4 + 2] = c[i * 4 + 2]; out[i * 4 + 3] = a[i * 4]; }
 }
 // ASURA_TEXDUMPONLY=addr,addr,... (hex): ASURA_TEXDUMP and ASURA_TEXDUMPMIPS save only textures at these addresses
+// ---- QTE prompts (ASURA_AUTOQTE) ----
+// A QTE prompt is a handful of UI draws whose textures are fixed for each kind of prompt (the button icon, the crest, the ring). A texture
+// in the table below marks the prompt it belongs to while it is drawn; at each swap the frame's set is published, and xam.cpp adds the
+// answer to the pad state (qte_active). Hashes are the texture content hash as draws_<frame>.txt shows it (64-bit hash folded to 32).
+enum : uint32_t { QTE_A = 1, QTE_B = 2, QTE_X = 4, QTE_Y = 8, QTE_LT = 16, QTE_RT = 32, QTE_LS = 64, QTE_RS = 128, QTE_ROTATE = 256 };
+// LS/RS without the rotate arrows: push that stick down (episode 1's "push both sticks down"). With them: circle the stick.
+// The UI textures sit at fixed addresses; LS and RS also share a content hash (the hash samples one dword in eight), so both are matched.
+struct QteTex { uint32_t addr, hash, action; const char* name; };
+static const QteTex kQteTex[] = {                                           // from the episode 1 captures (logs\qrep3)
+    { 0x01496000, 0xD3B9EB89, QTE_B, "B" }, { 0x014CA000, 0x7358E170, QTE_B, "B" }, { 0x014DA000, 0xA0467C6B, QTE_B, "B" }, { 0x014EE000, 0xA799C1ED, QTE_B, "B" },
+    { 0x01466000, 0, QTE_B, "B" },
+    { 0x01476000, 0xCB16A818, QTE_RT, "RT" }, { 0x0147A000, 0x78A994A6, QTE_RT, "RT" }, { 0x01482000, 0xE158670C, QTE_RT, "RT" },
+    { 0x014AE000, 0x46BBB154, QTE_RT, "RT" }, { 0x014C2000, 0x74048470, QTE_RT, "RT" },
+    { 0x014A6000, 0x9DB98EDC, QTE_LT, "LT" }, { 0x014B6000, 0x1CF2227D, QTE_LT, "LT" },
+    { 0x01486000, 0x6957789E, QTE_LS, "LS" }, { 0x0148E000, 0x0EC6D4B7, QTE_LS, "LS" },
+    { 0x0148A000, 0x6957789E, QTE_RS, "RS" }, { 0x01492000, 0x0EC6D4B7, QTE_RS, "RS" },
+    { 0x01456000, 0x091CD8EE, QTE_ROTATE, "rotate" },
+};
+static std::atomic<uint32_t> g_qteActive{0};
+static uint32_t g_qteFrame = 0;
+static void qte_note_texture(uint32_t base, uint64_t hash) {
+    const uint32_t h = (uint32_t)(hash ^ (hash >> 32));
+    for (const QteTex& q : kQteTex) if (q.addr == base && (q.hash == 0 || q.hash == h)) g_qteFrame |= q.action;
+}
+static void qte_publish() {                                                 // at the swap
+    static uint32_t last = 0;
+    if (g_qteFrame != last) fprintf(stderr, "[qte] frame %llu: prompt mask %X -> %X\n", (unsigned long long)g_frame, last, g_qteFrame);
+    last = g_qteFrame;
+    g_qteActive = g_qteFrame;
+    g_qteFrame = 0;
+}
+uint32_t qte_active() { return g_qteActive.load(); }
 static bool texdump_wanted(uint32_t base) {
     static const char* only = getenv("ASURA_TEXDUMPONLY");
     if (!only) return true;
-    for (const char* p = only; *p;) { char* e; const uint32_t a = (uint32_t)strtoul(p, &e, 16); if (e == p) break; if (a == base) return true; p = (*e == ',') ? e + 1 : e; }
+    for (const char* p = only; *p;) {                                      // addresses, or ranges lo-hi
+        char* e; const uint32_t a = (uint32_t)strtoul(p, &e, 16); if (e == p) break;
+        uint32_t b = a;
+        if (*e == '-') { const char* q = e + 1; b = (uint32_t)strtoul(q, &e, 16); }
+        if (base >= a && base <= b) return true;
+        p = (*e == ',') ? e + 1 : e;
+    }
     return false;
 }
 static HostTex* get_texture(const FetchInfo& fi) {
@@ -2967,6 +3006,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         if (!ht) return;
         if (texflip_on()) { FlipVal fv; fv.base = base; fv.mip = fi.mipBase; fv.w = w; fv.h = h; fv.fmt = fmt; fv.data = ht->hash; texflip_note(u.slot, fv); }
         if (ringPs && g_shotRingSize > 0) draw_ring_tex(u.slot, base, ht->hash);
+        if (ringPs) qte_note_texture(base, ht->hash);
         {   // one line per distinct fetch while tracing, to check the mip chain and filter a draw really gets
             static std::set<uint64_t> seenFetch;
             if (g_trace > 1000 && seenFetch.insert(((uint64_t)base << 8) | u.slot).second)
@@ -3674,7 +3714,8 @@ static void shot_ring() {
         int saved = 0;
         const std::string dirS = capture_session_dir(g_frame); const char* dir = dirS.c_str();
         draw_ring_dump(dir);
-        for (int i = 0; i < kN; i++) { const int k = (next + i) % kN; if (frames[k] != ~0ull) { save_shot(tex[k].Get(), d, frames[k], dir); saved++; } }
+        static const bool kNoImg = getenv("ASURA_SHOTRINGNOIMG") != nullptr;   // only the draw list (many captures, little disk)
+        if (!kNoImg) for (int i = 0; i < kN; i++) { const int k = (next + i) % kN; if (frames[k] != ~0ull) { save_shot(tex[k].Get(), d, frames[k], dir); saved++; } }
         QueryPerformanceCounter(&b);
         fprintf(stderr, "[capture] frame %llu: saved the previous %d images in %.1f s\n", (unsigned long long)g_frame, saved, (double)(b.QuadPart - a.QuadPart) * g_perfTicksToMs / 1000.0);
         void input_clock_pause(uint64_t ms);
@@ -3901,6 +3942,7 @@ void physwatch_tick();                  // hooks.cpp (ASURA_PHYSWATCH)
 static void do_swap(uint32_t front) {
     funcprof_frame(g_frame);
     physwatch_tick();
+    qte_publish();
     LARGE_INTEGER swapStart; QueryPerformanceCounter(&swapStart);
     if (g_drawsLeftOut) {
         fprintf(stderr, "[shader] frame=%llu left out %llu draws waiting on a compile, waited %.1f ms\n", (unsigned long long)g_frame, (unsigned long long)g_drawsLeftOut, g_compileWaitMs);
