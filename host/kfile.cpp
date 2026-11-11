@@ -2,6 +2,8 @@
 // (saves, DLC) come from XamContentCreateEx; symbolic links from ObCreateSymbolicLink. Ported from the BCR2 host.
 #include "kernel.h"
 #include <windows.h>
+#include <shlwapi.h>
+#pragma comment(lib, "shlwapi.lib")
 #include <algorithm>
 #include <atomic>
 #include <map>
@@ -113,6 +115,7 @@ struct GuestFile {
     HANDLE h = INVALID_HANDLE_VALUE;
     std::string path;
     bool dir = false, writable = false;
+    bool titleMovie = false;                                                // a title / main menu background movie (TitleMenu_Bg*.bik)
     uint64_t pos = 0;
     std::vector<WIN32_FIND_DATAA> entries; size_t next = 0; bool listed = false;
     std::mutex m;
@@ -124,9 +127,13 @@ static std::shared_ptr<GuestFile> file_of(uint32_t h) {
     auto it = g_files.find(h);
     return it == g_files.end() ? nullptr : it->second;
 }
+// The title screen and main menu play TitleMenu_Bg*.bik behind them and keep it open while it plays: the Graphics Options menu (options.cpp) opens only then.
+static std::atomic<int> g_titleMovies{0};
+bool title_screen_active() { return g_titleMovies.load() > 0; }
 void file_close(uint32_t h) {
     std::shared_ptr<GuestFile> f;
     { std::lock_guard<std::mutex> g(g_filesLock); auto it = g_files.find(h); if (it == g_files.end()) return; f = it->second; g_files.erase(it); }
+    if (f->titleMovie) g_titleMovies--;
     if (f->h != INVALID_HANDLE_VALUE) CloseHandle(f->h);
 }
 static void set_iosb(uint32_t iosb, uint32_t status, uint32_t info) { if (iosb) { wr32(iosb, status); wr32(iosb + 4, info); } }
@@ -232,6 +239,7 @@ static void open_file(PPCContext& ctx, uint32_t outH, uint32_t access, uint32_t 
     if (disposition == 5 && existed && !isDir) SetEndOfFile(h);   // overwrite_if
     auto f = std::make_shared<GuestFile>();
     f->h = h; f->path = path; f->dir = isDir; f->writable = writable;
+    if (!isDir && StrStrIA(path.c_str(), "TitleMenu_Bg")) { f->titleMovie = true; g_titleMovies++; }
     uint32_t gh = handle_create(ob_create(0, 1, 0x10));
     { std::lock_guard<std::mutex> g(g_filesLock); g_files[gh] = f; }
     wr32(outH, gh);

@@ -123,6 +123,7 @@ void audio_out_submit(const uint8_t* frame) {
     if (hr == AUDCLNT_E_BUFFER_TOO_LARGE) return;       // a full device buffer only happens after a clock fallback; drop this frame
     if (FAILED(hr)) { device_lost("getting a device buffer", hr); return; }
     memcpy(dst, out, sizeof(out));
-    hr = g_render->ReleaseBuffer(kFrameSamples, 0);
+    static const bool kMute = getenv("ASURA_MUTE") != nullptr;          // silent, but the device still paces the game (unlike ASURA_NOSOUND): for test runs
+    hr = g_render->ReleaseBuffer(kFrameSamples, kMute ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
     if (FAILED(hr)) device_lost("releasing a device buffer", hr);
 }

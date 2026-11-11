@@ -165,6 +165,10 @@ static const int g_resScale = [] {
     if (bcr2_log_requested()) fprintf(stderr, "[display] render scale %dx (%dx%d)\n", s, 1280 * s, 720 * s);
     return s;
 }();
+int gpu_render_scale() { return g_resScale; }
+// Vsync (Graphics Options, asura.ini, or ASURA_VSYNC=1): present on the display's refresh instead of as soon as a frame is ready.
+static std::atomic<bool> g_vsync{ getenv("ASURA_VSYNC") && atoi(getenv("ASURA_VSYNC")) != 0 };
+void gpu_set_vsync(bool on) { g_vsync = on; fprintf(stderr, "[display] vsync %s\n", on ? "on" : "off"); }
 static bool g_devOk = false, g_noOverwriteSrv = false;
 static ComPtr<ID3D11Buffer> g_cbFloat, g_cbState, g_cbBlit, g_vbRing, g_ibRing;
 static ComPtr<ID3D11ShaderResourceView> g_vbSrv;
@@ -250,8 +254,10 @@ static DWORD WINAPI window_thread(LPVOID ev) {
         ow = (int)(ow * k); oh = (int)(oh * k);
     }
     RECT rc{ 0, 0, ow, oh }; AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-    g_hwnd = CreateWindowW(L"asurawin", L"Asura's Wrath (recomp)", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
+    static const bool kMinimized = getenv("ASURA_MINIMIZED") != nullptr;    // test runs: start minimized, without taking focus
+    g_hwnd = CreateWindowW(L"asurawin", L"Asura's Wrath (recomp)", WS_OVERLAPPEDWINDOW | (kMinimized ? 0 : WS_VISIBLE), CW_USEDEFAULT, CW_USEDEFAULT,
                            rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, wc.hInstance, nullptr);
+    if (kMinimized) ShowWindow(g_hwnd, SW_SHOWMINNOACTIVE);
     SetEvent((HANDLE)ev);
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
@@ -490,7 +496,7 @@ struct XShader {
 };
 
 // New shaders compile on worker threads, so a mesh seen for the first time costs a frame or two of that mesh, not a freeze of the whole game.
-struct CompileJob { XShader* sh; std::string src; bool isVs; };
+struct CompileJob { XShader* sh; std::string src; bool isVs; std::string fallback; };   // fallback: compiled if src is refused
 static std::mutex g_compileLock;
 static std::condition_variable g_compileWake;
 static std::deque<CompileJob> g_compileQueue;
@@ -512,11 +518,39 @@ static void compile_worker() {
             job = std::move(g_compileQueue.front()); g_compileQueue.pop_front();
         }
         auto blob = compile_cached(job.src, "main", job.isVs ? "vs_5_0" : "ps_5_0");
+        if (!blob && !job.fallback.empty()) {
+            fprintf(stderr, "[gfx] shader %016llX: using the level-0 sampling copy\n", (unsigned long long)job.sh->hash);
+            blob = compile_cached(job.fallback, "main", job.isVs ? "vs_5_0" : "ps_5_0");
+        }
         finish_shader(job.sh, blob.Get(), job.isVs);
         g_compilePending--;
     }
 }
-static void queue_compile(XShader* sh, std::string src, bool isVs) {
+// The same shader with every gradient sample (Sample, SampleBias) turned into SampleLevel(..., 0.0): what loop shaders always used before.
+static std::string to_level0(const std::string& src) {
+    std::string out; out.reserve(src.size() + 256);
+    size_t pos = 0;
+    for (;;) {
+        size_t a = src.find(".Sample(", pos), b = src.find(".SampleBias(", pos);
+        size_t at = std::min(a, b);
+        if (at == std::string::npos) { out.append(src, pos, std::string::npos); break; }
+        const size_t open = src.find('(', at);
+        out.append(src, pos, at - pos);
+        std::vector<std::string> args; std::string cur; int depth = 0; size_t i = open + 1;
+        for (; i < src.size(); i++) {
+            const char ch = src[i];
+            if (ch == '(') depth++;
+            else if (ch == ')') { if (depth == 0) break; depth--; }
+            else if (ch == ',' && depth == 0) { args.push_back(cur); cur.clear(); continue; }
+            cur += ch;
+        }
+        args.push_back(cur);
+        out += ".SampleLevel(" + args[0] + "," + args[1] + ",0.0)";
+        pos = i + 1;
+    }
+    return out;
+}
+static void queue_compile(XShader* sh, std::string src, bool isVs, std::string fallback = {}) {
     static std::once_flag once;
     std::call_once(once, [] {
         const unsigned n = std::max(1u, std::min(6u, std::thread::hardware_concurrency() / 3));
@@ -524,7 +558,7 @@ static void queue_compile(XShader* sh, std::string src, bool isVs) {
         fprintf(stderr, "[gfx] %u background shader compile threads\n", n);
     });
     g_compilePending++;
-    { std::lock_guard<std::mutex> lk(g_compileLock); g_compileQueue.push_back({ sh, std::move(src), isVs }); }
+    { std::lock_guard<std::mutex> lk(g_compileLock); g_compileQueue.push_back({ sh, std::move(src), isVs, std::move(fallback) }); }
     g_compileWake.notify_one();
 }
 // Whether a draw can go ahead. Full-screen passes wait, since leaving one out would flash the whole screen. So does everything during a large batch, as
@@ -572,6 +606,20 @@ Texture2D T2[16] : register(t0);
 TextureCube TC[16] : register(t16);
 SamplerState SS[16] : register(s0);
 ByteAddressBuffer VB : register(t64);
+// Xenos multiplies as Direct3D 9 did: 0 times anything (infinity, NaN) is 0, in MUL, MAD, the dot products and the scalar multiplies (as Xenia).
+// Plain IEEE products turned 1/sqrt(0) and log2(0) into NaN where the console gets 0: specks on bumpy, lit metal.
+// Bilinear filtering on a fetch's own grid (size 1/inv texels) in a render-scale surface: the four nearest texel centres, blended with the
+// console's weights. uv is in surface space (fetch space times sc); yoff moves to a slice of a stacked fetch.
+float4 gridlerp(Texture2D t, SamplerState s, float2 uv, float2 sc, float2 inv, float yoff) {
+  float2 sz = 1.0 / inv, p = uv / sc * sz - 0.5, i0 = floor(p), f = p - i0;
+  float2 a = clamp(i0, 0.0, sz - 1.0), b = clamp(i0 + 1.0, 0.0, sz - 1.0);
+  float2 ua = (a + 0.5) * inv * sc, ub = (b + 0.5) * inv * sc;
+  float4 c00 = t.SampleLevel(s, float2(ua.x, ua.y + yoff), 0), c10 = t.SampleLevel(s, float2(ub.x, ua.y + yoff), 0);
+  float4 c01 = t.SampleLevel(s, float2(ua.x, ub.y + yoff), 0), c11 = t.SampleLevel(s, float2(ub.x, ub.y + yoff), 0);
+  return lerp(lerp(c00, c10, f.x), lerp(c01, c11, f.x), f.y);
+}
+float4 m0(float4 a, float4 b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
+float m0(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
 float4 texfix(float4 t, int n) {
   uint4 g = tfsg[n];
   float4 b = t * 2.0 - 1.0;
@@ -748,9 +796,11 @@ struct Translator {
         bool vSide = (vop >= 20 && vop <= 27) || vop == 29;
         if (vRes || vSide) {
             B += " float4 s1=" + src_vec(d, 1) + ", s2=" + src_vec(d, 2) + ", s3=" + src_vec(d, 3) + ", v=0;\n";
+            static const bool kIeeeMul = getenv("ASURA_IEEEMUL") != nullptr;  // the old plain products, to compare
+            const bool z = !kIeeeMul;
             switch (vop) {
               case 0: B += " v=s1+s2;\n"; break;
-              case 1: B += " v=s1*s2;\n"; break;
+              case 1: B += z ? " v=m0(s1,s2);\n" : " v=s1*s2;\n"; break;
               case 2:   // max of a value with itself is the console's mov; memexport copies raw bits that float max would change (denormals)
                 B += (exact && src_vec(d, 1) == src_vec(d, 2)) ? " v=s1;\n" : " v=max(s1,s2);\n"; break;
               case 3: B += " v=min(s1,s2);\n"; break;
@@ -761,13 +811,13 @@ struct Translator {
               case 8: B += " v=frac(s1);\n"; break;
               case 9: B += " v=trunc(s1);\n"; break;
               case 10: B += " v=floor(s1);\n"; break;
-              case 11: B += " v=s1*s2+s3;\n"; break;
+              case 11: B += z ? " v=m0(s1,s2)+s3;\n" : " v=s1*s2+s3;\n"; break;
               case 12: B += " v=(s1==0.0)?s2:s3;\n"; break;
               case 13: B += " v=(s1>=0.0)?s2:s3;\n"; break;
               case 14: B += " v=(s1>0.0)?s2:s3;\n"; break;
-              case 15: B += " v=dot(s1,s2).xxxx;\n"; break;
-              case 16: B += " v=dot(s1.xyz,s2.xyz).xxxx;\n"; break;
-              case 17: B += " v=(dot(s1.xy,s2.xy)+s3.x).xxxx;\n"; break;
+              case 15: B += z ? " { float4 q=m0(s1,s2); v=(q.x+q.y+q.z+q.w).xxxx; }\n" : " v=dot(s1,s2).xxxx;\n"; break;
+              case 16: B += z ? " { float4 q=m0(s1,s2); v=(q.x+q.y+q.z).xxxx; }\n" : " v=dot(s1.xyz,s2.xyz).xxxx;\n"; break;
+              case 17: B += z ? " { float4 q=m0(s1,s2); v=(q.x+q.y+s3.x).xxxx; }\n" : " v=(dot(s1.xy,s2.xy)+s3.x).xxxx;\n"; break;
               case 18:
                 B += " { float3 dd=float3(s1.z,s1.w,s1.x); float3 aa=abs(dd); float tc,sc,ma,fc;\n"
                      "   if(aa.z>=aa.x&&aa.z>=aa.y){tc=-dd.y;sc=dd.z<0?-dd.x:dd.x;ma=2*dd.z;fc=dd.z<0?5:4;}\n"
@@ -819,8 +869,8 @@ struct Translator {
             switch (sop) {
               case 0: case 44: case 45: B += " sr=a+b;\n"; break;
               case 1: B += " sr=a+ps;\n"; break;
-              case 2: case 42: case 43: B += " sr=a*b;\n"; break;
-              case 3: B += " sr=a*ps;\n"; break;
+              case 2: case 42: case 43: B += getenv("ASURA_IEEEMUL") ? " sr=a*b;\n" : " sr=m0(a,b);\n"; break;
+              case 3: B += getenv("ASURA_IEEEMUL") ? " sr=a*ps;\n" : " sr=m0(a,ps);\n"; break;
               case 4: B += S(" sr=(ps==-%s||isinf(ps)||isnan(ps)||isnan(b)||b<=0.0)?-%s:a*ps;\n", FM, FM); break;
               case 5: B += (exact && ca == cb) ? " sr=a;\n" : " sr=max(a,b);\n"; break;
               case 6: B += " sr=min(a,b);\n"; break;
@@ -985,6 +1035,31 @@ struct Translator {
             }
             B += "}\n"; return;
         }
+        if (op == 19 && slot < 16) {                                        // getWeights: the bilinear weights a fetch here would use
+            // The fractional texel position, frac(coord * size - 0.5), per axis, on the fetch's own grid (tfi = 1 / guest size; the texture is
+            // bound so tfi is set). UE3's shadow filtering blends its point-sampled taps with these; without them the weights were whatever the
+            // registers held, and shadows on lit surfaces came out as per-pixel speckle (the bronze figure and ship in episode 1).
+            TexUse u{ slot, dim };
+            if (texs.find(slot) == texs.end()) texs[slot] = u;
+            const bool denorm = bits(d0, 25, 1);
+            const float ox = sext(bits(d2, 16, 5), 5) * 0.5f, oy = sext(bits(d2, 21, 5), 5) * 0.5f, oz = sext(bits(d2, 26, 5), 5) * 0.5f;
+            const std::string uvw = sreg + S(".%c%c%c", comp(srcSw & 3), comp((srcSw >> 2) & 3), comp((srcSw >> 4) & 3));
+            if (dim == 3) B += " float4 t=0;\n";                                // cube: not seen yet
+            else {
+                B += " float3 uw=" + uvw + ";\n";
+                B += denorm ? " float2 tc=uw.xy;\n" : S(" float2 tc=uw.xy/tfi[%u].xy;\n", slot);
+                B += S(" tc+=float2(%g,%g);\n", ox, oy);
+                B += S(" float4 t=float4(frac(tc-0.5),%s,0.0);\n", dim == 2 ? S("frac(uw.z*max(tfp[%u].w,1.0)-0.5+%g)", slot, oz).c_str() : "0.0");
+                if (dim == 0) B += " t.y=0.0;\n";
+            }
+            for (int i = 0; i < 4; i++) {
+                uint32_t s = (dsw >> (3 * i)) & 7;
+                if (s == 7) continue;
+                std::string val = s < 4 ? S("t.%c", comp(s)) : (s == 5 ? "1.0" : "0.0");
+                B += " " + R(dst) + S(".%c=", comp(i)) + val + ";\n";
+            }
+            B += "}\n"; return;
+        }
         if (op != 1 && op != 17) {
             logf_once(S("fop%u", op).c_str(), "unhandled fetch opcode %u", op);
             B += "}\n"; return;
@@ -1003,7 +1078,10 @@ struct Translator {
         std::string uvw = sreg + S(".%c%c%c", comp(srcSw & 3), comp((srcSw >> 2) & 3), comp((srcSw >> 4) & 3));
         std::string lod = useRegLod ? "lodReg" : "0.0";
         std::string smp;
-        bool explicitLod = isVs || hasLoop || useRegLod;
+        // Pixel shaders with loops used to sample level 0 everywhere (HLSL refuses gradients in some loops): fine detail on distant metal and clouds
+        // then sparkled. Now they sample normally, and build_shader keeps a level-0 copy (to_level0) in case the compiler refuses.
+        static const bool kLoopLod0 = getenv("ASURA_LOOPLOD0") != nullptr;
+        bool explicitLod = isVs || (hasLoop && kLoopLod0) || useRegLod;
         if (dim == 3) {
             B += " float3 uv=cubedir(" + uvw + ");\n";
             smp = explicitLod ? S("TC[%u].SampleLevel(SS[%u],uv,%s)", slot, slot, lod.c_str()) : S("TC[%u].Sample(SS[%u],uv)", slot, slot);
@@ -1024,9 +1102,14 @@ struct Translator {
                 // tfi.z = slice stride in surface v): the two nearest slices, blended, with v kept inside the slice.
                 B += S(" float ld=max(tfp[%u].w,1.0), lz=clamp(uw.z*ld-0.5,0.0,ld-1.0), l0=floor(lz), lf=lz-l0, l1=min(l0+1.0,ld-1.0);\n", slot);
                 B += S(" uv.y=clamp(uv.y,0.5*tfscale(%u).y*tfi[%u].y,tfscale(%u).y*(1.0-0.5*tfi[%u].y));\n", slot, slot, slot, slot);
-                // Hardware filtering on the stored (render-scale) surface. Tried 2026-11-10: blending on the game's own 16x16 grid instead, as the
-                // console's filter would; compared side by side on one frame, this one banded much less.
-                smp = "lerp(" + one(S("uv+float2(0,l0*tfi[%u].z)", slot)) + "," + one(S("uv+float2(0,l1*tfi[%u].z)", slot)) + ",lf)";
+                // Bilinear on the game's own grid (gridlerp), as the console filters: the surface is stored at render scale, so each grid cell is a
+                // scale x scale block of equal texels and hardware filtering only blended across the one-texel seam between blocks. The colour
+                // table then graded in steps, more so the higher the scale. (Tried once on 2026-11-10 at 2x and judged worse, while the first row
+                // of every slice still read the padding.) ASURA_LUTHW=1: the hardware filter, as before.
+                static const bool kLutHw = getenv("ASURA_LUTHW") != nullptr;
+                if (kLutHw) smp = "lerp(" + one(S("uv+float2(0,l0*tfi[%u].z)", slot)) + "," + one(S("uv+float2(0,l1*tfi[%u].z)", slot)) + ",lf)";
+                else smp = S("lerp(gridlerp(T2[%u],SS[%u],uv,tfscale(%u),tfi[%u].xy,l0*tfi[%u].z),gridlerp(T2[%u],SS[%u],uv,tfscale(%u),tfi[%u].xy,l1*tfi[%u].z),lf)",
+                             slot, slot, slot, slot, slot, slot, slot, slot, slot, slot);
             } else smp = one("uv");
         }
         if (op == 17) {                                                     // getCompTexLOD
@@ -1139,8 +1222,8 @@ struct Translator {
 
     std::string decls() {
         std::string d;
-        if (useArray) d += " float4 r[64]; for(int ri=0;ri<64;ri++) r[ri]=0;\n";
-        else for (int n : usedRegs) d += S(" float4 r%d=0;\n", n);
+        if (useArray) d += (isVs && !getenv("ASURA_VSIMPRECISE")) ? " precise float4 r[64]; for(int ri=0;ri<64;ri++) r[ri]=0;\n" : " float4 r[64]; for(int ri=0;ri<64;ri++) r[ri]=0;\n";
+        else for (int n : usedRegs) d += S(isVs && !getenv("ASURA_VSIMPRECISE") ? " precise float4 r%d=0;\n" : " float4 r%d=0;\n", n);
         d += " bool p=false; int a0=0; int aL=0; float ps=0.0; float lodReg=0.0; int pc=0;\n";
         if (isVs && memexport) d += " float4 eA=0; float4 eM[5]; for(int ei=0;ei<5;ei++) eM[ei]=0; uint emw=0;\n";
         return d;
@@ -1219,6 +1302,18 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
     }
     std::string src = std::string(kCommon) + uv_helper() + kVOut;
     if (T.memexport) src += kMemExport;
+    if (isVs && !getenv("ASURA_VSIMPRECISE")) {
+        // Every vertex shader temporary is precise: a depth pre-pass and the colour pass after it run the same microcode in different shaders, and
+        // compiler or driver freedom (fusing a multiply-add in one, not the other) moved depth by a bit, so a GEQUAL/EQUAL test failed on scattered
+        // pixels and the background showed through (speckled bronze armour in episode 1).
+        auto prec = [](std::string& s) {
+            for (const char* t : { " float4 ", " float " }) {
+                const std::string from = t, to = std::string(" precise") + t;
+                for (size_t p = s.find(from); p != std::string::npos; p = s.find(from, p + to.size())) s.replace(p, from.size(), to);
+            }
+        };
+        prec(T.body);
+    }
     if (isVs) {
         // VTE: optionally divide-undo, then map guest screen space onto the full host render target
         src += "VOut main(uint vid : SV_VertexID) {\n float4 oI[16]; for(int i=0;i<16;i++) oI[i]=0; float4 oPos=float4(0,0,0,1), oPts=0;\n";
@@ -1247,7 +1342,9 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
         src += d;
         // vpW.z set (small targets above render scale 1): interpolators are moved from the host pixel's centre to the guest pixel's,
         // along their screen derivatives, so lookup-table passes compute the values the game laid out per guest pixel.
-        src += S(" float2 gd=(floor(In.pos.xy/%d.0)+0.5)*%d.0-In.pos.xy; if(vpW.z==0.0) gd=0;\n", g_resScale, g_resScale);
+        // A hair past the centre (+0.02 guest pixel): the colour table's shader picks slice and row from these values, and at the exact centre the
+        // first row of each slice sat on the boundary with the slice before. Which side won depended on the render scale (fine at 2, green at 3).
+        src += S(" float2 gd=(floor(In.pos.xy/%d.0)+0.52)*%d.0-In.pos.xy; if(vpW.z==0.0) gd=0;\n", g_resScale, g_resScale);
         for (int i = 0; i < 16; i++) {
             if (T.useArray) src += S(" r[%d]=In.o[%d]+ddx_fine(In.o[%d])*gd.x+ddy_fine(In.o[%d])*gd.y;\n", i, i, i, i);
             else if (T.usedRegs.count(i)) src += S(" r%d=In.o[%d]+ddx_fine(In.o[%d])*gd.x+ddy_fine(In.o[%d])*gd.y;\n", i, i, i, i);
@@ -1258,6 +1355,28 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
             std::string pos = S("(vpW.z!=0.0?floor(In.pos.xy/%d.0)+0.5:In.pos.xy/%d.0)", g_resScale, g_resScale);
             if (T.useArray) src += S(" r[%u]=float4(%s,0,0);\n", paramGen, pos.c_str());
             else if (T.usedRegs.count(paramGen)) src += S(" r%u=float4(%s,0,0);\n", paramGen, pos.c_str());
+        }
+        // ASURA_DBGPSAT="<ps hash>@<marker>#<k>:<hlsl float4 expr>": stop that pixel shader right after the k-th line of its body containing
+        // <marker> and output <expr>, to look at a value the shader overwrites before its end (DBGPS only sees the end).
+        if (const char* at = getenv("ASURA_DBGPSAT")) {
+            const std::string spec = at, hs = S("%016llX@", (unsigned long long)h);
+            if (spec.rfind(hs, 0) == 0) {
+                const size_t hashEnd = hs.size(), colon = spec.find(':', hashEnd), sharp = spec.rfind('#', colon);
+                if (colon != std::string::npos && sharp != std::string::npos && sharp > hashEnd) {
+                    const std::string marker = spec.substr(hashEnd, sharp - hashEnd), expr = spec.substr(colon + 1);
+                    const int k = atoi(spec.c_str() + sharp + 1);
+                    int seen = 0; size_t pos = 0;
+                    while ((pos = T.body.find(marker, pos)) != std::string::npos) {
+                        const size_t eol = T.body.find('\n', pos);
+                        if (++seen == k && eol != std::string::npos) {
+                            T.body.insert(eol + 1, " { POut dbg; dbg.c0=" + expr + "; dbg.c1=0; dbg.c2=0; dbg.c3=0; return dbg; }\n");
+                            fprintf(stderr, "[gfx] debug probe on ps %s after '%s' #%d\n", hs.c_str(), marker.c_str(), k);
+                            break;
+                        }
+                        pos = eol == std::string::npos ? T.body.size() : eol;
+                    }
+                }
+            }
         }
         src += T.body;
         src += " uint af=(uint)alpha.x; if(af!=7){ float aa=oC[0].a, rf=alpha.y; bool atok=true;\n"
@@ -1278,6 +1397,17 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
             std::string ds = dbg, hs = S("%016llX:", (unsigned long long)h);
             if (ds.rfind(hs, 0) == 0) { src += " oC[0]=" + ds.substr(hs.size()) + ";\n"; fprintf(stderr, "[gfx] debug override on ps %s\n", hs.c_str()); }
         }
+        if (const char* tint = getenv("ASURA_TINTPS")) {                     // "hash,hash,...": paint each listed pixel shader a flat colour (red, green, blue, yellow, magenta, cyan, white, orange)
+            static const char* kTint[8] = { "4,0,0", "0,4,0", "0,0,4", "4,4,0", "4,0,4", "0,4,4", "4,4,4", "4,1.5,0" };
+            const std::string hs = S("%016llX", (unsigned long long)h);
+            int idx = 0;
+            for (const char* p = tint; *p; idx++) {
+                const char* e = strchr(p, ','); const size_t n = e ? (size_t)(e - p) : strlen(p);
+                if (n == hs.size() && _strnicmp(p, hs.c_str(), n) == 0) { src += S(" oC[0]=float4(%s,1);\n", kTint[idx & 7]); fprintf(stderr, "[gfx] tint %d on ps %s\n", idx, hs.c_str()); break; }
+                if (!e) break;
+                p = e + 1;
+            }
+        }
         src += " POut o; o.c0=oC[0]; o.c1=oC[1]; o.c2=oC[2]; o.c3=oC[3];";
         if (T.writesDepth) src += " o.d=oDepth;";
         src += " return o; }\n";
@@ -1295,10 +1425,15 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
     total++;
     if (total <= 3 || (total % 50) == 0) fprintf(stderr, "[gfx] shaders translated=%d (last %s %u dwords, %zu tex, %zu vf)\n", total, isVs ? "vs" : "ps", T.words, sh->tex.size(), sh->vf.size());
     static const bool kSync = getenv("ASURA_SYNCSHADERS") != nullptr;         // compile on this thread, as before
+    std::string fallback = (!isVs && T.hasLoop) ? to_level0(src) : std::string();
+    if (fallback == src) fallback.clear();
     auto blob = load_cached(src, isVs ? "vs_5_0" : "ps_5_0");                // already compiled once: cheap enough to do right here
-    if (!blob && kSync) blob = compile_cached(src, "main", isVs ? "vs_5_0" : "ps_5_0");
+    if (!blob && kSync) {
+        blob = compile_cached(src, "main", isVs ? "vs_5_0" : "ps_5_0");
+        if (!blob && !fallback.empty()) blob = compile_cached(fallback, "main", "ps_5_0");
+    }
     if (blob || kSync) finish_shader(sh, blob.Get(), isVs);
-    else queue_compile(sh, std::move(src), isVs);
+    else queue_compile(sh, std::move(src), isVs, std::move(fallback));
     return sh;
 }
 
@@ -1563,7 +1698,13 @@ static DXGI_FORMAT rt_dxgi(uint32_t f) {
     return DXGI_FORMAT_R8G8B8A8_UNORM;
 }
 // Host targets are as tall as the pitch could reach inside 10 MB of EDRAM at 32 bpp, since the height is never stated.
-static void rt_size(uint32_t pitch, uint32_t& w, uint32_t& h) { w = std::max(pitch, 16u); h = std::clamp(align_up(2621440u / w, 8), 720u, 8192u); }
+// Also no taller than a host texture can be (16384 rows) at the render scale: the viewport is the target's full size, and at scale 4 a narrow target
+// (the colour table's, pitch 80, 8192 rows) asked for a 32768-row viewport, past D3D11's limit, and its draws came out wrong (the picture turned green).
+static void rt_size(uint32_t pitch, uint32_t& w, uint32_t& h) {
+    w = std::max(pitch, 16u);
+    h = std::clamp(align_up(2621440u / w, 8), 720u, 8192u);
+    h = std::min(h, 16384u / (uint32_t)g_resScale);
+}
 
 static Rt* get_color_rt(uint32_t base, uint32_t fmt, uint32_t pitch) {
     uint64_t key = ((uint64_t)base << 32) | ((uint64_t)fmt << 16) | (pitch & 0xFFFF);
@@ -1584,21 +1725,25 @@ static Rt* get_depth_rt(uint32_t base, uint32_t pitch) {
     uint64_t key = ((uint64_t)base << 32) | (0xFFFFull << 16) | (pitch & 0xFFFF);
     auto it = g_rts.find(key);
     if (it != g_rts.end()) return it->second;
-    Rt* r = new Rt(); rt_size(pitch, r->w, r->h); r->fmt = DXGI_FORMAT_R24G8_TYPELESS;
+    // ASURA_DEPTH32=1 (experiment): 32-bit float depth instead of 24-bit unorm. The scene's depth is the console's 24-bit float (D24FS8), and with
+    // reversed depth distant geometry sits near 0, where unorm keeps far less precision than the console.
+    static const bool k32 = getenv("ASURA_DEPTH32") != nullptr;
+    Rt* r = new Rt(); rt_size(pitch, r->w, r->h); r->fmt = k32 ? DXGI_FORMAT_R32G8X24_TYPELESS : DXGI_FORMAT_R24G8_TYPELESS;
     D3D11_TEXTURE2D_DESC d{}; d.Width = r->w * g_resScale; d.Height = std::min(r->h * g_resScale, 16384u); d.MipLevels = 1; d.ArraySize = 1; d.Format = r->fmt; d.SampleDesc.Count = 1;
     d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
     g_dev->CreateTexture2D(&d, nullptr, &r->tex);
-    D3D11_DEPTH_STENCIL_VIEW_DESC dv{}; dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    D3D11_DEPTH_STENCIL_VIEW_DESC dv{}; dv.Format = k32 ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D24_UNORM_S8_UINT; dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
     g_dev->CreateDepthStencilView(r->tex.Get(), &dv, &r->dsv);
-    D3D11_SHADER_RESOURCE_VIEW_DESC sv{}; sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv{}; sv.Format = k32 ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : DXGI_FORMAT_R24_UNORM_X8_TYPELESS; sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
     g_dev->CreateShaderResourceView(r->tex.Get(), &sv, &r->srv);
-    sv.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+    sv.Format = k32 ? DXGI_FORMAT_X32_TYPELESS_G8X24_UINT : DXGI_FORMAT_X24_TYPELESS_G8_UINT;
     g_dev->CreateShaderResourceView(r->tex.Get(), &sv, &r->stencilSrv);
     g_ctx->ClearDepthStencilView(r->dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
     fprintf(stderr, "[gfx] depth target base=%X pitch=%u -> %ux%u\n", base, pitch, r->w, r->h);
     return g_rts[key] = r;
 }
 
+static void dump_surfaces(uint32_t only = 0, int seq = -1);
 // ---- resolved surfaces, keyed by guest address ----
 struct Surface {
     uint32_t base = 0, end = 0, w = 0, h = 0, pitch = 0;
@@ -1733,8 +1878,30 @@ static void unpack_rgba8(int conv, const uint8_t* s, uint8_t* d) {
 
 struct HostTex {
     ComPtr<ID3D11Texture2D> tex; ComPtr<ID3D11ShaderResourceView> srv;
+    ComPtr<ID3D11ShaderResourceView> srvSigned;                             // the same texels read as signed (SNORM), made on first use
+    DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN; uint32_t faces = 1;
     uint64_t hash = 0, lastFrame = ~0ull, mxEpoch = 0; uint32_t hostW = 0, hostH = 0, levels = 0;
 };
+// Signed textures (normal maps above all) were read as unsigned and turned signed in texfix after filtering. Byte 7F (+1) and 80 (-1) are neighbours
+// in unsigned order, so filtering across zero gave values near -1: bumpy metal and clouds sparkled at a distance. Formats with an SNORM twin are
+// created typeless, and a fetch that reads every channel as signed gets the SNORM view: the GPU filters signed values. ASURA_NOSNORM=1 for the old way.
+static DXGI_FORMAT snorm_twin(DXGI_FORMAT f, DXGI_FORMAT* typeless, int* channels) {
+    switch (f) {
+      case DXGI_FORMAT_R8_UNORM:       *typeless = DXGI_FORMAT_R8_TYPELESS;       *channels = 1; return DXGI_FORMAT_R8_SNORM;
+      case DXGI_FORMAT_R8G8_UNORM:     *typeless = DXGI_FORMAT_R8G8_TYPELESS;     *channels = 2; return DXGI_FORMAT_R8G8_SNORM;
+      case DXGI_FORMAT_R8G8B8A8_UNORM: *typeless = DXGI_FORMAT_R8G8B8A8_TYPELESS; *channels = 4; return DXGI_FORMAT_R8G8B8A8_SNORM;
+      case DXGI_FORMAT_BC4_UNORM:      *typeless = DXGI_FORMAT_BC4_TYPELESS;      *channels = 1; return DXGI_FORMAT_BC4_SNORM;
+      case DXGI_FORMAT_BC5_UNORM:      *typeless = DXGI_FORMAT_BC5_TYPELESS;      *channels = 2; return DXGI_FORMAT_BC5_SNORM;
+      default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+static ComPtr<ID3D11ShaderResourceView> make_srv(ID3D11Texture2D* tex, DXGI_FORMAT f, uint32_t faces) {
+    D3D11_SHADER_RESOURCE_VIEW_DESC v{}; v.Format = f;
+    if (faces == 6) { v.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE; v.TextureCube.MipLevels = (UINT)-1; }
+    else { v.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; v.Texture2D.MipLevels = (UINT)-1; }
+    ComPtr<ID3D11ShaderResourceView> s; g_dev->CreateShaderResourceView(tex, &v, &s);
+    return s;
+}
 static std::unordered_map<uint64_t, HostTex*> g_texCache;
 
 static uint64_t range_hash(uint32_t addr, uint32_t size) {
@@ -2115,13 +2282,17 @@ static HostTex* get_texture(const FetchInfo& fi) {
     const uint32_t levels = maxLevel + 1;
     bool same = ht->tex && ht->hostW == hw && ht->hostH == hh && ht->levels == levels;
     if (!same) {
-        ht->tex.Reset(); ht->srv.Reset();
-        D3D11_TEXTURE2D_DESC d{}; d.Width = hw; d.Height = hh; d.MipLevels = levels; d.ArraySize = fi.faces; d.Format = tf.dxgi; d.SampleDesc.Count = 1;
+        ht->tex.Reset(); ht->srv.Reset(); ht->srvSigned.Reset();
+        static const bool kNoSnorm = getenv("ASURA_NOSNORM") != nullptr;
+        DXGI_FORMAT typeless = DXGI_FORMAT_UNKNOWN; int ch = 0;
+        const bool twin = !kNoSnorm && !tf.conv && snorm_twin(tf.dxgi, &typeless, &ch) != DXGI_FORMAT_UNKNOWN;
+        D3D11_TEXTURE2D_DESC d{}; d.Width = hw; d.Height = hh; d.MipLevels = levels; d.ArraySize = fi.faces; d.Format = twin ? typeless : tf.dxgi; d.SampleDesc.Count = 1;
         d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         if (fi.faces == 6) d.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
         HRESULT hr = g_dev->CreateTexture2D(&d, nullptr, &ht->tex);
         if (FAILED(hr)) { logf_once(S("texc%u", fi.fmt).c_str(), "texture creation failed fmt=%u %ux%u hr=%08lX", fi.fmt, hw, hh, hr); return nullptr; }
-        g_dev->CreateShaderResourceView(ht->tex.Get(), nullptr, &ht->srv);
+        ht->srv = make_srv(ht->tex.Get(), tf.dxgi, fi.faces);
+        ht->view = twin ? tf.dxgi : DXGI_FORMAT_UNKNOWN; ht->faces = fi.faces;
         ht->hostW = hw; ht->hostH = hh; ht->levels = levels;
     }
     for (uint32_t f = 0; f < fi.faces; f++)
@@ -2591,6 +2762,8 @@ static void sync_color_alias(Rt* r, uint32_t base, uint32_t fmt, uint32_t pitch)
 // constant dword (D24 << 8 | S8) over that part of EDRAM, which also clears any colour target sharing the base. Host targets are
 // separate per pitch and format, so apply it to all of them directly. Returns false to fall back to an ordinary draw.
 // withColor is the mode=4 form: the same rectangle also writes a colour taken from its vertices, to the bound colour targets.
+static bool is_10bit_family(uint32_t f) { return f == 2 || f == 3 || f == 10 || f == 12; }
+static bool is_7e3_float(uint32_t f) { return f == 3 || f == 12; }
 static bool fast_clear(bool withColor) {
     const uint32_t* vf = &g_regs[R_FETCH];
     if ((vf[0] & 3) != 3) return false;
@@ -2615,10 +2788,25 @@ static bool fast_clear(bool withColor) {
     Rt* depth = get_depth_rt(base, hostPitch);
     g_ctx->ClearDepthStencilView(depth->dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, z, (UINT8)stencil);
     depth->seq = ++g_rtSeq;
-    for (uint32_t f : { 0u, 1u }) {
-        uint64_t key = ((uint64_t)base << 32) | ((uint64_t)f << 16) | (hostPitch & 0xFFFF);
-        auto it = g_rts.find(key);
-        if (it != g_rts.end()) { g_ctx->ClearRenderTargetView(it->second->rtv.Get(), col); it->second->seq = g_rtSeq - 1; }
+    // Every colour target at this base and pitch shares those EDRAM bits, whatever its format. UE3 clears its 7e3 scene target
+    // (format 3) this way each frame; clearing only the 8-bit views left the scene uncleared wherever no geometry drew (the
+    // window behind the emperor in episode 1 kept the previous shot and smeared). ASURA_FASTCLEAR8 restores the 8-bit-only clear.
+    static const bool kOnly8 = getenv("ASURA_FASTCLEAR8") != nullptr;
+    auto from7e3 = [](uint32_t v) { const uint32_t m = v & 0x7F, e = v >> 7; return e == 0 ? m / 512.0f : (1.0f + m / 128.0f) * exp2f((float)e - 3.0f); };
+    for (auto& kv : g_rts) {
+        if ((uint32_t)(kv.first >> 32) != base || (kv.first & 0xFFFF) != (hostPitch & 0xFFFF)) continue;
+        const uint32_t f = (uint32_t)(kv.first >> 16) & 0xFFFF;
+        float c[4];
+        if (f == 0 || f == 1) memcpy(c, col, sizeof c);
+        else if (kOnly8) continue;
+        else if (word == 0) c[0] = c[1] = c[2] = c[3] = 0.0f;
+        else if (is_10bit_family(f)) {
+            const uint32_t ch[3] = { word & 0x3FF, (word >> 10) & 0x3FF, (word >> 20) & 0x3FF };
+            for (int i = 0; i < 3; i++) c[i] = is_7e3_float(f) ? from7e3(ch[i]) : ch[i] / 1023.0f;
+            c[3] = (word >> 30) / 3.0f;
+        } else continue;                                                    // 64-bit and other formats: only a zero word is known to be safe
+        g_ctx->ClearRenderTargetView(kv.second->rtv.Get(), c);
+        kv.second->seq = g_rtSeq - 1;
     }
     if (withColor) {
         float vc[4];
@@ -2668,11 +2856,26 @@ static XShader* cur_ps(uint32_t paramGen) {
 }
 // ASURA_DRAWPROF=1: time per phase of issue_draw, summed per frame and logged every 300 frames as [drawprof] (ms per frame).
 static const bool kDrawProf = getenv("ASURA_DRAWPROF") != nullptr;
-static double g_dp[10] = {};
+static double g_dp[10] = {}, g_dpFrame[10] = {};                            // g_dpFrame: this frame only, for a [hitch] line
 static LARGE_INTEGER g_dpLast;
 static const char* const kDpNames[10] = { "setup", "shaders", "targets", "indices", "vertices", "textures", "constants", "state", "-", "call+tail" };
-#define DP(k) do { if (kDrawProf) { LARGE_INTEGER n_; QueryPerformanceCounter(&n_); g_dp[k] += (double)(n_.QuadPart - g_dpLast.QuadPart) * g_perfTicksToMs; g_dpLast = n_; } } while (0)
+#define DP(k) do { if (kDrawProf) { LARGE_INTEGER n_; QueryPerformanceCounter(&n_); const double d_ = (double)(n_.QuadPart - g_dpLast.QuadPart) * g_perfTicksToMs; g_dp[k] += d_; g_dpFrame[k] += d_; g_dpLast = n_; } } while (0)
 struct DpScope { DpScope() { if (kDrawProf) QueryPerformanceCounter(&g_dpLast); } ~DpScope() { DP(9); } };
+// [vram] with each [perf]: the driver's video memory use against its budget, and how many host textures the cache holds
+static void vram_report() {
+    static ComPtr<IDXGIAdapter3> adapter; static bool tried = false;
+    if (!tried) {
+        tried = true;
+        ComPtr<IDXGIDevice> d; ComPtr<IDXGIAdapter> a;
+        if (SUCCEEDED(g_dev.As(&d)) && SUCCEEDED(d->GetAdapter(&a))) a.As(&adapter);
+    }
+    size_t n = 0; uint64_t texels = 0;
+    for (auto& kv : g_texCache) if (kv.second->tex) { n++; texels += (uint64_t)kv.second->hostW * kv.second->hostH; }
+    DXGI_QUERY_VIDEO_MEMORY_INFO i{};
+    if (!adapter || FAILED(adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &i))) i = {};
+    fprintf(stderr, "[vram] frame=%llu usage=%lluMB budget=%lluMB textures=%zu base-level texels=%lluM\n", (unsigned long long)g_frame,
+            (unsigned long long)(i.CurrentUsage >> 20), (unsigned long long)(i.Budget >> 20), n, (unsigned long long)(texels >> 20));
+}
 static void drawprof_report(uint64_t frames) {
     if (!kDrawProf || !frames) return;
     std::string s = S("[drawprof] %llu frames, ms per frame:", (unsigned long long)frames);
@@ -3038,8 +3241,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
             if (dim == 2) { w = (tf[2] & 0x7FF) + 1; h = ((tf[2] >> 11) & 0x7FF) + 1; depth = (tf[2] >> 22) + 1; }   // 3D
             else if (dim == 1) depth = ((tf[2] >> 26) & 63) + 1;                                                      // 2D, stacked
             cb.tfp[u.slot * 4] = (float)w / sf->w; cb.tfp[u.slot * 4 + 1] = (float)h / sf->h;
-            cb.tfi[u.slot * 4] = 1.0f / w; cb.tfi[u.slot * 4 + 1] = 1.0f / h;
-            if (u.dim == 2) {                                               // slices one under another, 32-row aligned
+            cb.tfi[u.slot * 4] = 1.0f / w; cb.tfi[u.slot * 4 + 1] = 1.0f / h;            if (u.dim == 2) {                                               // slices one under another, 32-row aligned
                 cb.tfp[u.slot * 4 + 3] = (float)depth;
                 cb.tfi[u.slot * 4 + 2] = (float)align_up(h, 32) / sf->h;
                 logf_once(S("stk%X", base).c_str(), "3D/stacked fetch of resolved surface %X: %ux%ux%u, fetch dim %u", base, w, h, depth, dim);
@@ -3091,11 +3293,27 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         {   // one line per distinct fetch while tracing, to check the mip chain and filter a draw really gets
             static std::set<uint64_t> seenFetch;
             if (g_trace > 1000 && seenFetch.insert(((uint64_t)base << 8) | u.slot).second)
-                fprintf(stderr, "[texmip] slot=%u base=%08X %ux%u fmt=%u mipBase=%08X maxLevel=%u levels=%u packed=%d fetch mag=%u min=%u mip=%u aniso=%u arb=%u lodbias=%d minL=%u maxL=%u shader mag=%d min=%d mip=%d\n",
+                fprintf(stderr, "[texmip] sign=%u%u%u%u swz=%03X exp=%d slot=%u base=%08X %ux%u fmt=%u mipBase=%08X maxLevel=%u levels=%u packed=%d fetch mag=%u min=%u mip=%u aniso=%u arb=%u lodbias=%d minL=%u maxL=%u shader mag=%d min=%d mip=%d\n",
+                        (tf[0] >> 2) & 3, (tf[0] >> 4) & 3, (tf[0] >> 6) & 3, (tf[0] >> 8) & 3, (tf[3] >> 1) & 0xFFF, sext((tf[3] >> 13) & 63, 6),
                         u.slot, base, w, h, fmt, fi.mipBase, fi.maxLevel, ht->levels, (int)fi.packed, (tf[3] >> 19) & 3, (tf[3] >> 21) & 3, (tf[3] >> 23) & 3, (tf[3] >> 25) & 7, (tf[3] >> 28) & 7,
                         sext((tf[4] >> 12) & 0x3FF, 10), (tf[4] >> 2) & 15, (tf[4] >> 6) & 15, u.magf, u.minf, u.mipf);
         }
-        srvs[u.dim == 3 ? 16 + u.slot : u.slot] = ht->srv.Get();
+        ID3D11ShaderResourceView* view = ht->srv.Get();
+        if (ht->view != DXGI_FORMAT_UNKNOWN) {                              // every channel fetched signed: read the SNORM view, nothing left for texfix to convert
+            DXGI_FORMAT typeless; int ch = 0;
+            const DXGI_FORMAT sn = snorm_twin(ht->view, &typeless, &ch);
+            bool allSigned = ch > 0;
+            for (int i = 0; i < ch; i++) if (cb.tfsg[u.slot * 4 + i] != 1) allSigned = false;
+            if (allSigned) {
+                if (!ht->srvSigned) {
+                    ht->srvSigned = make_srv(ht->tex.Get(), sn, ht->faces);
+                    static int nl = 0;
+                    if (nl++ < 40) fprintf(stderr, "[snorm] texture %08X fmt %u %ux%u read as signed\n", base, fmt, w, h);
+                }
+                if (ht->srvSigned) { view = ht->srvSigned.Get(); for (int i = 0; i < ch; i++) cb.tfsg[u.slot * 4 + i] = 0; }
+            }
+        }
+        srvs[u.dim == 3 ? 16 + u.slot : u.slot] = view;
         TexFmt t; tex_fmt(fmt, t);
         if (t.block > 1) { cb.tfp[u.slot * 4] = (float)w / ht->hostW; cb.tfp[u.slot * 4 + 1] = (float)h / ht->hostH; }
     };
@@ -3201,11 +3419,23 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     {   // BCR2_DBGNOZ: no depth test on blended scene draws, to see whether depth is rejecting them
         static const bool kNoZ = getenv("ASURA_DBGNOZ") != nullptr;
         if (kNoZ && prim != 6 && g_regs[R_BLEND0] != 0x00010001u) dcEff &= ~2u;
+        // ASURA_NOZPS="hash,hash": no depth test for draws with these pixel shaders, to see whether depth rejects their pixels
+        static const char* kNoZPs = getenv("ASURA_NOZPS");
+        if (kNoZPs && ps && strstr(kNoZPs, S("%016llX", (unsigned long long)ps->hash).c_str())) dcEff &= ~2u;
     }
     g_ctx->OMSetDepthStencilState(get_ds(dcEff, sr, srbf), sr & 0xFF);
     float polyScale = 0, polyOff = 0;
     // The slope is per pixel, so at a higher render scale the same surface changes less per pixel and the bias has to grow with the scale.
-    if ((mode >> 11) & 3) { polyScale = reg_f(R_OFFSET_FRONT_SCALE) / 16.0f * g_resScale; polyOff = reg_f(R_OFFSET_FRONT_SCALE + 1); }
+    {   // Front and back faces have their own offsets (PA_SU_POLY_OFFSET_FRONT_* then BACK_*); D3D11 has one, so take the faces this draw keeps.
+        // Shadow depth passes drawing back faces only (front culled) set the back offset: using the front one left them unbiased (shadow acne).
+        const bool frontOn = (mode >> 11) & 1, backOn = (mode >> 12) & 1, cullFront = (mode & 3) == 1;
+        static const bool kFrontOnly = getenv("ASURA_POLYFRONTONLY") != nullptr;
+        if (kFrontOnly ? (frontOn || backOn) : (frontOn && !cullFront)) { polyScale = reg_f(R_OFFSET_FRONT_SCALE) / 16.0f * g_resScale; polyOff = reg_f(R_OFFSET_FRONT_SCALE + 1); }
+        else if (!kFrontOnly && backOn) { polyScale = reg_f(R_OFFSET_FRONT_SCALE + 2) / 16.0f * g_resScale; polyOff = reg_f(R_OFFSET_FRONT_SCALE + 3); }
+        if (g_trace > 0 && (frontOn || backOn))
+            fprintf(stderr, "[gfx]   polyoffset mode=%08X front %g,%g back %g,%g -> scale %g offset %g\n", mode, reg_f(R_OFFSET_FRONT_SCALE), reg_f(R_OFFSET_FRONT_SCALE + 1),
+                    reg_f(R_OFFSET_FRONT_SCALE + 2), reg_f(R_OFFSET_FRONT_SCALE + 3), polyScale, polyOff);
+    }
     bool clipOff = (g_regs[R_CLIP_CNTL] >> 16) & 1;
     g_ctx->RSSetState(get_rs(mode, rect, clipOff, polyScale, polyOff));
     D3D11_VIEWPORT vp{ 0, 0, (float)(rw * g_resScale), (float)(rh * g_resScale), 0, 1 };
@@ -3333,10 +3563,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     }
 }
 
-static void draw_sprites(int px, int py, int pw, int ph) {
-    std::vector<GpuSprite> list;
-    { std::lock_guard<std::mutex> lk(g_spriteLock); list = g_sprites; }
-    if (list.empty()) return;
+static void sprite_pipeline() {
     if (!g_psSprite) {
         const char* ps = "Texture2D src:register(t0); SamplerState smp:register(s0); cbuffer P:register(b2){ float2 ofs; float2 scale; uint swaprb; float gam; float pv; float aa; };\n"
                          "float4 main(float4 p:SV_Position):SV_Target { return src.SampleLevel(smp,(p.xy-ofs)/scale,0); }\n";
@@ -3347,6 +3574,12 @@ static void draw_sprites(int px, int py, int pw, int ph) {
         bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
         g_dev->CreateBlendState(&bd, &g_blendAlpha);
     }
+}
+static void draw_sprites(int px, int py, int pw, int ph) {
+    std::vector<GpuSprite> list;
+    { std::lock_guard<std::mutex> lk(g_spriteLock); list = g_sprites; }
+    if (list.empty()) return;
+    sprite_pipeline();
     if (!g_psSprite || !g_blendAlpha) return;
     for (const GpuSprite& s : list) {
         ID3D11ShaderResourceView* srv = sprite_srv(s.icon);
@@ -3380,6 +3613,62 @@ static void draw_sprites(int px, int py, int pw, int ph) {
         g_ctx->PSSetShaderResources(0, 1, nul);
         g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
     }
+}
+
+// The Graphics Options menu (options.cpp) over the 16:9 picture: a centred panel, its picture redrawn by the menu when anything changes.
+bool options_picture(int w, int h, std::vector<uint8_t>& rgba, uint64_t& version);
+static void draw_options(int px, int py, int pw, int ph) {
+    static ComPtr<ID3D11Texture2D> tex; static ComPtr<ID3D11ShaderResourceView> srv; static ComPtr<ID3D11BlendState> blendPre;
+    static uint64_t version = 0, uploaded = ~0ull; static int tw = 0, th = 0; static std::vector<uint8_t> px32;
+    const int w = std::max(pw * 11 / 20, 1), h = std::max(ph * 11 / 20, 1);
+    if (!options_picture(w, h, px32, version)) return;                      // closed
+    if (!tex || tw != w || th != h) {
+        tex.Reset(); srv.Reset(); uploaded = ~0ull;
+        D3D11_TEXTURE2D_DESC d{}; d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R8G8B8A8_UNORM; d.SampleDesc.Count = 1;
+        d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &tex))) return;
+        g_dev->CreateShaderResourceView(tex.Get(), nullptr, &srv);
+        tw = w; th = h;
+    }
+    if (uploaded != version && px32.size() == (size_t)w * h * 4) { g_ctx->UpdateSubresource(tex.Get(), 0, nullptr, px32.data(), w * 4, 0); uploaded = version; }
+    sprite_pipeline();
+    if (!blendPre) {
+        D3D11_BLEND_DESC bd{}; bd.RenderTarget[0].BlendEnable = TRUE;
+        bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE; bd.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA; bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE; bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO; bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        g_dev->CreateBlendState(&bd, &blendPre);
+    }
+    if (!g_psSprite || !srv || !blendPre) return;
+    const float dx0 = (float)(px + (pw - w) / 2), dy0 = (float)(py + (ph - h) / 2);
+    ID3D11ShaderResourceView* nul[32] = {};
+    g_ctx->PSSetShaderResources(0, 32, nul);
+    ID3D11RenderTargetView* rtv = g_backRtv.Get();
+    g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    invalidate_binds();
+    struct { float ofs[2]; float scale[2]; uint32_t sw; float gam; float pv; float aa; float es, pad[3]; } p{ { dx0, dy0 }, { (float)w, (float)h }, 0u, 1.0f, 0.0f, 0.0f, 0.0f, {} };
+    upload_cb(g_cbBlit.Get(), &p, sizeof(p));
+    ID3D11Buffer* cb = g_cbBlit.Get();
+    g_ctx->PSSetConstantBuffers(2, 1, &cb);
+    g_ctx->VSSetShader(g_vsBlit.Get(), nullptr, 0);
+    g_ctx->PSSetShader(g_psSprite.Get(), nullptr, 0);
+    g_ctx->GSSetShader(nullptr, nullptr, 0);
+    g_ctx->IASetInputLayout(nullptr);
+    g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_ctx->OMSetBlendState(blendPre.Get(), nullptr, 0xFFFFFFFFu);
+    g_ctx->OMSetDepthStencilState(get_ds(0, 0, 0), 0);
+    g_ctx->RSSetState(get_rs(0, true, true, 0, 0));
+    D3D11_VIEWPORT vp{ 0, 0, (float)g_backW, (float)g_backH, 0, 1 };
+    g_ctx->RSSetViewports(1, &vp);
+    D3D11_RECT sc{ (LONG)dx0, (LONG)dy0, (LONG)(dx0 + w), (LONG)(dy0 + h) };
+    g_ctx->RSSetScissorRects(1, &sc);
+    ID3D11SamplerState* samp = g_presentSampler.Get();
+    g_ctx->PSSetSamplers(0, 1, &samp);
+    ID3D11ShaderResourceView* s = srv.Get();
+    g_ctx->PSSetShaderResources(0, 1, &s);
+    g_ctx->Draw(3, 0);
+    g_ctx->PSSetShaderResources(0, 1, nul);
+    g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
 }
 
 // The startup screen while shaders compile: white text on black in the game's own font, centred. The text is pictures of the game's rendering of it
@@ -3499,8 +3788,6 @@ static void sync_depth_alias(Rt* depth, uint32_t base, uint32_t pitch) {
 // itself; until this the format 2 target never got the scene and the whole 3D view came out flat green. Host targets are
 // separate per format, so when one of these is bound, the newest one at the same base and pitch is carried over: copied when
 // the host formats match, re-encoded between half floats and 7e3 bits when they don't (Xenia's conversion).
-static bool is_10bit_family(uint32_t f) { return f == 2 || f == 3 || f == 10 || f == 12; }
-static bool is_7e3_float(uint32_t f) { return f == 3 || f == 12; }
 static void sync_color_alias(Rt* r, uint32_t base, uint32_t fmt, uint32_t pitch) {
     if (!is_10bit_family(fmt)) return;
     Rt* src = nullptr; uint32_t srcFmt = 0;
@@ -3660,6 +3947,11 @@ static void do_resolve() {
                 blit(src->srv.Get(), g_psBlitRaw.Get(), sf->rawRtv.Get(), sf->w * rs, sf->h * rs, dx0 * rs, dy0 * rs, std::min(dx1, (int)sf->w) * rs, std::min(dy1, (int)sf->h) * rs, srcX, srcY, false, 1, 1, src->stencilSrv.Get());
             sf->guestHash = guest_sample_hash(sf->base, sf->end - sf->base);
             sf->swapped = destSwap && !isDepth;
+            {   // ASURA_DUMPRESOLVE=<hex base>: in the traced frame, write that surface after each resolve into it (a shadow map reused within the frame)
+                static const char* kDr = getenv("ASURA_DUMPRESOLVE");
+                static int seq = 0;
+                if (kDr && g_trace > 0 && sf->base == (uint32_t)strtoul(kDr, nullptr, 16)) dump_surfaces(sf->base, seq++);
+            }
         }
         g_blitExpScale = 0;
     }
@@ -3773,7 +4065,7 @@ static void save_shot(ID3D11Texture2D* st, const D3D11_TEXTURE2D_DESC& d, uint64
 // BCR2_SHOTRINGAT=frame does the same as pressing F9 at that frame, for testing.
 // Where F9 captures go: BCR2_SHOTDIR if set, else a new folder _debug_capture\f9_<frame> beside the exe.
 static std::string capture_session_dir(uint64_t frame) {
-    if (const char* e = getenv("ASURA_SHOTDIR")) return e;
+    if (const char* e = getenv("ASURA_SHOTDIR")) { CreateDirectoryA(e, nullptr); return e; }   // a missing folder silently lost a whole capture
     const std::string base = exe_dir() + "\\_debug_capture";
     CreateDirectoryA(base.c_str(), nullptr);
     const std::string d = base + S("\\f9_%llu", (unsigned long long)frame);
@@ -3860,10 +4152,16 @@ static void write_shot() {
     if (g_shotRingSize > 0) shot_ring();
     static const char* envDir = getenv("ASURA_SHOTDIR");                       // set: a frame every BCR2_SHOTEVERY (default 60) goes there as well
     static const int every = envDir ? (getenv("ASURA_SHOTEVERY") ? std::max(atoi(getenv("ASURA_SHOTEVERY")), 1) : 60) : 0;
+    static const bool dirMade = envDir ? (CreateDirectoryA(envDir, nullptr), true) : false;   // a missing folder silently loses every shot
+    (void)dirMade;
     static std::string burstDir;
     bool burst = g_shotBurstLeft.load() > 0;
     if (burst) { if (burstDir.empty()) burstDir = capture_session_dir(g_frame); g_shotBurstLeft--; if (g_frame % g_shotStep.load() != 0) return; }
-    else { burstDir.clear(); if (!every || (g_frame % every) != 0) return; }
+    else {   // ASURA_SHOTFROM / ASURA_SHOTTO: only that stretch of frames
+        static const uint64_t from = getenv("ASURA_SHOTFROM") ? _strtoui64(getenv("ASURA_SHOTFROM"), nullptr, 10) : 0;
+        static const uint64_t to = getenv("ASURA_SHOTTO") ? _strtoui64(getenv("ASURA_SHOTTO"), nullptr, 10) : ~0ull;
+        burstDir.clear(); if (!every || (g_frame % every) != 0 || g_frame < from || g_frame > to) return;
+    }
     const char* dir = burst ? burstDir.c_str() : envDir;
     D3D11_TEXTURE2D_DESC d; g_backTex->GetDesc(&d);
     d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
@@ -3874,13 +4172,13 @@ static void write_shot() {
 
 // BCR2_DUMPFRAME=n with BCR2_SHOTDIR: log frame n's draws and resolves, then write each resolved surface as a BMP.
 static int64_t g_dumpFrame = getenv("ASURA_DUMPFRAME") ? _atoi64(getenv("ASURA_DUMPFRAME")) : -1;   // also set by F10 (with --log): the next frame
-static void dump_surfaces() {
+static void dump_surfaces(uint32_t only, int seq) {                          // only/seq: one surface, right after a resolve (ASURA_DUMPRESOLVE)
     const char* dir = getenv("ASURA_SHOTDIR");
     if (!dir) return;
     std::vector<std::pair<Surface*, bool>> all;
     static const char* kOnly = getenv("ASURA_DUMPONLY");                     // hex base address: dump just this surface
-    const uint32_t onlyBase = kOnly ? (uint32_t)strtoul(kOnly, nullptr, 16) : 0;
-    for (auto& kv : g_surfaces) { if (kOnly && kv.first != onlyBase) continue; all.push_back({ kv.second, false }); if (kv.second->rawTex) all.push_back({ kv.second, true }); }
+    const uint32_t onlyBase = only ? only : kOnly ? (uint32_t)strtoul(kOnly, nullptr, 16) : 0;
+    for (auto& kv : g_surfaces) { if (onlyBase && kv.first != onlyBase) continue; all.push_back({ kv.second, false }); if (kv.second->rawTex) all.push_back({ kv.second, true }); }
     for (auto& ent : all) {
         Surface* s = ent.first;
         ID3D11Texture2D* from = ent.second ? s->rawTex.Get() : s->tex.Get();
@@ -3889,7 +4187,7 @@ static void dump_surfaces() {
         ComPtr<ID3D11Texture2D> st; if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &st))) continue;
         g_ctx->CopyResource(st.Get(), from);
         D3D11_MAPPED_SUBRESOURCE ms; if (FAILED(g_ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &ms))) continue;
-        std::string p = std::string(dir) + S("\\surf_%08X_f%d%s_n%llu.bmp", s->base, (int)s->fmt, ent.second ? "_raw" : "", (unsigned long long)g_frame);
+        std::string p = std::string(dir) + S("\\surf_%08X_f%d%s_n%llu%s.bmp", s->base, (int)s->fmt, ent.second ? "_raw" : "", (unsigned long long)g_frame, seq >= 0 ? S("_r%d", seq).c_str() : "");
         if (FILE* f = fopen(p.c_str(), "wb")) {
             BITMAPFILEHEADER fh{}; BITMAPINFOHEADER ih{};
             uint32_t imgSize = d.Width * d.Height * 4;
@@ -3909,7 +4207,7 @@ static void dump_surfaces() {
                     // Decoded per format, so the picture is the surface's value clamped to 0..1 (half floats and 10-bit used to come out as raw bytes)
                     if (d.Format == DXGI_FORMAT_R32_FLOAT) { float v; memcpy(&v, src + x * 4, 4); r = g = b = u8(v); }
                     else if (d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) { uint16_t h[4]; memcpy(h, src + x * 8, 8); r = u8(half(h[0])); g = u8(half(h[1])); b = u8(half(h[2])); }
-                    else if (d.Format == DXGI_FORMAT_R16G16B16A16_UNORM) { uint16_t h[4]; memcpy(h, src + x * 8, 8); r = h[0] >> 8; g = h[1] >> 8; b = h[2] >> 8; }
+                    else if (d.Format == DXGI_FORMAT_R16G16B16A16_UNORM) { uint16_t h[4]; memcpy(h, src + x * 8, 8); r = h[0] >> 8; g = h[1] >> 8; b = h[2] >> 8; static const bool kA = getenv("ASURA_DUMPALPHA") != nullptr; if (kA) r = g = b = h[3] >> 8; }
                     else if (d.Format == DXGI_FORMAT_R16G16_FLOAT) { uint16_t h[2]; memcpy(h, src + x * 4, 4); r = u8(half(h[0])); g = u8(half(h[1])); b = 0; }
                     else if (d.Format == DXGI_FORMAT_R16G16_UNORM) { uint16_t h[2]; memcpy(h, src + x * 4, 4); r = h[0] >> 8; g = h[1] >> 8; b = 0; }
                     else if (d.Format == DXGI_FORMAT_R10G10B10A2_UNORM) { uint32_t w; memcpy(&w, src + x * 4, 4); r = (w >> 2) & 255; g = (w >> 12) & 255; b = (w >> 22) & 255; }
@@ -4032,6 +4330,7 @@ static void do_swap(uint32_t front) {
     funcprof_frame(g_frame);
     physwatch_tick();
     qte_publish();
+    { void options_frame(); options_frame(); }                              // Graphics Options menu input (options.cpp)
     LARGE_INTEGER swapStart; QueryPerformanceCounter(&swapStart);
     if (g_drawsLeftOut) {
         fprintf(stderr, "[shader] frame=%llu left out %llu draws waiting on a compile, waited %.1f ms\n", (unsigned long long)g_frame, (unsigned long long)g_drawsLeftOut, g_compileWaitMs);
@@ -4100,6 +4399,7 @@ static void do_swap(uint32_t front) {
         blit(s->srv.Get(), useRamp ? g_psPresentLut.Get() : g_psPresentPlain.Get(), g_backRtv.Get(), g_backW, g_backH, px, py, px + pw, py + ph, 0, 0, s->swapped, sxs, sys, useRamp ? g_lutSrv.Get() : nullptr, ofs);
         g_blitExtra = nullptr;
         draw_sprites(px, py, pw, ph);
+        draw_options(px, py, pw, ph);
     } else {
         float c[4] = { 0.05f, 0.0f, 0.1f, 1 };
         g_ctx->ClearRenderTargetView(g_backRtv.Get(), c);
@@ -4149,7 +4449,7 @@ static void do_swap(uint32_t front) {
             if (nShown >= 300) { fprintf(stderr, "[vrr] frame ready after its tick: avg=%.1f max=%.1f ms, shown with no hold (target %.1f ms): %llu of %llu; latest wake: hold %.2f ms, tick %.2f ms\n", phaseSum / nShown, phaseMax, kPhaseMs, (unsigned long long)nLate, (unsigned long long)nShown, holdLateMax, g_tickLateMaxUs.exchange(0) / 1000.0); nShown = nLate = 0; phaseSum = phaseMax = holdLateMax = 0; }
         } else {
         static const int kForce = getenv("ASURA_PRESENTINTERVAL") ? atoi(getenv("ASURA_PRESENTINTERVAL")) : -1;
-        UINT interval = kForce >= 0 ? (UINT)kForce : (g_presentFollowsDisplay.load() ? 1u : 0u);
+        UINT interval = kForce >= 0 ? (UINT)kForce : ((g_presentFollowsDisplay.load() || g_vsync.load()) ? 1u : 0u);
         // A stall such as a load can leave one extra frame queued, and at a steady 1:1 rate that adds a full refresh of latency forever.
         // Every Present then blocks, so after 30 of those in a row, leave one frame out to empty the queue.
         static int blocked = 0;
@@ -4181,6 +4481,15 @@ static void do_swap(uint32_t front) {
             uint64_t w0 = g_waitTicks[0].load(), w1 = g_waitTicks[1].load(), w2 = g_waitTicks[2].load();
             double ms = prevSwap.QuadPart ? (double)(now.QuadPart - prevSwap.QuadPart) * g_perfTicksToMs : 0;
             const double worstDraw = g_worstDrawMs; g_worstDrawMs = 0;
+            if (kDrawProf) {   // one long frame vanishes in the 300-frame average: break it down on its own
+                static double pDp[10] = {};
+                if (ms > 100.0) {
+                    std::string s = S("[spikeprof] frame=%llu ms=%.1f", (unsigned long long)g_frame, ms);
+                    for (int k = 0; k < 10; k++) if (k != 8) s += S(" %s=%.1f", kDpNames[k], g_dp[k] - pDp[k]);
+                    fprintf(stderr, "%s\n", s.c_str());
+                }
+                memcpy(pDp, g_dp, sizeof pDp);
+            }
             if (ms > 20.0 && g_frame > 300) {
                 static int nSpike = 0;
                 if (nSpike++ < 20000)
@@ -4190,6 +4499,12 @@ static void do_swap(uint32_t front) {
                             (w0 >= pW0 ? w0 - pW0 : w0) * g_perfTicksToMs, (w1 >= pW1 ? w1 - pW1 : w1) * g_perfTicksToMs, (w2 >= pW2 ? w2 - pW2 : w2) * g_perfTicksToMs,
                             (unsigned long long)(g_nCompiles.load() - pCompiles), (unsigned long long)(g_nUploads - pUploads), (unsigned long long)((g_upBytes - pUpBytes) / 1024), worstDraw, (unsigned long long)g_worstVs, g_worstNum, g_worstSurf, g_wCb, g_wVb, g_wIb, g_wCall, g_wRt, g_swPrep, g_swHold, g_swTrack);
             }
+            if (ms > 100.0 && kDrawProf) {                                   // a visible hitch: where the draw time went, by phase
+                std::string s = S("[hitch] frame=%llu ms=%.1f draws=%llu", (unsigned long long)g_frame, ms, (unsigned long long)g_drawsFrame);
+                for (int k = 0; k < 10; k++) if (k != 8) s += S(" %s=%.1f", kDpNames[k], g_dpFrame[k]);
+                fprintf(stderr, "%s\n", s.c_str());
+            }
+            memset(g_dpFrame, 0, sizeof(g_dpFrame));
             pD = g_tDraw; pT = g_tTex; pR = g_tResolve; pP = g_tPresent; pW0 = w0; pW1 = w1; pW2 = w2; pCompiles = g_nCompiles.load(); pUploads = g_nUploads; pUpBytes = g_upBytes;
         }
         prevSwap = now;
@@ -4209,6 +4524,7 @@ static void do_swap(uint32_t front) {
                         (unsigned long long)g_frame, n * 1000.0 / ms, ms / n, (double)(g_draws - lastDraws) / n, (double)(g_resolves - lastRes) / n,
                         g_tDraw / n, g_tTex / n, g_tResolve / n, g_tPresent / n, w0 / n, w1 / n, w2 / n);
                 drawprof_report(n);
+                vram_report();
             }
             last = now; lastFrame = g_frame + 1; lastDraws = g_draws; lastRes = g_resolves;
             g_tDraw = g_tTex = g_tResolve = g_tPresent = 0;

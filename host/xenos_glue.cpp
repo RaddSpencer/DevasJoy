@@ -12,9 +12,7 @@ bool bcr2_log_requested() {   // also asked before main() runs
 }
 const char* get_content_root() { static const std::string r = data_root() + "\\game\\disc"; return r.c_str(); }
 
-// BCR2's settings menu: not in this port yet, so the renderer keeps its defaults (and any ASURA_* switches)
-void settings_apply_to_env() {}
-int settings_button_set() { return 0; }
+// settings_apply_to_env and settings_button_set: options.cpp (the Graphics Options menu and asura.ini)
 
 // keyboard and mouse: only the renderer's own keys (F9 capture, F12 screenshot) for now
 void kbm_note_wheel(int) {}

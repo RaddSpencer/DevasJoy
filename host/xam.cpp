@@ -220,6 +220,10 @@ static void XamInputGetState_(PPCContext& ctx, uint8_t*) {
     if (!st) { ctx.r3.u64 = 0; return; }
     memset(g_base + st, 0, 16);
     input_t0();
+    {   // the Graphics Options menu (options.cpp) has the pad: the game sees nothing pressed
+        bool options_capturing();
+        if (options_capturing()) { static uint32_t packet = 0x20000000; wr32(st, ++packet); ctx.r3.u64 = 0; return; }
+    }
     if (!input_play(st) && !auto_input(st)) {
         XINPUT_STATE xs;
         if (pad_read(xs)) {

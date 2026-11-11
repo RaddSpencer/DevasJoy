@@ -30,3 +30,6 @@ SAVEDATA.DAT
 asura_logo*.png
 thirdparty/*
 !thirdparty/libmspack/
+
+# player settings written by the Graphics Options menu
+asura.ini
