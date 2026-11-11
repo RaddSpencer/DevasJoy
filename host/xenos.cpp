@@ -182,6 +182,7 @@ static ComPtr<ID3D11Query> g_vbDone[kVbRings];                               // 
 static bool g_vbUsed[kVbRings] = {};
 static int g_vbIndex = 0;
 static uint32_t g_vbPos = 0, g_ibPos = 0;
+static uint64_t g_vbGen = 0;                                                // bumped whenever vertex ring data can be overwritten or the buffer changes (vertex cache in issue_draw)
 static uint64_t g_draws = 0, g_resolves = 0, g_drawsFrame = 0;
 
 // Display modes. The window thread only asks; the GPU thread owns the swap chain and makes the change between frames.
@@ -2319,6 +2320,7 @@ static void probeq_report() {
     g_probeQ.clear();
 }
 static std::vector<uint32_t> g_vsCode, g_psCode;
+static uint64_t g_vsGen = 0, g_psGen = 0;                                    // bumped when the loaded shader code really changes (issue_draw reuses its lookup)
 static uint32_t g_vsHash = 0, g_psHash = 0;
 static XShader* g_vsCur = nullptr; static XShader* g_psCur = nullptr; static uint32_t g_psParamGen = 0xFFFFFFFFu;
 
@@ -2340,7 +2342,7 @@ static uint32_t vb_alloc(uint32_t size, uint8_t*& ptr) {
         if (g_vbPos + size > kVbRingSize) {
             g_ctx->End(g_vbDone[g_vbIndex].Get());
             g_vbUsed[g_vbIndex] = true;
-            g_vbIndex = (g_vbIndex + 1) % kVbRings;
+            g_vbIndex = (g_vbIndex + 1) % kVbRings; g_vbGen++;
             g_vbRing = g_vbRings[g_vbIndex]; g_vbSrv = g_vbSrvs[g_vbIndex];
             g_vbPos = 0;
             // Normally that ring is long finished. If not, as in a burst of huge frames, a discard is the safe way to get memory.
@@ -2351,15 +2353,20 @@ static uint32_t vb_alloc(uint32_t size, uint8_t*& ptr) {
         ptr = (uint8_t*)ms.pData + g_vbPos;
     } else {
         static std::vector<uint8_t> scratch; scratch.resize(size); ptr = scratch.data();
-        if (g_vbPos + size > kVbRingSize) g_vbPos = 0;
+        if (g_vbPos + size > kVbRingSize) { g_vbPos = 0; g_vbGen++; }
     }
     uint32_t r = g_vbPos; g_vbPos += size;
     return r;
 }
 // Makes the next vb_alloc start a fresh ring buffer if this many bytes would not fit in the current one (see issue_draw).
-static void vb_reserve(uint64_t bytes) {
+// Returns true when that happens (or the single-buffer fallback will wrap): data copied earlier in the current buffer can't be reused then.
+static bool vb_reserve(uint64_t bytes) {
     static uint64_t moves = 0;
-    if (g_noOverwriteSrv && g_vbPos > 0 && g_vbPos + bytes > kVbRingSize) { g_vbPos = kVbRingSize; if (++moves <= 3) fprintf(stderr, "[gfx] vertex ring: a draw's %llu bytes start the next buffer\n", (unsigned long long)bytes); }
+    if (g_vbPos > 0 && g_vbPos + bytes > kVbRingSize) {
+        if (g_noOverwriteSrv) { g_vbPos = kVbRingSize; if (++moves <= 3) fprintf(stderr, "[gfx] vertex ring: a draw's %llu bytes start the next buffer\n", (unsigned long long)bytes); }
+        return true;
+    }
+    return false;
 }
 static void vb_commit(uint32_t off, uint32_t size, const uint8_t* ptr) {
     if (g_noOverwriteSrv) { g_ctx->Unmap(g_vbRing.Get(), 0); return; }
@@ -2639,6 +2646,31 @@ struct WorstDraw {
     ~WorstDraw() { LARGE_INTEGER b; QueryPerformanceCounter(&b); double ms = (double)(b.QuadPart - a.QuadPart) * g_perfTicksToMs; if (ms > g_worstDrawMs) { g_worstDrawMs = ms; g_worstVs = g_vsHash; g_worstNum = num; g_worstSurf = g_regs[R_SURFACE_INFO]; g_wCb = g_sCb; g_wVb = g_sVb; g_wIb = g_sIb; g_wCall = g_sCall; g_wRt = g_sRt; } }
 };
 
+// The current shaders, looked up again only when the loaded code changed (build_shader hashes the whole microcode).
+static XShader* cur_vs() {
+    static uint64_t gen = ~0ull; static XShader* s = nullptr;
+    if (!s || gen != g_vsGen) { s = build_shader(g_vsCode, true, 0xFFFFFFFFu); gen = g_vsGen; }
+    return s;
+}
+static XShader* cur_ps(uint32_t paramGen) {
+    static uint64_t gen = ~0ull; static uint32_t pg = 0; static XShader* s = nullptr;
+    if (!s || gen != g_psGen || pg != paramGen) { s = build_shader(g_psCode, false, paramGen); gen = g_psGen; pg = paramGen; }
+    return s;
+}
+// ASURA_DRAWPROF=1: time per phase of issue_draw, summed per frame and logged every 300 frames as [drawprof] (ms per frame).
+static const bool kDrawProf = getenv("ASURA_DRAWPROF") != nullptr;
+static double g_dp[10] = {};
+static LARGE_INTEGER g_dpLast;
+static const char* const kDpNames[10] = { "setup", "shaders", "targets", "indices", "vertices", "textures", "constants", "state", "-", "call+tail" };
+#define DP(k) do { if (kDrawProf) { LARGE_INTEGER n_; QueryPerformanceCounter(&n_); g_dp[k] += (double)(n_.QuadPart - g_dpLast.QuadPart) * g_perfTicksToMs; g_dpLast = n_; } } while (0)
+struct DpScope { DpScope() { if (kDrawProf) QueryPerformanceCounter(&g_dpLast); } ~DpScope() { DP(9); } };
+static void drawprof_report(uint64_t frames) {
+    if (!kDrawProf || !frames) return;
+    std::string s = S("[drawprof] %llu frames, ms per frame:", (unsigned long long)frames);
+    for (int k = 0; k < 10; k++) if (k != 8) s += S(" %s=%.2f", kDpNames[k], g_dp[k] / frames);
+    fprintf(stderr, "%s\n", s.c_str());
+    memset(g_dp, 0, sizeof(g_dp));
+}
 static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBase, uint32_t dmaSize) {
     uint32_t prim = init & 63, srcSel = (init >> 6) & 3, idx32 = (init >> 11) & 1, num = init >> 16;
     uint32_t edram = g_regs[R_MODECONTROL] & 7;
@@ -2651,10 +2683,11 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     watch_surface("before draw/resolve");
     if (edram == 6) { PerfScope perfRes(g_tResolve); do_resolve(); watch_surface("after resolve"); return; }
     PerfScope perfDraw(g_tDraw);
+    DpScope dpScope;
     WorstDraw worstDraw(num);
     if (num == 0 || prim == 0) return;
     if (edram == 0) {                                                       // no EDRAM output: only a memexport draw does anything
-        if (g_vsCode.empty() || !build_shader(g_vsCode, true, 0xFFFFFFFFu)->memexport) return;
+        if (g_vsCode.empty() || !cur_vs()->memexport) return;
     }
     if (prim >= 0x10) { logf_once(S("prim%u", prim).c_str(), "unsupported primitive type %u", prim); return; }
     if (prim == 1) logf_once("points", "point list drawn as 1-pixel points (no sprite expansion yet)");
@@ -2681,7 +2714,8 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     if (prim == 8 && srcSel == 2 && (g_regs[R_DEPTHCONTROL] & 0x76) == 0x76 &&
         (edram == 5 || (edram == 4 && ((g_regs[R_SURFACE_INFO] >> 16) & 3) != 0)) && fast_clear(edram == 4)) return;
 
-    XShader* vs = build_shader(g_vsCode, true, 0xFFFFFFFFu);
+    DP(0);
+    XShader* vs = cur_vs();
     g_vsHash = (uint32_t)((unsigned long long)vs->hash >> 32);
     // A memexport draw: run its vertex shader once per vertex, writing guest memory, with no render target and no pixel shader.
     const bool mx = vs->memexport && mx_ready();
@@ -2692,9 +2726,12 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         if (vf0 && !vs->vf.empty()) {
             vfw = (g_regs[R_FETCH + vs->vf[0].slot * 2 + 1] >> 2) & 0xFFFFFF;
             const uint32_t* w = (const uint32_t*)phys(vf0);
-            const uint32_t lim = vfw < 65536 ? vfw : 65536;
+            // 256 words spread over the stream (the zero count is scaled): hashing all of it for every draw cost 10+ ms a frame in busy scenes
+            const uint32_t step = std::max(1u, vfw / 256);
+            uint32_t seen = 0;
             vhash = 2166136261u;
-            for (uint32_t i = 0; i < lim; i++) { vzero += w[i] == 0; vhash = (vhash ^ w[i]) * 16777619u; }
+            for (uint32_t i = 0; i < vfw; i += step, seen++) { vzero += w[i] == 0; vhash = (vhash ^ w[i]) * 16777619u; }
+            if (seen && step > 1) vzero = (uint32_t)((uint64_t)vzero * vfw / seen);
         }
         draw_ring_add(g_frame, g_vsHash, (uint32_t)((unsigned long long)g_psHash), num, vf0, g_regs[R_SURFACE_INFO] & 0x3FFF, edram, g_regs[R_WINDOW_OFFSET], vfw, vzero, vhash);
     }
@@ -2706,7 +2743,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     static const bool kDepthKeepPs = getenv("ASURA_DEPTHKEEPPS") != nullptr;
     static const char* kDepthSolid = getenv("ASURA_DEPTHSOLID");              // comma-separated vertex shader hashes: only these depth-only draws skip the pixel shader
     const bool skipPs = depthOnly && !kDepthKeepPs && (!kDepthSolid || strstr(kDepthSolid, S("%016llX", (unsigned long long)vs->hash).substr(0, 8).c_str()));
-    XShader* ps = (g_psCode.empty() || skipPs || mx) ? nullptr : build_shader(g_psCode, false, paramGen);
+    XShader* ps = (g_psCode.empty() || skipPs || mx) ? nullptr : cur_ps(paramGen);
     if (g_trace > 0) {
         fprintf(stderr, "[gfx]   shaders vs=%016llX ok=%d ps=%016llX ok=%d vte=%08X mode=%08X blend0=%08X cc=%08X psconst=%08X tf:", (unsigned long long)vs->hash, (int)vs->ok,
                 ps ? (unsigned long long)ps->hash : 0ull, ps ? (int)ps->ok : -1, g_regs[R_VTE_CNTL], g_regs[R_MODE_CNTL], g_regs[R_BLEND0], g_regs[R_COLORCONTROL], g_regs[0x2308]);
@@ -2738,6 +2775,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         for (auto& u : vs->vf) { uint32_t f0 = g_regs[R_FETCH + u.slot * 2], f1 = g_regs[R_FETCH + u.slot * 2 + 1]; fprintf(stderr, " %u:addr=%08X,words=%u,end=%u,stride=%u", u.slot, f0 & ~3u, (f1 >> 2) & 0xFFFFFF, f1 & 3, u.stride); }
         fprintf(stderr, "\n");
     }
+    DP(1);
     if (!shaders_ready(vs, ps, prim == 8 || mx)) return;                    // a memexport draw left out would lose the memory it writes
     if (!vs->ok) return;
     if (ps && !ps->ok) ps = nullptr;
@@ -2782,6 +2820,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         memcpy(g_curRtv, rtvs, sizeof(rtvs)); g_curDsv = dsv;
     }
 
+    DP(2);
     // ---- indices ----
     static std::vector<uint32_t> idx;
     idx.clear();
@@ -2859,40 +2898,71 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
             while (g_ctx->GetData(q.Get(), &done, sizeof(done), 0) != S_OK || !done) YieldProcessor();
         }
     }
+    DP(3);
     // ---- vertex data ----
     int32_t indexOffset = (int32_t)(g_regs[R_INDX_OFFSET] & 0xFFFFFF);
     indexOffset = sext(indexOffset, 24);
     static StateCb cb;
     memset(cb.vfo, 0, sizeof(cb.vfo));
+    // Streams already copied into the current ring buffer this frame are reused: instanced fleets draw the same 1-2 MB stream hundreds of
+    // times a frame, and copying (and byte-swapping) it for each draw made the zoom-out at the start of episode 1 run at 20 fps.
+    // An entry holds while the ring buffer is the same one, no memexport wrote memory, and a sampled checksum of the guest data still matches.
+    struct VbCached { uint32_t off = 0, size = 0, sum = 0; uint64_t gen = ~0ull, frame = ~0ull, epoch = 0; };
+    static std::unordered_map<uint64_t, VbCached> vbCache;
+    static uint64_t vbCacheFrame = ~0ull;
+    if (vbCacheFrame != g_frame) { vbCache.clear(); vbCacheFrame = g_frame; }  // entries only live for their frame
+    static const bool kNoVbCache = getenv("ASURA_NOVBCACHE") != nullptr;     // for comparison
+    auto vb_sum = [](const uint8_t* p, uint32_t size) {                      // 64 dwords spread over the stream, plus its ends
+        uint32_t h = 2166136261u;
+        const uint32_t n = size / 4, step = std::max(1u, n / 64);
+        for (uint32_t i = 0; i < n; i += step) { uint32_t v; memcpy(&v, p + i * 4, 4); h = (h ^ v) * 16777619u; }
+        if (n) { uint32_t v; memcpy(&v, p + (n - 1) * 4, 4); h = (h ^ v) * 16777619u; }
+        return h;
+    };
+    struct VbPlan { uint32_t slot, addr, endian, size; uint64_t first, key; uint32_t sum; const VbCached* hit; };
+    VbPlan plan[32]; int nPlan = 0;
     {   // All of a draw's streams must land in the same ring buffer: the draw binds one. vb_alloc moves to the next buffer when the current one
         // is full, and when that happened between two streams, the earlier stream was read from the new buffer at its old offset: one draw in one
         // frame got another mesh's UVs or normals (faces and ships flickering to other surfaces, differently each run). Reserve the room first.
-        uint64_t total = 0;
+        uint64_t missBytes = 0;
         for (auto& u : vs->vf) {
             uint32_t f0 = g_regs[R_FETCH + u.slot * 2], f1 = g_regs[R_FETCH + u.slot * 2 + 1];
-            if ((f0 & 3) == 3) total += align_up((uint32_t)std::min<uint64_t>((uint64_t)((f1 >> 2) & 0xFFFFFF) * 4 + 64, kVbRingSize / 2), 16);
+            if ((f0 & 3) != 3) { logf_once("vfbad", "vertex fetch constant %u has type %u", u.slot, f0 & 3); continue; }
+            uint32_t addr = f0 & ~3u, endian = f1 & 3, words = (f1 >> 2) & 0xFFFFFF;
+            uint32_t strideB = u.stride * 4;
+            uint64_t first = strideB ? (uint64_t)std::max<int64_t>(0, (int64_t)minI + indexOffset) * strideB : 0;
+            uint64_t last = strideB ? ((uint64_t)((int64_t)maxI + indexOffset) + 1) * strideB : (uint64_t)words * 4;
+            uint64_t avail = (uint64_t)words * 4;
+            if (last > avail) last = avail;
+            if (first >= last) { first = 0; last = std::min<uint64_t>(avail, 4096); }
+            // Upload the whole stream: the index buffer doesn't say which vertices a shader reads. Instanced meshes compute vertex = index mod instance size
+            // in the vertex shader (vs 2090BFF4A9951B2D), so instance 5's indices are large while it reads the first vertices of the stream. A range taken from
+            // the indices missed those, and the shader read whatever sat nearby in the ring: stray black geometry and heavy flicker, even with a still camera.
+            // BCR2_VBRANGE restores the narrow upload, for comparison.
+            static const bool kVbRange = getenv("ASURA_VBRANGE") != nullptr;
+            if (!kVbRange) { first = 0; last = avail; }
+            uint32_t size = (uint32_t)std::min<uint64_t>(last - first + 64, kVbRingSize / 2);
+            if ((first + size) > avail) size = (uint32_t)(avail - first);
+            if (size == 0 || nPlan >= 32) continue;
+            VbPlan& p = plan[nPlan++];
+            p.slot = u.slot; p.addr = addr; p.endian = endian; p.size = size; p.first = first;
+            p.key = ((uint64_t)(addr + (uint32_t)first) << 32) ^ ((uint64_t)size << 2) ^ endian;
+            p.sum = kNoVbCache ? 0 : vb_sum(phys(addr + (uint32_t)first), size);
+            p.hit = nullptr;
+            if (!kNoVbCache) {
+                auto it = vbCache.find(p.key);
+                if (it != vbCache.end() && it->second.gen == g_vbGen && it->second.frame == g_frame && it->second.epoch == g_mxEpoch && it->second.size == size && it->second.sum == p.sum)
+                    p.hit = &it->second;
+            }
+            if (!p.hit) missBytes += align_up(size, 16);
         }
-        vb_reserve(total);
+        if (missBytes && vb_reserve(missBytes)) for (int i = 0; i < nPlan; i++) plan[i].hit = nullptr;   // a fresh buffer: copy everything again
     }
-    for (auto& u : vs->vf) {
-        uint32_t f0 = g_regs[R_FETCH + u.slot * 2], f1 = g_regs[R_FETCH + u.slot * 2 + 1];
-        if ((f0 & 3) != 3) { logf_once("vfbad", "vertex fetch constant %u has type %u", u.slot, f0 & 3); continue; }
-        uint32_t addr = f0 & ~3u, endian = f1 & 3, words = (f1 >> 2) & 0xFFFFFF;
-        uint32_t strideB = u.stride * 4;
-        uint64_t first = strideB ? (uint64_t)std::max<int64_t>(0, (int64_t)minI + indexOffset) * strideB : 0;
-        uint64_t last = strideB ? ((uint64_t)((int64_t)maxI + indexOffset) + 1) * strideB : (uint64_t)words * 4;
-        uint64_t avail = (uint64_t)words * 4;
-        if (last > avail) last = avail;
-        if (first >= last) { first = 0; last = std::min<uint64_t>(avail, 4096); }
-        // Upload the whole stream: the index buffer doesn't say which vertices a shader reads. Instanced meshes compute vertex = index mod instance size
-        // in the vertex shader (vs 2090BFF4A9951B2D), so instance 5's indices are large while it reads the first vertices of the stream. A range taken from
-        // the indices missed those, and the shader read whatever sat nearby in the ring: stray black geometry and heavy flicker, even with a still camera.
-        // BCR2_VBRANGE restores the narrow upload, for comparison.
-        static const bool kVbRange = getenv("ASURA_VBRANGE") != nullptr;
-        if (!kVbRange) { first = 0; last = avail; }
-        uint32_t size = (uint32_t)std::min<uint64_t>(last - first + 64, kVbRingSize / 2);
-        if ((first + size) > avail) size = (uint32_t)(avail - first);
-        if (size == 0) continue;
+    for (int pi = 0; pi < nPlan; pi++) {
+        const VbPlan& p = plan[pi];
+        if (p.hit) { cb.vfo[p.slot] = p.hit->off - (uint32_t)p.first; continue; }
+        const uint32_t addr = p.addr, endian = p.endian, size = p.size; const uint64_t first = p.first;
+        struct { uint32_t slot; } u{ p.slot };
         uint8_t* ptr = nullptr;
         uint32_t off = vb_alloc(size, ptr);
         const uint8_t* src = phys(addr + (uint32_t)first);
@@ -2910,8 +2980,10 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         }
         vb_commit(off, size, ptr);
         cb.vfo[u.slot] = off - (uint32_t)first;
+        if (!kNoVbCache) { VbCached& e = vbCache[p.key]; e.off = off; e.size = size; e.sum = p.sum; e.gen = g_vbGen; e.frame = g_frame; e.epoch = g_mxEpoch; }
     }
 
+    DP(4);
     // ---- textures and samplers ----
     ID3D11ShaderResourceView* srvs[32] = {};
     ID3D11SamplerState* samps[16] = {};
@@ -3038,6 +3110,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         g_ctx->PSSetSamplers(0, 16, psKeepS);
     }
 
+    DP(5);
     // ---- viewport mapping into shader constants ----
     uint32_t vte = g_regs[R_VTE_CNTL];
     float xs = (vte & 1) ? reg_f(R_VPORT_XSCALE) : 1, xo = (vte & 2) ? reg_f(R_VPORT_XSCALE + 1) : 0;
@@ -3096,6 +3169,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     g_ctx->IASetInputLayout(nullptr);
     g_ctx->IASetPrimitiveTopology(topo);
 
+    DP(6);
     // ---- fixed-function ----
     float blendF[4] = { reg_f(R_BLEND_RED), reg_f(R_BLEND_RED + 1), reg_f(R_BLEND_RED + 2), reg_f(R_BLEND_RED + 3) };
     g_ctx->OMSetBlendState(get_blend(mask), blendF, 0xFFFFFFFFu);
@@ -3166,6 +3240,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         static const char* kSkip = getenv("ASURA_SKIPVS");
         if (kSkip && S("%016llX", (unsigned long long)vs->hash).compare(0, strlen(kSkip), kSkip) == 0) return;   // a prefix is enough (the draw ring shows the first 8 digits)
     }
+    DP(7);
     if (useIdx) {
         uint32_t bytes = drawCount * 4;
         if (bytes > kIbRingSize) { logf_once("ibbig", "index data too large"); return; }
@@ -4119,6 +4194,7 @@ static void do_swap(uint32_t front) {
                 fprintf(stderr, "[perf] frame=%llu fps=%.1f ms/frame=%.2f draws=%.0f res=%.0f | draw=%.2f (tex=%.2f) resolve=%.2f present=%.2f | wait ring=%.2f reg=%.2f intr=%.2f\n",
                         (unsigned long long)g_frame, n * 1000.0 / ms, ms / n, (double)(g_draws - lastDraws) / n, (double)(g_resolves - lastRes) / n,
                         g_tDraw / n, g_tTex / n, g_tResolve / n, g_tPresent / n, w0 / n, w1 / n, w2 / n);
+                drawprof_report(n);
             }
             last = now; lastFrame = g_frame + 1; lastDraws = g_draws; lastRes = g_resolves;
             g_tDraw = g_tTex = g_tResolve = g_tPresent = 0;
@@ -4160,9 +4236,13 @@ void gpu_packet(uint8_t* base, uint32_t op, const uint32_t* b, uint32_t cnt) {
     }
     auto load_shader = [&](uint32_t type, const uint32_t* data, uint32_t n, bool fromMem, uint32_t addr) {
         auto& code = type == 0 ? g_vsCode : g_psCode;
-        code.resize(n);
-        if (fromMem) for (uint32_t i = 0; i < n; i++) code[i] = _byteswap_ulong(*(const uint32_t*)phys(addr + i * 4));
-        else memcpy(code.data(), data, n * 4);
+        static std::vector<uint32_t> incoming;
+        incoming.resize(n);
+        if (fromMem) for (uint32_t i = 0; i < n; i++) incoming[i] = _byteswap_ulong(*(const uint32_t*)phys(addr + i * 4));
+        else memcpy(incoming.data(), data, n * 4);
+        if (incoming.size() == code.size() && !memcmp(incoming.data(), code.data(), n * 4)) return;   // the same shader again: keep its generation
+        code.swap(incoming);
+        (type == 0 ? g_vsGen : g_psGen)++;
     };
     auto const_base = [](uint32_t ot, uint32_t& idx) {
         idx = ot & 0x7FF;
