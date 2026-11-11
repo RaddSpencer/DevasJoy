@@ -459,7 +459,7 @@ static void sampler_thread() {
                 for (auto& kv : counts) v.push_back({ kv.second, kv.first });
                 std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.first > b.first; });
                 fprintf(stderr, "[sample] frame %llu took %llu ms, %u samples:\n", (unsigned long long)frame, (unsigned long long)(now - t0), samples);
-                for (size_t i = 0; i < v.size() && i < 14; i++) fprintf(stderr, "[sample]   %4u %s\n", v[i].first, v[i].second.c_str());
+                for (size_t i = 0; i < v.size() && i < 30; i++) fprintf(stderr, "[sample]   %4u %s\n", v[i].first, v[i].second.c_str());
                 fflush(stderr);
             }
             counts.clear(); samples = 0; frame = f; t0 = now;
@@ -477,7 +477,7 @@ static void sampler_thread() {
                 PPCContext* x = s.ctx.load();
                 if (!x) continue;
                 int n = snprintf(b, sizeof b, "t%u run lr=%08X <", tid, (uint32_t)x->lr);
-                for (uint32_t sp = x->r1.u32, k = 0; k < 3 && sp >= 0x40000000u && sp < 0x7F000000u; k++) {
+                for (uint32_t sp = x->r1.u32, k = 0; k < 6 && sp >= 0x40000000u && sp < 0x7F000000u; k++) {
                     if (IsBadReadPtr(g_base + sp, 4)) break;
                     uint32_t next = rd32(sp);
                     if (next <= sp || next - sp > 0x100000 || IsBadReadPtr(g_base + next - 8, 4)) break;
@@ -725,7 +725,18 @@ void file_close(uint32_t handle);   // kfile.cpp
 static void NtClose_(PPCContext& ctx, uint8_t*) { file_close(ctx.r3.u32); handle_close(ctx.r3.u32); ctx.r3.u64 = STATUS_SUCCESS; }
 
 // critical sections: one host recursive mutex per guest critical section
-struct GuestCs { std::recursive_mutex m; std::atomic<uint64_t> takes{0}; };
+// Fair: when a thread is waiting, a release hands the lock to the waiters in arrival order, and the releasing thread can't take it straight
+// back. A host recursive mutex let a thread that unlocks and relocks in a loop starve a waiter: at camera cuts a loader thread (its loop in
+// sub_82239588) took this lock 48,000 times in 141 ms while the render thread waited for it, for 0.1 to 0.4 s per cut.
+// ASURA_UNFAIRCS=1 keeps the old mutex, for comparison.
+struct GuestCs {
+    std::mutex m; std::condition_variable cv;
+    DWORD owner = 0; uint32_t depth = 0;
+    uint64_t nextTicket = 0, serving = 0; uint32_t waiters = 0;
+    std::recursive_mutex unfair;
+    std::atomic<uint64_t> takes{0};
+};
+static const bool g_unfairCs = getenv("ASURA_UNFAIRCS") != nullptr;
 static std::mutex g_csMapLock;
 static std::unordered_map<uint32_t, std::unique_ptr<GuestCs>> g_cs;
 static GuestCs& cs_get(uint32_t cs) {
@@ -734,19 +745,54 @@ static GuestCs& cs_get(uint32_t cs) {
     if (!p) p = std::make_unique<GuestCs>();
     return *p;
 }
+static bool cs_try(GuestCs& c, DWORD self) {                                // caller holds c.m
+    if (c.owner == self) { c.depth++; return true; }
+    if (c.owner == 0 && c.waiters == 0) { c.owner = self; c.depth = 1; return true; }
+    return false;
+}
 static void RtlInitializeCriticalSection_(PPCContext& ctx, uint8_t*) { cs_get(ctx.r3.u32); ctx.r3.u64 = 0; }
 static void RtlEnterCriticalSection_(PPCContext& ctx, uint8_t*) {
     auto& c = cs_get(ctx.r3.u32);
-    if (c.m.try_lock()) { c.takes++; return; }
+    if (g_unfairCs) {
+        if (c.unfair.try_lock()) { c.takes++; return; }
+        MonWait mw("critical section", ctx.r3.u32);
+        c.unfair.lock(); c.takes++;
+        return;
+    }
+    const DWORD self = GetCurrentThreadId();
+    std::unique_lock<std::mutex> lk(c.m);
+    if (cs_try(c, self)) { c.takes++; return; }
     MonWait mw("critical section", ctx.r3.u32);
     const uint64_t before = c.takes.load(); const ULONGLONG t0 = GetTickCount64();
-    c.m.lock(); c.takes++;
+    const uint64_t ticket = c.nextTicket++;
+    c.waiters++;
+    c.cv.wait(lk, [&] { return c.owner == 0 && c.serving == ticket; });
+    c.waiters--; c.serving++;
+    c.owner = self; c.depth = 1; c.takes++;
+    if (c.waiters) c.cv.notify_all();                                       // the next ticket may now be waiting for the lock to be released
+    lk.unlock();
     const ULONGLONG ms = GetTickCount64() - t0;
     if (ms >= 100 && g_logging)                                             // a long wait: was the lock held throughout, or taken by others meanwhile?
         fprintf(stderr, "[cs] %08X: waited %llu ms (lr %08X); others took it %llu times meanwhile\n", ctx.r3.u32, (unsigned long long)ms, (uint32_t)ctx.lr, (unsigned long long)(c.takes.load() - before - 1));
 }
-static void RtlLeaveCriticalSection_(PPCContext& ctx, uint8_t*) { cs_get(ctx.r3.u32).m.unlock(); }
-static void RtlTryEnterCriticalSection_(PPCContext& ctx, uint8_t*) { auto& c = cs_get(ctx.r3.u32); const bool ok = c.m.try_lock(); if (ok) c.takes++; ctx.r3.u64 = ok ? 1 : 0; }
+static void RtlLeaveCriticalSection_(PPCContext& ctx, uint8_t*) {
+    auto& c = cs_get(ctx.r3.u32);
+    if (g_unfairCs) { c.unfair.unlock(); return; }
+    std::lock_guard<std::mutex> lk(c.m);
+    // The game sometimes releases a section from another thread than took it (startup hung at "checking for downloadable content" when
+    // that was refused). Release it whoever calls, as the old mutex did.
+    if (c.depth == 0) return;
+    if (c.owner != GetCurrentThreadId()) { static int n = 0; if (n++ < 5 && g_logging) fprintf(stderr, "[cs] %08X released by another thread than took it (lr %08X)\n", ctx.r3.u32, (uint32_t)ctx.lr); }
+    if (--c.depth == 0) { c.owner = 0; if (c.waiters) c.cv.notify_all(); }
+}
+static void RtlTryEnterCriticalSection_(PPCContext& ctx, uint8_t*) {
+    auto& c = cs_get(ctx.r3.u32);
+    bool ok;
+    if (g_unfairCs) ok = c.unfair.try_lock();
+    else { std::lock_guard<std::mutex> lk(c.m); ok = cs_try(c, GetCurrentThreadId()); }
+    if (ok) c.takes++;
+    ctx.r3.u64 = ok ? 1 : 0;
+}
 
 // spin locks: a guest word, 0 = free
 static void spin_acquire(uint32_t a) {
