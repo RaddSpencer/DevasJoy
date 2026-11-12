@@ -201,8 +201,12 @@ static void vsync_thread() {
     g_vsyncThread = make_host_guest_thread("vsync");
     auto next = std::chrono::steady_clock::now();
     uint64_t n = 0;
+    // ASURA_VBLANKHZ=<hz> (experiment, default 60): the rate of the vblank interrupt. The game presents every second vblank, so 120 asks it for 60 fps.
+    static const int kHz = getenv("ASURA_VBLANKHZ") ? std::max(atoi(getenv("ASURA_VBLANKHZ")), 1) : 60;
+    const auto period = std::chrono::microseconds(1000000 / kHz);
+    if (kHz != 60) LOG("[gpu] vblank at %d Hz (ASURA_VBLANKHZ)\n", kHz);
     for (;;) {
-        next += std::chrono::microseconds(16667);
+        next += period;
         std::this_thread::sleep_until(next);
         if (std::chrono::steady_clock::now() > next + std::chrono::milliseconds(50)) next = std::chrono::steady_clock::now();
         wr32(reg_addr(0x1951), 1);                        // D1MODE_VBLANK_STATUS

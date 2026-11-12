@@ -91,6 +91,13 @@ struct PerfScope {
 
 void gpu_reg(uint32_t r, uint32_t v) {
     if (r >= 0x10000) return;
+    {   // ASURA_CONSTWATCH: every write to the watched constant, however it arrives (type-0 register writes included), while tracing
+        static const int kW = getenv("ASURA_CONSTWATCH") ? atoi(getenv("ASURA_CONSTWATCH")) : -1;
+        if (kW >= 0 && g_trace > 0 && r >= R_CONST + kW * 4u && r < R_CONST + kW * 4u + 4) {
+            float f; memcpy(&f, &v, 4);
+            fprintf(stderr, "[constreg] c%d.%c = %g (%08X)\n", kW, "xyzw"[r - R_CONST - kW * 4], f, v);
+        }
+    }
     g_regs[r] = v;
     if (r >= R_CONST && r < R_CONST + 0x800) g_constDirty = true;
     if (r == 0x1922) g_lutIndex = v & 0xFF;                                 // DC_LUT_RW_INDEX
@@ -2786,7 +2793,58 @@ static bool fast_clear(bool withColor) {
     g_ctx->OMSetRenderTargets(1, none, nullptr);
     invalidate_binds();
     Rt* depth = get_depth_rt(base, hostPitch);
-    g_ctx->ClearDepthStencilView(depth->dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, z, (UINT8)stencil);
+    // The rectangle it covers. UE3 packs every shadow caster's depth map into one atlas at the same EDRAM base and clears each
+    // caster's tile this way before drawing it; clearing the whole host target erased every caster drawn before, so only the last
+    // one's shadow map survived and the crowd's lighting popped as the draw order changed (episode 1, Shinkoku). Host rows are the
+    // vertex positions (a window offset does not move host targets), clipped to the scissor; samples per pixel scale them.
+    D3D11_RECT clr{ 0, 0, (LONG)(depth->w * g_resScale), (LONG)(depth->h * g_resScale) };
+    bool partial = false;
+    {
+        static const bool kWhole = getenv("ASURA_FASTCLEARWHOLE") != nullptr;
+        const uint32_t strideW = ((vf[1] >> 2) & 0xFFFFFF) / 3;
+        if (!kWhole && msaa != 1 && strideW >= 2 && !(g_regs[R_VTE_CNTL] & 0x3F)) {
+            auto rdv = [&](uint32_t a) { uint32_t w = *(const uint32_t*)phys(a);
+                if (endian == 2) w = _byteswap_ulong(w); else if (endian == 1) w = ((w & 0xFF00FF00u) >> 8) | ((w & 0x00FF00FFu) << 8); else if (endian == 3) w = (w >> 16) | (w << 16);
+                float f; memcpy(&f, &w, 4); return f; };
+            float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+            for (uint32_t k = 0; k < 3; k++) {
+                const float x = rdv(vaddr + k * strideW * 4), y = rdv(vaddr + k * strideW * 4 + 4);
+                x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y);
+            }
+            int sx0, sy0, sx1, sy1, tx, ty;
+            compute_scissor(sx0, sy0, sx1, sy1); host_tile_shift(tx, ty);
+            const int ss = msaa >= 2 ? 2 : 1;                                   // 4x: 2x2 samples per pixel
+            int rx0 = std::max((int)lroundf(x0), sx0 + tx), ry0 = std::max((int)lroundf(y0), sy0 + ty);
+            int rx1 = std::min((int)lroundf(x1), sx1 + tx), ry1 = std::min((int)lroundf(y1), sy1 + ty);
+            rx0 = std::max(rx0, 0) * ss * g_resScale; ry0 = std::max(ry0, 0) * ss * g_resScale;
+            rx1 = std::min(rx1 * ss * g_resScale, (int)clr.right); ry1 = std::min(ry1 * ss * g_resScale, (int)clr.bottom);
+            if (rx1 <= rx0 || ry1 <= ry0) return true;                          // nothing covered
+            if (rx0 > 0 || ry0 > 0 || rx1 < clr.right || ry1 < clr.bottom) { clr = { rx0, ry0, rx1, ry1 }; partial = true; }
+        }
+    }
+    if (!partial) g_ctx->ClearDepthStencilView(depth->dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, z, (UINT8)stencil);
+    else {
+        sync_depth_alias(depth, base, hostPitch);                               // the rest of the target keeps its contents
+        ID3D11ShaderResourceView* nul[32] = {};
+        g_ctx->PSSetShaderResources(0, 32, nul);
+        g_ctx->OMSetRenderTargets(0, nullptr, depth->dsv.Get());
+        invalidate_binds();
+        g_ctx->VSSetShader(g_vsBlit.Get(), nullptr, 0);
+        g_ctx->PSSetShader(nullptr, nullptr, 0);                                // depth from the viewport: blit z is 0, MinDepth = MaxDepth = z
+        g_ctx->GSSetShader(nullptr, nullptr, 0);
+        g_ctx->IASetInputLayout(nullptr);
+        g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+        // z on, write, always; stencil on, always, replace on every path; read and write masks FF
+        const uint32_t dcClr = 1u | 2u | 4u | (7u << 4) | (7u << 8) | (2u << 11) | (2u << 14) | (2u << 17);
+        g_ctx->OMSetDepthStencilState(get_ds(dcClr, 0xFFFF00u, 0), stencil);
+        g_ctx->RSSetState(get_rs(0, true, true, 0, 0));
+        D3D11_VIEWPORT vp{ 0, 0, (float)(depth->w * g_resScale), (float)(depth->h * g_resScale), z, z };
+        g_ctx->RSSetViewports(1, &vp);
+        g_ctx->RSSetScissorRects(1, &clr);
+        g_ctx->Draw(3, 0);
+        invalidate_binds();
+    }
     depth->seq = ++g_rtSeq;
     // Every colour target at this base and pitch shares those EDRAM bits, whatever its format. UE3 clears its 7e3 scene target
     // (format 3) this way each frame; clearing only the 8-bit views left the scene uncleared wherever no geometry drew (the
@@ -2805,7 +2863,8 @@ static bool fast_clear(bool withColor) {
             for (int i = 0; i < 3; i++) c[i] = is_7e3_float(f) ? from7e3(ch[i]) : ch[i] / 1023.0f;
             c[3] = (word >> 30) / 3.0f;
         } else continue;                                                    // 64-bit and other formats: only a zero word is known to be safe
-        g_ctx->ClearRenderTargetView(kv.second->rtv.Get(), c);
+        if (partial) { if (g_ctx1) g_ctx1->ClearView(kv.second->rtv.Get(), c, &clr, 1); }
+        else g_ctx->ClearRenderTargetView(kv.second->rtv.Get(), c);
         kv.second->seq = g_rtSeq - 1;
     }
     if (withColor) {
@@ -2825,13 +2884,15 @@ static bool fast_clear(bool withColor) {
             uint64_t key = ((uint64_t)(ci & 0xFFF) << 32) | ((uint64_t)((ci >> 16) & 0xF) << 16) | (hostPitch & 0xFFFF);
             if (i == 0 || g_rts.count(key)) {                               // later slots may hold stale registers: only touch known targets
                 Rt* r = get_color_rt(ci & 0xFFF, (ci >> 16) & 0xF, hostPitch);
-                g_ctx->ClearRenderTargetView(r->rtv.Get(), vc);
+                if (partial) { if (g_ctx1) g_ctx1->ClearView(r->rtv.Get(), vc, &clr, 1); }
+                else g_ctx->ClearRenderTargetView(r->rtv.Get(), vc);
                 r->seq = g_rtSeq - 1;
             }
         }
     }
     static int nl = 0;
-    if (nl++ < 6 || g_trace > 0) fprintf(stderr, "[gfx] fast clear base=%X pitch=%u(%u) z=%g stencil=%u word=%08X\n", base, pitch, hostPitch, z, stencil, word);
+    if (nl++ < 6 || g_trace > 0) fprintf(stderr, "[gfx] fast clear base=%X pitch=%u(%u) z=%g stencil=%u word=%08X rect=%ld,%ld-%ld,%ld%s\n", base, pitch, hostPitch, z, stencil, word,
+                                         clr.left, clr.top, clr.right, clr.bottom, partial ? " (part)" : "");
     return true;
 }
 
@@ -2956,6 +3017,19 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     static const char* kDepthSolid = getenv("ASURA_DEPTHSOLID");              // comma-separated vertex shader hashes: only these depth-only draws skip the pixel shader
     const bool skipPs = depthOnly && !kDepthKeepPs && (!kDepthSolid || strstr(kDepthSolid, S("%016llX", (unsigned long long)vs->hash).substr(0, 8).c_str()));
     XShader* ps = (g_psCode.empty() || skipPs || mx) ? nullptr : cur_ps(paramGen);
+    {   // ASURA_CONSTLOG="<ps hash>:<from>-<to>": in those frames, each draw with that pixel shader logs its vertex count and pixel constants c256-c285
+        static const char* kCl = getenv("ASURA_CONSTLOG");
+        static uint64_t clHash = 0, clFrom = 0, clTo = 0;
+        static bool parsed = false;
+        if (kCl && !parsed) { parsed = true; clHash = _strtoui64(kCl, nullptr, 16); if (const char* c = strchr(kCl, ':')) { clFrom = _strtoui64(c + 1, nullptr, 10); if (const char* m = strchr(c, '-')) clTo = _strtoui64(m + 1, nullptr, 10); } }
+        if (kCl && ps && ps->hash == clHash && g_frame >= clFrom && g_frame <= clTo) {
+            static uint64_t lastF = ~0ull; static int idx = 0;
+            if (g_frame != lastF) { lastF = g_frame; idx = 0; }
+            std::string s = S("[constlog] f=%llu i=%d vs=%08X n=%u vf=%08X", (unsigned long long)g_frame, idx++, (uint32_t)(vs->hash >> 32), num, g_regs[R_FETCH + 95 * 2] & ~3u);
+            for (int k = 256; k <= 285; k++) s += S(" c%d=%.4g,%.4g,%.4g,%.4g", k, reg_f(R_CONST + k * 4), reg_f(R_CONST + k * 4 + 1), reg_f(R_CONST + k * 4 + 2), reg_f(R_CONST + k * 4 + 3));
+            fprintf(stderr, "%s\n", s.c_str());
+        }
+    }
     if (g_trace > 0) {
         fprintf(stderr, "[gfx]   shaders vs=%016llX ok=%d ps=%016llX ok=%d vte=%08X mode=%08X blend0=%08X cc=%08X psconst=%08X tf:", (unsigned long long)vs->hash, (int)vs->ok,
                 ps ? (unsigned long long)ps->hash : 0ull, ps ? (int)ps->ok : -1, g_regs[R_VTE_CNTL], g_regs[R_MODE_CNTL], g_regs[R_BLEND0], g_regs[R_COLORCONTROL], g_regs[0x2308]);
@@ -3615,22 +3689,25 @@ static void draw_sprites(int px, int py, int pw, int ph) {
     }
 }
 
-// The Graphics Options menu (options.cpp) over the 16:9 picture: a centred panel, its picture redrawn by the menu when anything changes.
+// Pictures the host draws over the frame (options.cpp): the Graphics Options menu, a centred panel, and the FPS counter in the top-left corner.
+// Each is premultiplied RGBA that its owner redraws only when it changed (version); here it is uploaded and blended over the back buffer.
 bool options_picture(int w, int h, std::vector<uint8_t>& rgba, uint64_t& version);
-static void draw_options(int px, int py, int pw, int ph) {
-    static ComPtr<ID3D11Texture2D> tex; static ComPtr<ID3D11ShaderResourceView> srv; static ComPtr<ID3D11BlendState> blendPre;
-    static uint64_t version = 0, uploaded = ~0ull; static int tw = 0, th = 0; static std::vector<uint8_t> px32;
-    const int w = std::max(pw * 11 / 20, 1), h = std::max(ph * 11 / 20, 1);
-    if (!options_picture(w, h, px32, version)) return;                      // closed
-    if (!tex || tw != w || th != h) {
-        tex.Reset(); srv.Reset(); uploaded = ~0ull;
+bool fps_picture(int w, int h, std::vector<uint8_t>& rgba, uint64_t& version);
+struct OverlayPic { ComPtr<ID3D11Texture2D> tex; ComPtr<ID3D11ShaderResourceView> srv; uint64_t version = 0, uploaded = ~0ull; int tw = 0, th = 0; std::vector<uint8_t> px; };
+static void draw_overlay(OverlayPic& o, bool (*picture)(int, int, std::vector<uint8_t>&, uint64_t&), int x, int y, int w, int h) {
+    static ComPtr<ID3D11BlendState> blendPre;
+    w = std::max(w, 1); h = std::max(h, 1);
+    if (!picture(w, h, o.px, o.version)) return;                            // nothing to show
+    if (!o.tex || o.tw != w || o.th != h) {
+        o.tex.Reset(); o.srv.Reset(); o.uploaded = ~0ull;
         D3D11_TEXTURE2D_DESC d{}; d.Width = w; d.Height = h; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_R8G8B8A8_UNORM; d.SampleDesc.Count = 1;
         d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &tex))) return;
-        g_dev->CreateShaderResourceView(tex.Get(), nullptr, &srv);
-        tw = w; th = h;
+        if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &o.tex))) return;
+        g_dev->CreateShaderResourceView(o.tex.Get(), nullptr, &o.srv);
+        o.tw = w; o.th = h;
     }
-    if (uploaded != version && px32.size() == (size_t)w * h * 4) { g_ctx->UpdateSubresource(tex.Get(), 0, nullptr, px32.data(), w * 4, 0); uploaded = version; }
+    if (o.uploaded != o.version && o.px.size() == (size_t)w * h * 4) { g_ctx->UpdateSubresource(o.tex.Get(), 0, nullptr, o.px.data(), w * 4, 0); o.uploaded = o.version; }
+    ComPtr<ID3D11ShaderResourceView>& srv = o.srv;
     sprite_pipeline();
     if (!blendPre) {
         D3D11_BLEND_DESC bd{}; bd.RenderTarget[0].BlendEnable = TRUE;
@@ -3640,7 +3717,7 @@ static void draw_options(int px, int py, int pw, int ph) {
         g_dev->CreateBlendState(&bd, &blendPre);
     }
     if (!g_psSprite || !srv || !blendPre) return;
-    const float dx0 = (float)(px + (pw - w) / 2), dy0 = (float)(py + (ph - h) / 2);
+    const float dx0 = (float)x, dy0 = (float)y;
     ID3D11ShaderResourceView* nul[32] = {};
     g_ctx->PSSetShaderResources(0, 32, nul);
     ID3D11RenderTargetView* rtv = g_backRtv.Get();
@@ -3669,6 +3746,13 @@ static void draw_options(int px, int py, int pw, int ph) {
     g_ctx->Draw(3, 0);
     g_ctx->PSSetShaderResources(0, 1, nul);
     g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+}
+static void draw_options(int px, int py, int pw, int ph) {
+    static OverlayPic menu, fps;
+    const int mw = pw * 11 / 20, mh = ph * 11 / 20;
+    draw_overlay(menu, options_picture, px + (pw - mw) / 2, py + (ph - mh) / 2, mw, mh);
+    const int fh = std::max(ph / 24, 12), fw = fh * 6;                       // a small box in the top-left corner of the picture
+    draw_overlay(fps, fps_picture, px + fh / 2, py + fh / 2, fw, fh);
 }
 
 // The startup screen while shaders compile: white text on black in the game's own font, centred. The text is pictures of the game's rendering of it
@@ -4538,6 +4622,17 @@ static void do_swap(uint32_t front) {
     if ((g_frame % 600) == 0) fprintf(stderr, "[gfx] frame=%llu draws=%llu resolves=%llu\n", (unsigned long long)g_frame, (unsigned long long)g_draws, (unsigned long long)g_resolves);
 }
 
+// ASURA_CONSTWATCH=<float constant number>: while a frame is traced (ASURA_DUMPFRAME), log each packet that writes that constant,
+// with its kind, the values and (LOAD_ALU_CONSTANT) the memory address it read, between the draw lines.
+static void const_watch(const char* kind, uint32_t idx, uint32_t n, const uint32_t* v, uint32_t addr) {
+    static const int kC = getenv("ASURA_CONSTWATCH") ? atoi(getenv("ASURA_CONSTWATCH")) : -1;
+    if (kC < 0 || g_trace <= 0) return;
+    const uint32_t lo = R_CONST + kC * 4;
+    if (idx + n <= lo || idx >= lo + 4) return;
+    std::string s = S("[constwatch] %s regs %X..%X (c%u..c%u) addr=%08X c%d=", kind, idx, idx + n - 1, (idx - R_CONST) / 4, (idx + n - 1 - R_CONST) / 4, addr, kC);
+    for (uint32_t k = 0; k < 4; k++) { const uint32_t r = lo + k; if (r >= idx && r < idx + n) { float f; memcpy(&f, &v[r - idx], 4); s += S("%g%s", f, k < 3 ? "," : ""); } else s += k < 3 ? "-," : "-"; }
+    fprintf(stderr, "%s\n", s.c_str());
+}
 // ---- packets ----
 void gpu_packet(uint8_t* base, uint32_t op, const uint32_t* b, uint32_t cnt) {
     static bool inited = false;
@@ -4609,15 +4704,18 @@ void gpu_packet(uint8_t* base, uint32_t op, const uint32_t* b, uint32_t cnt) {
         break; }
       case 0x2D: {                                                          // SET_CONSTANT
         uint32_t idx; if (!const_base(b[0], idx)) break;
+        const_watch("SET_CONSTANT", idx, cnt - 1, b + 1, 0);
         for (uint32_t k = 1; k < cnt; k++) gpu_reg(idx++, b[k]);
         break; }
       case 0x2F: {                                                          // LOAD_ALU_CONSTANT
         uint32_t idx; if (!const_base(b[1], idx)) break;
         uint32_t addr = b[0] & 0x3FFFFFFC, n = b[2] & 0xFFF;
+        if (g_trace > 0) { std::vector<uint32_t> v(n); for (uint32_t k = 0; k < n; k++) v[k] = _byteswap_ulong(*(const uint32_t*)phys(addr + k * 4)); const_watch("LOAD_ALU_CONSTANT", idx, n, v.data(), addr); }
         for (uint32_t k = 0; k < n; k++) gpu_reg(idx++, _byteswap_ulong(*(const uint32_t*)phys(addr + k * 4)));
         break; }
       case 0x55: case 0x56: {                                               // SET_CONSTANT2, SET_SHADER_CONSTANTS
         uint32_t idx = b[0] & 0xFFFF;
+        const_watch(op == 0x55 ? "SET_CONSTANT2" : "SET_SHADER_CONSTANTS", idx, cnt - 1, b + 1, 0);
         for (uint32_t k = 1; k < cnt; k++) gpu_reg(idx++, b[k]);
         break; }
       case 0x27: load_shader(b[0] & 3, nullptr, b[1] & 0xFFFF, true, b[0] & ~3u); break;   // IM_LOAD
