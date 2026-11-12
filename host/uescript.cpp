@@ -152,18 +152,26 @@ std::string ue_class_name(uint32_t o) {
 }
 
 static bool g_logOn = false;
-static long long g_first = -1, g_last = -1;
+static std::vector<std::pair<long long, long long>> g_ranges;     // ASURA_SCRIPTLOG="first,last[;first,last...]" (last -1: no end)
 static std::string g_filter;
 static bool scriptlog_active() {
     static bool init = false;
     if (!init) {
         init = true;
-        if (const char* e = getenv("ASURA_SCRIPTLOG")) { g_logOn = true; sscanf(e, "%lld,%lld", &g_first, &g_last); }
+        if (const char* e = getenv("ASURA_SCRIPTLOG")) {
+            g_logOn = true;
+            for (const char* p = e; p && *p; ) {
+                long long a = -1, b = -1;
+                if (sscanf(p, "%lld,%lld", &a, &b) >= 1) g_ranges.push_back({a, b});
+                p = strchr(p, ';'); if (p) p++;
+            }
+        }
         if (const char* f = getenv("ASURA_SCRIPTLOGFILTER")) { g_filter = f; for (auto& c : g_filter) c = (char)tolower(c); }
     }
     if (!g_logOn) return false;
     const long long f = (long long)gpu_frame_number();
-    return f >= g_first && (g_last < 0 || f <= g_last);
+    for (auto& r : g_ranges) if (f >= r.first && (r.second < 0 || f <= r.second)) return true;
+    return false;
 }
 static bool matches(const std::string& s) {
     if (g_filter.empty()) return true;
@@ -222,7 +230,38 @@ static void script_dump(uint32_t self, const std::string& cls, const std::string
 // LinkDesc FString at +0x0C, bits at +0x18 (top bit: impulse)}; "Success" is found by its description.
 static bool qte_skip(uint32_t self, uint32_t lr) {
     static const bool kOn = [] { const char* e = getenv("ASURA_QTESKIP"); return e && *e && strcmp(e, "0") != 0; }();
-    if (!kOn || lr != 0x82981250u || !readable(self, 0x100) || rd32(self) != 0x821BED08u) return false;
+    if (!kOn || lr != 0x82981250u || !readable(self, 0x120)) return false;   // any action run by this native update (subclasses too)
+    // Succeed only after about the time a player takes, so cinematics that expect the input window don't run ahead and then hold
+    // (the B mash at ~12,776 in episode 1). +0xDC: the time limit in seconds when the QTE has one (0 otherwise; a no-input QTE
+    // with 0.866 there ended after 26 frames); +0x118: presses needed (1, or 15/30 for the mashes). Wait half the limit (0.73 s,
+    // the window measured for a QTE with no limit, when unset); for a mash, about 0.12 s a press (the auto-answer's pace), at
+    // most half the limit. Until then the script Update is not run, so no prompt opens.
+    // Timed in real seconds, the same at any frame rate: each Update adds the wall time since the action's previous Update, capped
+    // at 0.1 s so a hitch doesn't count in full. A gap over 2 s (a pause menu, or the action run again later) starts the wait over.
+    struct Wait { LARGE_INTEGER first, last; double elapsed; };
+    static std::map<uint32_t, Wait> waits;
+    static const double kQpf = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return (double)f.QuadPart; }();
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    auto it = waits.find(self);
+    if (it == waits.end()) it = waits.emplace(self, Wait{now, now, 0.0}).first;
+    else {
+        const double gap = (now.QuadPart - it->second.last.QuadPart) / kQpf;
+        if (gap > 2.0) { it->second.first = now; it->second.elapsed = 0.0; }
+        else it->second.elapsed += gap < 0.1 ? gap : 0.1;
+        it->second.last = now;
+    }
+    float limit; { const uint32_t u = rd32(self + 0xDC); memcpy(&limit, &u, 4); }
+    if (!(limit > 0.05f && limit < 60.f)) limit = 0.73f;
+    const uint32_t presses = rd32(self + 0x118);
+    float wait = limit * 0.5f;
+    if (presses > 1 && presses <= 100) { const float m = presses * 0.12f; if (!rd32(self + 0xDC) || m < wait) wait = m; }
+    static const float kScale = [] { const char* e = getenv("ASURA_QTESKIPWAIT"); return e ? (float)atof(e) : 1.f; }();   // 0: at once
+    if (it->second.elapsed < wait * kScale) return true;
+    // An input replay (ASURA_INPUTPLAY, recorded with the QTEs answered at once) leaves the wait out, so its gameplay input still
+    // lines up with the game.
+    void input_clock_pause(uint64_t ms);
+    input_clock_pause((uint64_t)((now.QuadPart - it->second.first.QuadPart) / kQpf * 1000.0));
+    waits.erase(it);
     const uint32_t links = rd32(self + 0x78), n = rd32(self + 0x7C);
     bool fired = false;
     for (uint32_t i = 0; i < n && i < 8 && readable(links + i * 0x2C, 0x2C); i++) {
@@ -232,16 +271,49 @@ static bool qte_skip(uint32_t self, uint32_t lr) {
         fired = true;
     }
     if (!fired) { fprintf(stderr, "[qteskip] f=%llu %08X has no Success output: left to run\n", (unsigned long long)gpu_frame_number(), self); return false; }
-    wr32(self + 0xC4, (rd32(self + 0xC4) & ~0x10000000u) | 0x21000000u);
-    fprintf(stderr, "[qteskip] f=%llu %08X: Success\n", (unsigned long long)gpu_frame_number(), self);
+    // The flags as a real success leaves them (+0xC4 18800000 -> 2C800000 in a trace): not the "done" bit 0x01000000, which the
+    // native update sets itself after its end-of-QTE work (vtable+400/+404, sub_82980ED8). Setting it here skipped that work and
+    // left effects frozen after the QTE (the fire splatter after the B mash, the arm effect on Asura in the last stick QTE).
+    wr32(self + 0xC4, (rd32(self + 0xC4) & ~0x10000000u) | 0x24800000u);
+    fprintf(stderr, "[qteskip] f=%llu %08X: Success after %.2f s (limit %.2f, presses %u)\n", (unsigned long long)gpu_frame_number(), self, wait * kScale, limit, presses);
     return true;
+}
+
+// ASURA_QTETRACE=1 (debug): for each QTE action's script Update, log the full object once, then every dword in +0x80..+0x200 that
+// changed since the previous Update (hex and as float), to find the time-limit and timer fields.
+static void qte_trace(uint32_t self, uint32_t lr, uint32_t parms, const char* when) {
+    static const bool kOn = [] { const char* e = getenv("ASURA_QTETRACE"); return e && *e && strcmp(e, "0") != 0; }();
+    if (!kOn || lr != 0x82981250u || !readable(self, 0x200)) return;
+    static std::map<uint32_t, std::vector<uint32_t>> last;
+    auto& v = last[self];
+    const unsigned long long f = (unsigned long long)gpu_frame_number();
+    auto flt = [](uint32_t u) { float x; memcpy(&x, &u, 4); return x; };
+    if (v.empty()) {
+        v.resize(0x80);
+        std::string s = S("[qtetrace] f=%llu %08X first %s (dt %g):", f, self, when, readable(parms, 4) ? flt(rd32(parms)) : 0.f);
+        for (uint32_t o = 0; o < 0x200; o += 4) { v[o / 4] = rd32(self + o); s += S("%s%08X", o % 32 ? " " : S("\n[qtetrace]   +%03X ", o).c_str(), v[o / 4]); }
+        fprintf(stderr, "%s\n", s.c_str());
+        return;
+    }
+    std::string s;
+    for (uint32_t o = 0x80; o < 0x200; o += 4) {
+        const uint32_t u = rd32(self + o);
+        if (u != v[o / 4]) { s += S(" +%03X %08X->%08X (%g)", o, v[o / 4], u, flt(u)); v[o / 4] = u; }
+    }
+    const uint32_t links = rd32(self + 0x78), n = rd32(self + 0x7C);                // outputs being fired
+    for (uint32_t i = 0; i < n && i < 8 && readable(links + i * 0x2C, 0x2C); i++)
+        if (rd32(links + i * 0x2C + 0x18) & 0x80000000u) s += S(" fires \"%s\"", wide_at(rd32(links + i * 0x2C + 0x0C)).c_str());
+    if (!s.empty()) fprintf(stderr, "[qtetrace] f=%llu %08X %s:%s\n", f, self, when, s.c_str());
 }
 
 // UObject::ProcessEvent(UFunction*, void* parms, void* result): every script event sent from native code.
 PPC_FUNC_IMPL(__imp__sub_82260F60);
 PPC_FUNC(sub_82260F60) {
+    const uint32_t tSelf = ctx.r3.u32, tLr = (uint32_t)ctx.lr, tParms = ctx.r5.u32;
+    qte_trace(tSelf, tLr, tParms, "before");
     if (qte_skip(ctx.r3.u32, (uint32_t)ctx.lr)) return;
-    if (!scriptlog_active()) { __imp__sub_82260F60(ctx, base); return; }
+    static const bool kTrace = getenv("ASURA_QTETRACE") != nullptr;
+    if (!scriptlog_active()) { __imp__sub_82260F60(ctx, base); if (kTrace) qte_trace(tSelf, tLr, tParms, "after"); return; }
     const uint32_t self = ctx.r3.u32, fn = ctx.r4.u32, parms = ctx.r5.u32;
     const std::string obj = ue_obj_name(self), cls = ue_class_name(self), ev = ue_obj_name(fn);
     if (matches(obj) || matches(cls) || matches(ev)) {
@@ -252,4 +324,5 @@ PPC_FUNC(sub_82260F60) {
     script_dump(self, cls, ev, "before");
     __imp__sub_82260F60(ctx, base);
     script_dump(self, cls, ev, "after");
+    if (kTrace) qte_trace(tSelf, tLr, tParms, "after");
 }

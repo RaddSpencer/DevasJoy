@@ -2137,13 +2137,14 @@ static const QteTex kQteTex[] = {                                           // f
 };
 static std::atomic<uint32_t> g_qteActive{0};
 static uint32_t g_qteFrame = 0;
-// ASURA_QTESKIP (Story Mode) hides what is left of the prompts: the QTEs never open theirs (uescript.cpp), but the BURST prompt of the
-// gameplay sections (RT at a full Mantra gauge) is drawn by the HUD; xam.cpp presses RT for it. The prompt's textures move between runs
+// ASURA_BURSTAUTO=1 (with ASURA_QTESKIP, which never opens the QTE prompts: uescript.cpp) hides the BURST prompt of the gameplay
+// sections (RT at a full Mantra gauge, drawn by the HUD) and xam.cpp presses RT for it. Off by default: BURST can also come up in
+// gameplay, so Story Mode leaves it to the player (the user's call, 2026-11-12). The prompt's textures move between runs
 // (the RT icons stay, the "BURST" lettering was at 02BD4000, 02BD5000 or 02BD6000, the flash at 00791000 or 0079F000; logs\burst4-7), so
 // in this mode an icon is also recognised by its content hash alone, and once an icon has been drawn in the frame, the UI pieces after
 // it shaped like the prompt's (fmt 20, 128x128, 512x128 or 1024x1024) are left out too. No QTE prompt is drawn in this mode, so an icon
 // on screen can only be a BURST prompt.
-static const bool kHidePrompts = [] { const char* e = getenv("ASURA_QTESKIP"); return e && *e && strcmp(e, "0") != 0; }();
+static const bool kHidePrompts = [] { const char* e = getenv("ASURA_BURSTAUTO"); return e && *e && strcmp(e, "0") != 0; }();
 static bool g_hideDraw = false;
 static void qte_note_texture(uint32_t base, uint64_t hash, uint32_t fmt, uint32_t w, uint32_t h2) {
     const uint32_t h = (uint32_t)(hash ^ (hash >> 32));
@@ -4261,7 +4262,18 @@ static void write_shot() {
     else {   // ASURA_SHOTFROM / ASURA_SHOTTO: only that stretch of frames
         static const uint64_t from = getenv("ASURA_SHOTFROM") ? _strtoui64(getenv("ASURA_SHOTFROM"), nullptr, 10) : 0;
         static const uint64_t to = getenv("ASURA_SHOTTO") ? _strtoui64(getenv("ASURA_SHOTTO"), nullptr, 10) : ~0ull;
-        burstDir.clear(); if (!every || (g_frame % every) != 0 || g_frame < from || g_frame > to) return;
+        static const std::vector<std::pair<uint64_t, uint64_t>> ranges = [] {   // ASURA_SHOTRANGES="a-b;c-d": several stretches instead
+            std::vector<std::pair<uint64_t, uint64_t>> v;
+            for (const char* p = getenv("ASURA_SHOTRANGES"); p && *p; ) {
+                unsigned long long a = 0, b = 0;
+                if (sscanf(p, "%llu-%llu", &a, &b) == 2) v.push_back({a, b});
+                p = strchr(p, ';'); if (p) p++;
+            }
+            return v;
+        }();
+        bool inRange = ranges.empty() ? (g_frame >= from && g_frame <= to) : false;
+        for (auto& r : ranges) if (g_frame >= r.first && g_frame <= r.second) inRange = true;
+        burstDir.clear(); if (!every || (g_frame % every) != 0 || !inRange) return;
     }
     const char* dir = burst ? burstDir.c_str() : envDir;
     D3D11_TEXTURE2D_DESC d; g_backTex->GetDesc(&d);
