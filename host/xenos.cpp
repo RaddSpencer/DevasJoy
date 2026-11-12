@@ -2137,9 +2137,24 @@ static const QteTex kQteTex[] = {                                           // f
 };
 static std::atomic<uint32_t> g_qteActive{0};
 static uint32_t g_qteFrame = 0;
-static void qte_note_texture(uint32_t base, uint64_t hash) {
+// ASURA_QTESKIP (Story Mode) hides what is left of the prompts: the QTEs never open theirs (uescript.cpp), but the BURST prompt of the
+// gameplay sections (RT at a full Mantra gauge) is drawn by the HUD; xam.cpp presses RT for it. The prompt's textures move between runs
+// (the RT icons stay, the "BURST" lettering was at 02BD4000, 02BD5000 or 02BD6000, the flash at 00791000 or 0079F000; logs\burst4-7), so
+// in this mode an icon is also recognised by its content hash alone, and once an icon has been drawn in the frame, the UI pieces after
+// it shaped like the prompt's (fmt 20, 128x128, 512x128 or 1024x1024) are left out too. No QTE prompt is drawn in this mode, so an icon
+// on screen can only be a BURST prompt.
+static const bool kHidePrompts = [] { const char* e = getenv("ASURA_QTESKIP"); return e && *e && strcmp(e, "0") != 0; }();
+static bool g_hideDraw = false;
+static void qte_note_texture(uint32_t base, uint64_t hash, uint32_t fmt, uint32_t w, uint32_t h2) {
     const uint32_t h = (uint32_t)(hash ^ (hash >> 32));
-    for (const QteTex& q : kQteTex) if (q.addr == base && (q.hash == 0 || q.hash == h)) g_qteFrame |= q.action;
+    {   // each pixel texture's folded hash once while tracing, and any texture at a prompt address whose hash is not the table's
+        static std::set<uint64_t> seen;
+        const bool atPrompt = std::any_of(std::begin(kQteTex), std::end(kQteTex), [&](const QteTex& q) { return q.addr == base && q.hash && q.hash != h; });
+        if ((g_trace > 0 || atPrompt) && seen.insert((uint64_t)base << 32 | h).second) fprintf(stderr, "[qtetex] f=%llu base=%08X hash=%08X%s\n", (unsigned long long)g_frame, base, h, atPrompt ? " (prompt address, other hash)" : "");
+    }
+    for (const QteTex& q : kQteTex)
+        if ((q.addr == base && (q.hash == 0 || q.hash == h)) || (kHidePrompts && q.hash && q.hash == h)) { g_qteFrame |= q.action; if (kHidePrompts) g_hideDraw = true; }
+    if (kHidePrompts && g_qteFrame && fmt == 20 && ((w == 128 && h2 == 128) || (w == 512 && h2 == 128) || (w == 1024 && h2 == 1024))) g_hideDraw = true;
 }
 static void qte_publish() {                                                 // at the swap
     static uint32_t last = 0;
@@ -3363,7 +3378,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         if (!ht) return;
         if (texflip_on()) { FlipVal fv; fv.base = base; fv.mip = fi.mipBase; fv.w = w; fv.h = h; fv.fmt = fmt; fv.data = ht->hash; texflip_note(u.slot, fv); }
         if (ringPs && g_shotRingSize > 0) draw_ring_tex(u.slot, base, ht->hash);
-        if (ringPs) qte_note_texture(base, ht->hash);
+        if (ringPs) qte_note_texture(base, ht->hash, fmt, w, h);
         {   // one line per distinct fetch while tracing, to check the mip chain and filter a draw really gets
             static std::set<uint64_t> seenFetch;
             if (g_trace > 1000 && seenFetch.insert(((uint64_t)base << 8) | u.slot).second)
@@ -3393,8 +3408,10 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     };
     if (texflip_on()) texflip_draw(vs->hash, ps ? ps->hash : 0, vs->vf.empty() ? 0 : (g_regs[R_FETCH + vs->vf[0].slot * 2] & ~3u), srcSel == 0 ? dmaBase : 0, num);
     ringPs = true;
+    g_hideDraw = false;
     if (ps) for (auto& u : ps->tex) bind_tex(u);
     ringPs = false;
+    if (g_hideDraw) { g_hideDraw = false; return; }                         // a prompt piece, in Story Mode (qte_note_texture)
     {
         ID3D11ShaderResourceView* vsr[32] = {};
         ID3D11SamplerState* vsm[16] = {};
@@ -4414,6 +4431,11 @@ static void do_swap(uint32_t front) {
     funcprof_frame(g_frame);
     physwatch_tick();
     qte_publish();
+    {   // ASURA_DUMPONPROMPT=1: trace (as ASURA_DUMPFRAME) the frame after a prompt icon first shows, once
+        static const bool kOn = getenv("ASURA_DUMPONPROMPT") != nullptr;
+        static bool done = false;
+        if (kOn && !done && g_qteActive.load()) { done = true; g_dumpFrame = (int64_t)g_frame + 1; fprintf(stderr, "[qte] tracing frame %lld\n", (long long)g_dumpFrame); }
+    }
     { void options_frame(); options_frame(); }                              // Graphics Options menu input (options.cpp)
     LARGE_INTEGER swapStart; QueryPerformanceCounter(&swapStart);
     if (g_drawsLeftOut) {
@@ -4498,7 +4520,7 @@ static void do_swap(uint32_t front) {
             // F10: dump the next frame in full (every surface, and the per-draw trace in the log), as ASURA_DUMPFRAME would
             static bool f10Prev = false;
             const bool d10 = kbm_reserved_down(VK_F10);
-            if (d10 && !f10Prev) { g_dumpFrame = (int64_t)g_frame + 2; fprintf(stderr, "[capture] F10: dumping frame %lld\n", (long long)g_dumpFrame); }
+            if (d10 && !f10Prev) { g_dumpFrame = (int64_t)g_frame + 1; fprintf(stderr, "[capture] F10: dumping frame %lld\n", (long long)g_dumpFrame); }
             f10Prev = d10;
         }
     }

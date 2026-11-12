@@ -4,7 +4,7 @@ set(CMAKE_CXX_STANDARD 20)
 
 # The recompiled game code is compiled straight into the exe so generated/import_stubs.cpp can override the weak import thunks.
 file(GLOB PPC_SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../ppc/*.cpp")
-set(HOST_SRC main.cpp kernel.cpp kfile.cpp kstring.cpp xam.cpp gpu.cpp audio.cpp hooks.cpp audio_out.cpp xma.cpp xenos.cpp xenos_glue.cpp options.cpp shaderpack.cpp shaderindex.cpp funcprof.cpp generated/import_stubs.cpp)
+set(HOST_SRC main.cpp kernel.cpp kfile.cpp kstring.cpp xam.cpp gpu.cpp audio.cpp hooks.cpp audio_out.cpp xma.cpp xenos.cpp xenos_glue.cpp options.cpp uescript.cpp shaderpack.cpp shaderindex.cpp funcprof.cpp generated/import_stubs.cpp)
 # libmspack's LZX decoder (LGPL 2.1, thirdparty\libmspack): unpacks the cooked packages for the shader index
 set(MSPACK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/libmspack/mspack)
 set(MSPACK_SRC ${MSPACK_DIR}/lzxd.c)

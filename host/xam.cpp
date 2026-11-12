@@ -189,10 +189,13 @@ static void qte_from_icons(QteAnswer& a) {                                  // t
 }
 // ASURA_AUTOQTE=1: answer QTEs from the judge (icons where it asks for something unknown); ASURA_AUTOQTE=icons: from the icons only.
 // Buttons are tapped at about 10 presses a second (answers presses and mashing); triggers and stick directions are held.
+// ASURA_QTESKIP (uescript.cpp) passes the QTEs themselves without showing them, so any prompt the renderer still sees is a gameplay one,
+// the BURST prompt (RT at a full gauge): answered from its icon, which the renderer also hides in that mode.
 static void qte_apply(uint32_t st) {
     static const char* kMode = getenv("ASURA_AUTOQTE");
-    if (!kMode) return;
-    static const bool kIconsOnly = !strcmp(kMode, "icons");
+    static const bool kSkip = [] { const char* e = getenv("ASURA_QTESKIP"); return e && *e && strcmp(e, "0") != 0; }();
+    if (!kMode && !kSkip) return;
+    static const bool kIconsOnly = !kMode || !strcmp(kMode, "icons");
     QteAnswer a;
     if (kIconsOnly || !qte_from_judge(a)) { a = QteAnswer(); qte_from_icons(a); }
     if (!a.any()) return;
