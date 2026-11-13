@@ -216,6 +216,17 @@ static void qte_apply(uint32_t st) {
     const uint64_t sig = a.buttons | (uint64_t)a.lt << 16 | (uint64_t)a.rt << 17 | (uint64_t)a.lRot << 18 | (uint64_t)a.rRot << 19 | (uint64_t)(a.lDir + 1) << 20 | (uint64_t)(a.rDir + 1) << 24;
     if (sig != lastSig) { LOG("[qte] answering: buttons %04X%s%s%s%s left stick %d right stick %d\n", a.buttons, a.lt ? " LT" : "", a.rt ? " RT" : "", a.lRot ? " rotate-L" : "", a.rRot ? " rotate-R" : "", a.lDir, a.rDir); lastSig = sig; }
 }
+// What the game was last given (buttons, LT << 16, RT << 24), and the input clock (ms since the first poll, as ASURA_INPUTREC writes it):
+// for logs that line game events up with the pad (ASURA_SYNCLOG, hooks.cpp).
+static std::atomic<uint32_t> g_lastPad{0};
+static std::atomic<ULONGLONG> g_pressFrom{0}, g_pressUntil{0};
+static std::atomic<uint16_t> g_pressButtons{0};
+void input_press_at(uint16_t buttons, uint32_t delayMs, uint32_t holdMs) {   // hold these buttons for holdMs, starting delayMs from now
+    const ULONGLONG now = GetTickCount64();
+    g_pressButtons = buttons; g_pressFrom = now + delayMs; g_pressUntil = now + delayMs + holdMs;
+}
+uint32_t input_last_pad() { return g_lastPad.load(); }
+uint32_t input_clock_ms() { return (uint32_t)(GetTickCount64() - input_t0()); }
 // XamInputGetState(user, flags, XINPUT_STATE*): {u32 packet; u16 buttons; u8 lt, rt; s16 lx, ly, rx, ry}
 static void XamInputGetState_(PPCContext& ctx, uint8_t*) {
     uint32_t user = ctx.r3.u32, st = ctx.r5.u32;
@@ -237,6 +248,11 @@ static void XamInputGetState_(PPCContext& ctx, uint8_t*) {
         }
     }
     qte_apply(st);
+    {   // a timed press asked for by the host (hooks.cpp, Synchronic QTEs in Story Mode): buttons held from `from` to `until` (GetTickCount64 ms)
+        const ULONGLONG now = GetTickCount64();
+        if (now >= g_pressFrom.load() && now < g_pressUntil.load()) wr16(st + 4, rd16(st + 4) | g_pressButtons.load());
+    }
+    g_lastPad =(uint32_t)rd16(st + 4) | (uint32_t)g_base[st + 6] << 16 | (uint32_t)g_base[st + 7] << 24;
     ctx.r3.u64 = 0;
 }
 static void XamInputSetState_(PPCContext& ctx, uint8_t*) {

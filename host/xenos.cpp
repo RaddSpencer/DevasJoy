@@ -230,7 +230,7 @@ extern bool g_logging;   // main.cpp: --log (or BCR2_LOG=1). Off by default: no 
 static std::atomic<uint64_t> g_lastF9{0};
 static std::atomic<bool> g_screenshotWanted{false};   // F12
 static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == WM_CLOSE) { fprintf(stderr, "[gfx] window closed, exiting\n"); fflush(stderr); TerminateProcess(GetCurrentProcess(), 0); }
+    if (m == WM_CLOSE) { fprintf(stderr, "[gfx] window closed, exiting\n"); fflush(stderr); void video_finish(); video_finish(); TerminateProcess(GetCurrentProcess(), 0); }
     kbm_note_message(h, m, w, l);
     if (m == WM_SIZE) g_sizeChanged = true;
     if (m == WM_MOUSEWHEEL) { kbm_note_wheel((short)HIWORD(w)); return 0; }
@@ -350,6 +350,52 @@ std::atomic<int> g_tickLateMaxUs{0};
 void gpu_note_tick_late(int us) { int m = g_tickLateMaxUs.load(); while (us > m && !g_tickLateMaxUs.compare_exchange_weak(m, us)) {} }
 
 bool gpu_vrr() { static const bool on = getenv("ASURA_VRR") != nullptr && tearing_supported(); return on; }   // no tearing support: keep the display lock
+
+// ASURA_PULLDOWN=1 (24 fps mode, Frame Rate "24 fps (2:3 pulldown)"): show the game's 24 frames a second on a fixed-refresh display the
+// way DVD players show film on a 60 Hz TV. Each frame is presented with vsync for a whole number of refreshes, chosen so the total keeps
+// pace with 24 fps: at 60 Hz 3, 2, 3, 2 (2:3 pulldown, 2.5 refreshes a frame on average), at 72 Hz 3 each, at 48 or 96 Hz 2 or 4 each
+// (even: no judder), at 50 Hz 2 with a 3 every twelfth frame. D3D allows 1 to 4 refreshes per Present, so displays over 100 Hz
+// (120, 144) can't be paced this way: they fall back to one refresh per frame with vsync, and the log says to pick 60 Hz.
+// On a 59.94 Hz display 2:3 pulldown shows 23.976 frames a second, so the game's vblank is slowed to match (gpu_pulldown_vblank_hz,
+// read by gpu.cpp's vblank thread); otherwise one frame in 1001 would pile up (a hitch every 42 s).
+// Returns the refreshes for the frame about to be presented, or 0 when the mode is off. The display's rate is read again every
+// 300 frames (the window can move to another monitor).
+static double display_hz() {
+    ComPtr<IDXGIOutput> out;
+    if (!g_swap || FAILED(g_swap->GetContainingOutput(&out))) return 0;
+    DXGI_OUTPUT_DESC od{}; out->GetDesc(&od);
+    DEVMODEW dm{}; dm.dmSize = sizeof(dm);
+    if (!EnumDisplaySettingsW(od.DeviceName, ENUM_CURRENT_SETTINGS, &dm) || dm.dmDisplayFrequency < 20) return 0;
+    const int f = (int)dm.dmDisplayFrequency;
+    return (f == 59 || f == 119 || f == 143 || f == 23 || f == 29 || f == 47 || f == 71 || f == 95) ? (f + 1) * 1000.0 / 1001.0 : (double)f;   // NTSC rates
+}
+static std::atomic<double> g_pulldownVblank{0};                            // the game's vblank rate to match the display (0: as set)
+double gpu_pulldown_vblank_hz() { return g_pulldownVblank.load(); }
+static UINT pulldown_interval() {
+    static const bool kOn = getenv("ASURA_PULLDOWN") && atoi(getenv("ASURA_PULLDOWN")) != 0;
+    if (!kOn) return 0;
+    static double hz = 0; static uint64_t at = ~0ull, shown = 0;
+    static long double acc = 0;                                            // refreshes owed so far, at hz / 24 a frame
+    static bool warned = false;
+    if (at == ~0ull || g_frame >= at + 300) {
+        at = g_frame;
+        const double h = display_hz();
+        if (h > 0 && std::fabs(h - hz) > 0.01) { hz = h; acc = 0; shown = 0; g_pulldownVblank = 48.0 * hz / std::round(hz); fprintf(stderr, "[pulldown] display at %.3f Hz: %.3f refreshes a frame\n", hz, hz / 24.0); warned = false; }
+    }
+    if (hz <= 0) return 1;
+    const double per = std::round(hz) / 24.0;                               // the nominal cadence (2.5 at 59.94 or 60 Hz): exact 3, 2, 3, 2; the game's
+                                                                            // vblank is slowed to hz / per instead (g_pulldownVblank)
+    if (per > 4.2 || per < 0.9) {
+        if (!warned) { warned = true; fprintf(stderr, "[pulldown] %.0f Hz can't be paced at 24 fps (1 to 4 refreshes a frame): one refresh per frame; set the display to 60 Hz\n", hz); }
+        return 1;
+    }
+    acc += per;
+    long long n = (long long)std::floor(acc + 0.5) - (long long)shown;    // the frame's whole refreshes: 3, 2, 3, 2 at 60 Hz
+    n = std::clamp<long long>(n, 1, 4);
+    shown += (uint64_t)n;
+    if (acc > 1e9) { acc -= (long double)shown; shown = 0; }
+    return (UINT)n;
+}
 
 static bool device_init() {
     if (g_trace == 0) if (const char* t = getenv("ASURA_GPUTRACE")) g_trace = atoi(t);
@@ -1888,6 +1934,7 @@ struct HostTex {
     ComPtr<ID3D11ShaderResourceView> srvSigned;                             // the same texels read as signed (SNORM), made on first use
     DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN; uint32_t faces = 1;
     uint64_t hash = 0, lastFrame = ~0ull, mxEpoch = 0; uint32_t hostW = 0, hostH = 0, levels = 0;
+    HostTex* mod = nullptr;                                                 // a replacement from the mods folder for the current contents
 };
 // Signed textures (normal maps above all) were read as unsigned and turned signed in texfix after filtering. Byte 7F (+1) and 80 (-1) are neighbours
 // in unsigned order, so filtering across zero gave values near -1: bumpy metal and clouds sparkled at a distance. Formats with an SNORM twin are
@@ -1969,20 +2016,42 @@ static void write_bmp(const std::string& path, const std::vector<uint8_t>& rgba,
     }
     fclose(f);
 }
-static void dump_texture_bmp(const char* dir, uint32_t base, uint32_t fmt, uint32_t w, uint32_t h, const TexFmt& tf, const uint8_t* data) {
-    static std::unordered_map<uint32_t, uint64_t> last;
-    static int count = 0;
-    if (w < 8 && h < 8) return;
-    uint64_t hs = fnv64(data, (size_t)w * h / (tf.conv ? 1 : (tf.block * tf.block)) * (tf.conv ? 4 : tf.bpb));
-    auto it = last.find(base);
-    if (it != last.end() && it->second == hs) return;
-    last[base] = hs;
-    const bool decodable = tf.conv || tf.dxgi == DXGI_FORMAT_R8G8B8A8_UNORM || tf.dxgi == DXGI_FORMAT_BC1_UNORM || tf.dxgi == DXGI_FORMAT_BC2_UNORM || tf.dxgi == DXGI_FORMAT_BC3_UNORM;
-    if (!decodable) return;                                                 // (movie planes, 8-bit: would use up the count)
-    if (count++ >= 8000) return;
-    std::vector<uint8_t> rgba((size_t)w * h * 4, 0);
-    if (tf.conv || tf.dxgi == DXGI_FORMAT_R8G8B8A8_UNORM) memcpy(rgba.data(), data, rgba.size());
-    else if (tf.dxgi == DXGI_FORMAT_BC1_UNORM || tf.dxgi == DXGI_FORMAT_BC2_UNORM || tf.dxgi == DXGI_FORMAT_BC3_UNORM) {
+// The host texture data of one level (as get_texture builds it) as 8-bit RGBA, for the dumps: false for formats it cannot show.
+// R8 and BC4 come out as grey with full alpha, R8G8 and BC5 as red and green.
+static bool decode_rgba(const TexFmt& tf, uint32_t w, uint32_t h, const uint8_t* data, std::vector<uint8_t>& rgba) {
+    rgba.assign((size_t)w * h * 4, 0);
+    auto alpha_block = [](const uint8_t* b, uint8_t al[16]) {
+        uint8_t a0 = b[0], a1 = b[1], tab[8]; tab[0] = a0; tab[1] = a1;
+        if (a0 > a1) for (int i = 1; i < 7; i++) tab[i + 1] = (uint8_t)(((7 - i) * a0 + i * a1) / 7);
+        else { for (int i = 1; i < 5; i++) tab[i + 1] = (uint8_t)(((5 - i) * a0 + i * a1) / 5); tab[6] = 0; tab[7] = 255; }
+        uint64_t bits = 0; for (int i = 0; i < 6; i++) bits |= (uint64_t)b[2 + i] << (8 * i);
+        for (int i = 0; i < 16; i++) al[i] = tab[(bits >> (3 * i)) & 7];
+    };
+    if (tf.conv || tf.dxgi == DXGI_FORMAT_R8G8B8A8_UNORM) { memcpy(rgba.data(), data, rgba.size()); return true; }
+    if (tf.dxgi == DXGI_FORMAT_R8_UNORM || tf.dxgi == DXGI_FORMAT_R8G8_UNORM) {
+        const bool two = tf.dxgi == DXGI_FORMAT_R8G8_UNORM;
+        for (size_t i = 0; i < (size_t)w * h; i++) {
+            uint8_t* d = &rgba[i * 4];
+            if (two) { d[0] = data[i * 2]; d[1] = data[i * 2 + 1]; } else d[0] = d[1] = d[2] = data[i];
+            d[3] = 255;
+        }
+        return true;
+    }
+    if (tf.dxgi == DXGI_FORMAT_BC4_UNORM || tf.dxgi == DXGI_FORMAT_BC5_UNORM) {
+        const bool two = tf.dxgi == DXGI_FORMAT_BC5_UNORM;
+        const uint32_t bw = w / 4, bh = h / 4;
+        for (uint32_t by = 0; by < bh; by++) for (uint32_t bx = 0; bx < bw; bx++) {
+            const uint8_t* b = data + ((size_t)by * bw + bx) * tf.bpb;
+            uint8_t r[16], g[16]; alpha_block(b, r); if (two) alpha_block(b + 8, g);
+            for (int i = 0; i < 16; i++) {
+                uint8_t* d = &rgba[(((size_t)by * 4 + i / 4) * w + bx * 4 + (i & 3)) * 4];
+                if (two) { d[0] = r[i]; d[1] = g[i]; } else d[0] = d[1] = d[2] = r[i];
+                d[3] = 255;
+            }
+        }
+        return true;
+    }
+    if (tf.dxgi == DXGI_FORMAT_BC1_UNORM || tf.dxgi == DXGI_FORMAT_BC2_UNORM || tf.dxgi == DXGI_FORMAT_BC3_UNORM) {
         const bool bc1 = tf.dxgi == DXGI_FORMAT_BC1_UNORM, bc3 = tf.dxgi == DXGI_FORMAT_BC3_UNORM;
         const uint32_t bw = w / 4, bh = h / 4;
         for (uint32_t by = 0; by < bh; by++) for (uint32_t bx = 0; bx < bw; bx++) {
@@ -2004,7 +2073,22 @@ static void dump_texture_bmp(const char* dir, uint32_t base, uint32_t fmt, uint3
                 d[0] = cc[0]; d[1] = cc[1]; d[2] = cc[2]; d[3] = (bc1 && cc[3] == 0) ? 0 : (tf.dxgi == DXGI_FORMAT_BC1_UNORM ? 255 : al[i]);
             }
         }
-    } else { fprintf(stderr, "[texdump] %08X fmt=%u %ux%u: not decoded (host format %d)\n", base, fmt, w, h, (int)tf.dxgi); return; }
+        return true;
+    }
+    return false;
+}
+static void dump_texture_bmp(const char* dir, uint32_t base, uint32_t fmt, uint32_t w, uint32_t h, const TexFmt& tf, const uint8_t* data) {
+    static std::unordered_map<uint32_t, uint64_t> last;
+    static int count = 0;
+    if (w < 8 && h < 8) return;
+    uint64_t hs = fnv64(data, (size_t)w * h / (tf.conv ? 1 : (tf.block * tf.block)) * (tf.conv ? 4 : tf.bpb));
+    auto it = last.find(base);
+    if (it != last.end() && it->second == hs) return;
+    last[base] = hs;
+    if (count >= 8000) return;
+    std::vector<uint8_t> rgba;
+    if (!decode_rgba(tf, w, h, data, rgba)) return;                       // (movie planes would use up the count)
+    count++;
     std::string stem = std::string(dir) + "\\" + S("%08X_f%u_%ux%u", base, fmt, w, h);
     write_bmp(stem + "_rgb.bmp", rgba, w, h, false);
     write_bmp(stem + "_a.bmp", rgba, w, h, true);
@@ -2156,6 +2240,12 @@ static void qte_note_texture(uint32_t base, uint64_t hash, uint32_t fmt, uint32_
     for (const QteTex& q : kQteTex)
         if ((q.addr == base && (q.hash == 0 || q.hash == h)) || (kHidePrompts && q.hash && q.hash == h)) { g_qteFrame |= q.action; if (kHidePrompts) g_hideDraw = true; }
     if (kHidePrompts && g_qteFrame && fmt == 20 && ((w == 128 && h2 == 128) || (w == 512 && h2 == 128) || (w == 1024 && h2 == 1024))) g_hideDraw = true;
+    // Story Mode with its prompts hidden (hooks.cpp synchronic_hide_enabled): the Y prompt icon (128x128 DXT5 at 014FA000 among the QTE
+    // prompt icons, folded content hash DF3D91A4) is left out. A Synchronic track shows it before Story Mode can hide the track's
+    // prompt, and nothing that runs afterwards takes it off (it stayed for the rest of the scene: the user's episode 3 run,
+    // logs\rec_20261113_142416_2.mp4 at 0:46). Every other Y prompt is a QTE's, and Story Mode answers those without a prompt anyway.
+    bool synchronic_hide_enabled();
+    if (h == 0xDF3D91A4u && synchronic_hide_enabled()) g_hideDraw = true;
 }
 static void qte_publish() {                                                 // at the swap
     static uint32_t last = 0;
@@ -2170,6 +2260,122 @@ static void qte_publish() {                                                 // a
     g_qteFrame = 0;
 }
 uint32_t qte_active() { return g_qteActive.load(); }
+
+// ---- texture mods: replacement pictures by content hash ----
+// Each texture the game uploads gets a 64-bit hash of its whole picture (the base level as the host holds it, untiled and
+// byte-swapped, all formats; width and height folded into the top bits), the same in every run wherever the texture sits in memory.
+//   ASURA_MODDUMP=1 writes every distinct texture once to mods\dump\<hash>_f<fmt>_<w>x<h>.png (8 px and up; formats the dumper
+//     decodes: RGBA, DXT1-5, R8 and BC4 as grey, R8G8 and BC5 as red and green). ASURA_MODDUMP=<w>x<h>,... keeps only those sizes.
+//   mods\textures\**\<hash>*.png replaces the texture whose hash the file name starts with (16 hex digits; the rest of the name
+//     is free, so a dumped file can be edited and copied over as it is). Any size with the same aspect ratio: a 4x picture gives
+//     4x the detail, as for a higher-resolution font. Channels go in as the dump shows them (grey textures: the red channel counts).
+//     Mip levels are generated. Cube maps are not replaced.
+//   The Button Labels set (gpu_button_set: 2 PlayStation, 3 Switch) looks in assets\prompts\<set>\ first, the same way.
+// Folders are data root (C:\dev\asura in the dev layout) + "\mods"; ASURA_MODS=<dir> names another. Read once at the first texture.
+static std::string mods_root() {
+    if (const char* e = getenv("ASURA_MODS")) return e;
+    return bcr2_data_root() + "\\mods";
+}
+static uint64_t mods_hash(const uint8_t* p, size_t n) {                     // 64-bit FNV-1a over 8-byte words, then the tail bytes
+    uint64_t h = 0xCBF29CE484222325ull;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) { uint64_t v; memcpy(&v, p + i, 8); h = (h ^ v) * 0x100000001B3ull; }
+    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001B3ull;
+    return h;
+}
+struct ModEntry { std::wstring path; HostTex tex; bool tried = false; };
+static std::unordered_map<uint64_t, ModEntry> g_mods[4];                    // [0] mods\textures, [2]/[3] the button sets' folders
+static bool g_modsScanned = false;
+static void mods_scan_dir(const std::wstring& dir, std::unordered_map<uint64_t, ModEntry>& into) {
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (f == INVALID_HANDLE_VALUE) return;
+    do {
+        const std::wstring name = fd.cFileName;
+        if (name == L"." || name == L"..") continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { mods_scan_dir(dir + L"\\" + name, into); continue; }
+        if (name.size() < 20 || _wcsicmp(name.c_str() + name.size() - 4, L".png") != 0) continue;
+        uint64_t h = 0; bool ok = true;
+        for (int i = 0; i < 16 && ok; i++) {
+            const wchar_t c = name[i];
+            const int v = c >= L'0' && c <= L'9' ? c - L'0' : c >= L'a' && c <= L'f' ? c - L'a' + 10 : c >= L'A' && c <= L'F' ? c - L'A' + 10 : -1;
+            if (v < 0) ok = false; else h = h << 4 | (uint64_t)v;
+        }
+        if (ok) into[h].path = dir + L"\\" + name;
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+}
+static void mods_scan() {
+    if (g_modsScanned) return;
+    g_modsScanned = true;
+    const std::string r = mods_root() + "\\textures";
+    mods_scan_dir(std::wstring(r.begin(), r.end()), g_mods[0]);
+    static const wchar_t* sets[4] = { nullptr, nullptr, L"playstation", L"switch" };
+    for (int s = 2; s < 4; s++) mods_scan_dir(assets_dir() + L"\\prompts\\" + sets[s], g_mods[s]);
+    fprintf(stderr, "[mods] %zu replacement textures in %s; button sets: %zu PlayStation, %zu Switch\n", g_mods[0].size(), r.c_str(), g_mods[2].size(), g_mods[3].size());
+}
+static bool mods_active() { mods_scan(); return !g_mods[0].empty() || !g_mods[2].empty() || !g_mods[3].empty(); }
+static bool mods_dumping() { static const bool on = getenv("ASURA_MODDUMP") != nullptr; return on; }
+static HostTex* mods_load(ModEntry& e, uint32_t hw, uint32_t hh) {
+    if (e.tried) return e.tex.srv ? &e.tex : nullptr;
+    e.tried = true;
+    std::vector<uint8_t> px; uint32_t w = 0, h = 0;
+    if (!load_png_rgba(e.path, px, w, h) || !w || !h) { fprintf(stderr, "[mods] could not load %ls\n", e.path.c_str()); return nullptr; }
+    if ((uint64_t)w * hh != (uint64_t)h * hw) fprintf(stderr, "[mods] %ls is %ux%u, the texture %ux%u: other aspect ratio, stretched\n", e.path.c_str(), w, h, hw, hh);
+    D3D11_TEXTURE2D_DESC d{}; d.Width = w; d.Height = h; d.MipLevels = 0; d.ArraySize = 1; d.Format = DXGI_FORMAT_R8G8B8A8_UNORM; d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET; d.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+    if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &e.tex.tex))) return nullptr;
+    g_dev->CreateShaderResourceView(e.tex.tex.Get(), nullptr, &e.tex.srv);
+    g_ctx->UpdateSubresource(e.tex.tex.Get(), 0, nullptr, px.data(), w * 4, 0);
+    g_ctx->GenerateMips(e.tex.srv.Get());
+    // The draw scales texture coordinates by guest size / host size for block formats (bind_tex, tfp): keep the game's padded size
+    // here so that factor stays as it was; the sampler works in 0..1 whatever the picture's real size.
+    e.tex.hostW = hw; e.tex.hostH = hh; e.tex.levels = 0;
+    fprintf(stderr, "[mods] loaded %ls (%ux%u for %ux%u)\n", e.path.c_str(), w, h, hw, hh);
+    return e.tex.srv ? &e.tex : nullptr;
+}
+static HostTex* mods_texture(uint64_t hash, uint32_t hw, uint32_t hh) {
+    const int set = gpu_button_set();
+    for (int s : { set >= 2 && set <= 3 ? set : -1, 0 }) {
+        if (s < 0) continue;
+        auto it = g_mods[s].find(hash);
+        if (it != g_mods[s].end()) if (HostTex* t = mods_load(it->second, hw, hh)) return t;
+    }
+    return nullptr;
+}
+static bool write_png(const std::wstring& path, const std::vector<uint8_t>& rgba, uint32_t w, uint32_t h) {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    ComPtr<IWICImagingFactory> f; ComPtr<IWICStream> st; ComPtr<IWICBitmapEncoder> enc; ComPtr<IWICBitmapFrameEncode> fr;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f)))) return false;
+    if (FAILED(f->CreateStream(&st)) || FAILED(st->InitializeFromFilename(path.c_str(), GENERIC_WRITE))) return false;
+    if (FAILED(f->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) || FAILED(enc->Initialize(st.Get(), WICBitmapEncoderNoCache))) return false;
+    if (FAILED(enc->CreateNewFrame(&fr, nullptr)) || FAILED(fr->Initialize(nullptr)) || FAILED(fr->SetSize(w, h))) return false;
+    WICPixelFormatGUID pf = GUID_WICPixelFormat32bppBGRA;                  // what the PNG encoder takes for 8-bit RGBA
+    if (FAILED(fr->SetPixelFormat(&pf)) || pf != GUID_WICPixelFormat32bppBGRA) { static int n = 0; if (n++ < 3) fprintf(stderr, "[moddump] PNG encoder refused 32-bit BGRA\n"); return false; }
+    std::vector<uint8_t> bgra(rgba);
+    for (size_t i = 0; i + 3 < bgra.size(); i += 4) std::swap(bgra[i], bgra[i + 2]);
+    if (FAILED(fr->WritePixels(h, w * 4, (UINT)bgra.size(), bgra.data()))) return false;
+    return SUCCEEDED(fr->Commit()) && SUCCEEDED(enc->Commit());
+}
+static void mods_dump(uint64_t hash, const FetchInfo& fi, const TexFmt& tf, uint32_t hw, uint32_t hh, const uint8_t* data) {
+    static std::unordered_set<uint64_t> done;
+    static int count = 0;
+    if ((hw < 8 && hh < 8) || count >= 20000 || !done.insert(hash).second) return;
+    if (fi.fmt == 2 && ((fi.w == 1280 && fi.h == 720) || (fi.w == 640 && fi.h == 360))) return;   // Bink movie planes (luma, chroma): a new one every frame
+    static const std::string sizes = [] { const char* e = getenv("ASURA_MODDUMP"); return std::string(e && strchr(e, 'x') ? e : ""); }();
+    if (!sizes.empty() && ("," + sizes + ",").find(S(",%ux%u,", fi.w, fi.h)) == std::string::npos) return;
+    std::vector<uint8_t> rgba;
+    if (!decode_rgba(tf, hw, hh, data, rgba)) return;
+    static const std::wstring dir = [] {
+        const std::string d = mods_root() + "\\dump";
+        CreateDirectoryA(mods_root().c_str(), nullptr); CreateDirectoryA(d.c_str(), nullptr);
+        return std::wstring(d.begin(), d.end());
+    }();
+    const std::string n = S("\\%016llX_f%u_%ux%u.png", (unsigned long long)hash, fi.fmt, hw, hh);
+    const std::wstring path = dir + std::wstring(n.begin(), n.end());
+    if (!write_png(path, rgba, hw, hh)) { DeleteFileW(path.c_str()); return; }
+    { count++; fprintf(stderr, "[moddump] f=%llu %08X fmt=%u %ux%u -> %s\n", (unsigned long long)g_frame, fi.base, fi.fmt, hw, hh, n.c_str() + 1); }
+}
 static bool texdump_wanted(uint32_t base) {
     static const char* only = getenv("ASURA_TEXDUMPONLY");
     if (!only) return true;
@@ -2245,7 +2451,7 @@ static HostTex* get_texture(const FetchInfo& fi) {
             fputc('\n', stderr);
         }
     }
-    if (ht->lastFrame == g_frame && ht->mxEpoch == g_mxEpoch && ht->srv) return ht;
+    if (ht->lastFrame == g_frame && ht->mxEpoch == g_mxEpoch && (ht->srv || ht->mod)) return ht->mod ? ht->mod : ht;
     ht->lastFrame = g_frame; ht->mxEpoch = g_mxEpoch;
     PerfScope perfTex(g_tTex);
     static const bool kNoMips = getenv("ASURA_NOMIPS") != nullptr;           // for comparison: draw every texture from its full-size image only
@@ -2267,8 +2473,9 @@ static HostTex* get_texture(const FetchInfo& fi) {
         if (seenAtlas.insert(key ^ h).second) fprintf(stderr, "[buttons] 256x256 RGBA texture at %08X hash %016llX%s\n", fi.base, (unsigned long long)h, (kButtonAtlasHash && h == kButtonAtlasHash) ? " (the button atlas)" : "");
         if (kButtonAtlasHash && h == kButtonAtlasHash) g_buttonKeys.insert(key);
     }
-    if (ht->srv && h == ht->hash) return ht;
+    if ((ht->srv || ht->mod) && h == ht->hash) return ht->mod ? ht->mod : ht;
     ht->hash = h;
+    ht->mod = nullptr;
     g_nUploads++; g_upBytes += total + mipBytes;
     uint32_t hw = blocksW * tf.block, hh = blocksH * tf.block;
     uint32_t outBpb = tf.conv ? 4 : tf.bpb;
@@ -2286,6 +2493,11 @@ static HostTex* get_texture(const FetchInfo& fi) {
                 if (tf.conv) unpack_rgba8(tf.conv, tmp, dst); else memcpy(dst, tmp, tf.bpb);
             }
         }
+    }
+    if (fi.faces == 1 && (mods_active() || mods_dumping())) {                // texture mods: by a hash of the whole picture (mods_texture)
+        const uint64_t full = mods_hash(out.data(), out.size()) ^ ((uint64_t)hw << 48 | (uint64_t)hh << 32);
+        if (mods_dumping()) mods_dump(full, fi, tf, hw, hh, out.data());
+        if (HostTex* m = mods_texture(full, hw, hh)) { ht->mod = m; return m; }
     }
     if (fi.fmt == 6 && hw == 1024 && hh == 256 && fi.faces == 1 && out.size() == (size_t)1024 * 256 * 4) {
         static std::set<uint64_t> seenSplash;
@@ -3319,6 +3531,13 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         if (sf && u.dim != 3) {
             if (texflip_on()) { FlipVal fv; fv.base = base; fv.w = w; fv.h = h; fv.fmt = fmt; fv.src = 1; texflip_note(u.slot, fv); }
             if (ringPs && g_shotRingSize > 0) draw_ring_tex(u.slot, base, sf->guestHash ^ 0x5F);
+            {   // ASURA_UITEXLOG: resolved surfaces sampled, once each per shader pair
+                static const bool kUiLog = getenv("ASURA_UITEXLOG") != nullptr;
+                static std::set<std::pair<uint64_t, uint64_t>> seenUi;
+                if (kUiLog && ringPs && seenUi.insert({ (uint64_t)base << 32 | fmt << 24 | w, (vs->hash ^ (ps ? ps->hash : 0)) }).second)
+                    fprintf(stderr, "[uitex] f=%llu vs=%016llX ps=%016llX slot=%u base=%08X fmt=%u %ux%u resolved surface\n", (unsigned long long)g_frame,
+                            (unsigned long long)vs->hash, (unsigned long long)(ps ? ps->hash : 0), u.slot, base, fmt, w, h);
+            }
             bool wantsRaw = sf->rawSrv && fmt != 22 && fmt != 23;           // depth read as bytes, not as a depth format
             srvs[u.slot] = wantsRaw ? sf->rawSrv.Get() : sf->srv.Get();
             switch (sf->fmt) {                                              // 16-bit decode in texfix follows what the surface holds
@@ -3380,6 +3599,13 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         if (texflip_on()) { FlipVal fv; fv.base = base; fv.mip = fi.mipBase; fv.w = w; fv.h = h; fv.fmt = fmt; fv.data = ht->hash; texflip_note(u.slot, fv); }
         if (ringPs && g_shotRingSize > 0) draw_ring_tex(u.slot, base, ht->hash);
         if (ringPs) qte_note_texture(base, ht->hash, fmt, w, h);
+        {   // ASURA_UITEXLOG=1: each distinct texture a draw samples, once, with the draw's shaders (to find what the UI text is drawn from)
+            static const bool kUiLog = getenv("ASURA_UITEXLOG") != nullptr;
+            static std::set<std::pair<uint64_t, uint64_t>> seenUi;
+            if (kUiLog && ringPs && seenUi.insert({ (uint64_t)base << 32 | fmt << 24 | w, (vs->hash ^ (ps ? ps->hash : 0)) }).second)
+                fprintf(stderr, "[uitex] f=%llu vs=%016llX ps=%016llX slot=%u base=%08X fmt=%u %ux%u tiled=%d hash=%016llX%s\n", (unsigned long long)g_frame,
+                        (unsigned long long)vs->hash, (unsigned long long)(ps ? ps->hash : 0), u.slot, base, fmt, w, h, (int)fi.tiled, (unsigned long long)ht->hash, ht->mod ? " (mod)" : "");
+        }
         {   // one line per distinct fetch while tracing, to check the mip chain and filter a draw really gets
             static std::set<uint64_t> seenFetch;
             if (g_trace > 1000 && seenFetch.insert(((uint64_t)base << 8) | u.slot).second)
@@ -4130,6 +4356,14 @@ static void note_display_stats(LARGE_INTEGER presented, uint64_t frame) {
     }
     if (frame - lastLog >= 300) {
         double secs = (double)syncTicks * g_perfTicksToMs / 1000.0;
+        // Pulldown: the display's rate as measured over the run (59.952 Hz here where Windows reports 59) sets the game's vblank, so the
+        // game's 24 fps stays locked to the display's 3, 2 cadence. Only stretches with nothing discarded count.
+        if (g_pulldownVblank.load() > 0 && secs > 5 && nSkipped == 0 && nDisjoint == 0) {
+            static double sumRef = 0, sumSecs = 0;
+            sumRef += (double)nRefreshes; sumSecs += secs;
+            const double hz = sumRef / sumSecs;
+            if (hz > 20) g_pulldownVblank = 48.0 * hz / std::round(hz);
+        }
         fprintf(stderr, "[disp] frame=%llu presents=%llu shown=%llu discarded=%llu refreshes=%llu hz=%.3f present_to_scan avg=%.1f max=%.1f failed=%llu\n",
                 (unsigned long long)frame, (unsigned long long)(frame - lastLog), (unsigned long long)nShown, (unsigned long long)nSkipped, (unsigned long long)nRefreshes,
                 secs > 0 ? nRefreshes / secs : 0.0, nShown ? latSum / nShown : 0.0, latMax, (unsigned long long)nDisjoint);
@@ -4248,7 +4482,38 @@ static void take_screenshot_if_wanted() {
         fprintf(stderr, "[screenshot] %s %s\n", ok ? "saved" : "FAILED", path.c_str());
     }).detach();
 }
+// ASURA_VIDEO=<file.mp4> (video.cpp): every presented frame. The back buffer is copied into one of three staging textures and read
+// back two frames later, when the GPU has long finished with it, so recording never waits on the GPU; video.cpp encodes on its own thread.
+bool video_wanted();
+void video_submit(const uint8_t* rows, uint32_t w, uint32_t h, uint32_t pitch, uint32_t fmt, uint64_t gameFrame);
+static void video_capture() {
+    if (!video_wanted() || !g_backTex) return;
+    struct Slot { ComPtr<ID3D11Texture2D> tex; uint32_t w = 0, h = 0; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN; uint64_t frame = 0; bool full = false; };
+    static Slot slots[3];
+    static uint64_t n = 0;
+    D3D11_TEXTURE2D_DESC d; g_backTex->GetDesc(&d);
+    Slot& cur = slots[n % 3];
+    if (cur.full) {                                                         // this slot's frame is two presents old: read it out first
+        D3D11_MAPPED_SUBRESOURCE ms;
+        if (SUCCEEDED(g_ctx->Map(cur.tex.Get(), 0, D3D11_MAP_READ, 0, &ms))) {
+            video_submit((const uint8_t*)ms.pData, cur.w, cur.h, ms.RowPitch, (uint32_t)cur.fmt, cur.frame);
+            g_ctx->Unmap(cur.tex.Get(), 0);
+        }
+        cur.full = false;
+    }
+    if (!cur.tex || cur.w != d.Width || cur.h != d.Height || cur.fmt != d.Format) {
+        D3D11_TEXTURE2D_DESC sd = d; sd.BindFlags = 0; sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
+        sd.MipLevels = 1; sd.ArraySize = 1; sd.SampleDesc.Count = 1;
+        cur.tex.Reset();
+        if (FAILED(g_dev->CreateTexture2D(&sd, nullptr, &cur.tex))) return;
+        cur.w = d.Width; cur.h = d.Height; cur.fmt = d.Format;
+    }
+    g_ctx->CopyResource(cur.tex.Get(), g_backTex.Get());
+    cur.frame = g_frame; cur.full = true;
+    n++;
+}
 static void write_shot() {
+    video_capture();
     take_screenshot_if_wanted();
     if (!g_logging) return;
     if (g_shotRingSize > 0) shot_ring();
@@ -4554,8 +4819,31 @@ static void do_swap(uint32_t front) {
             // and holding it to that tick's target would turn about 1 ms of lateness into a whole extra frame.
             static long long lastPresent = 0;
             const double sinceLast = lastPresent ? (double)(ready.QuadPart - lastPresent) * g_perfTicksToMs : 1e9;
-            const double wait = std::min(kPhaseMs - phase, 1000.0 / 60.0 - sinceLast);
-            if (wait <= 0 || !tick) nLate++;
+            double wait = std::min(kPhaseMs - phase, 1000.0 / 60.0 - sinceLast);
+            if (!tick) {
+                // This host has no game tick to hold to (gpu_note_tick is BCR2's). Release frames on an even cadence instead, one game frame
+                // period apart (two vblanks, gpu_frame_period_ms: 33.3 ms at 30 fps, 16.7 at 60, 41.7 at 24), the same clock the game runs
+                // on, so the two can't drift. A frame ready after its slot (by more than 0.5 ms) is shown at once and the cadence moves
+                // to it, so it settles just after the slowest recent frame and the rest wait for their slot: even frame times on a VRR
+                // display, at the cost of a few ms of latency.
+                double gpu_frame_period_ms();
+                static long long slot = 0;                                  // the next frame's release time (QPC)
+                const double period = gpu_frame_period_ms();
+                const long long periodQpc = (long long)(period / g_perfTicksToMs);
+                if (slot > ready.QuadPart + periodQpc) slot = ready.QuadPart + periodQpc;   // presents faster than the cadence (loading screens):
+                                                                                            // never hold one more than a frame period
+                const double late = slot ? (double)(ready.QuadPart - slot) * g_perfTicksToMs : 1e9;
+                if (late > 0.5) { slot = ready.QuadPart + periodQpc; wait = 0; nLate++; }
+                else { wait = late < 0 ? -late : 0; slot += periodQpc; }
+                if (wait > 0) {
+                    const long long until = ready.QuadPart + (long long)(wait / g_perfTicksToMs);
+                    { PerfScope th(g_swHold); gpu_wait_until(until); }
+                    LARGE_INTEGER q; QueryPerformanceCounter(&q); holdLateMax = std::max(holdLateMax, (double)(q.QuadPart - until) * g_perfTicksToMs);
+                }
+                wait = 0;                                                   // handled: skip the tick hold below
+            }
+            if (!tick) {}
+            else if (wait <= 0) nLate++;
             else {
                 const long long until = ready.QuadPart + (long long)(wait / g_perfTicksToMs);
                 { PerfScope th(g_swHold); gpu_wait_until(until); }
@@ -4568,6 +4856,7 @@ static void do_swap(uint32_t front) {
         } else {
         static const int kForce = getenv("ASURA_PRESENTINTERVAL") ? atoi(getenv("ASURA_PRESENTINTERVAL")) : -1;
         UINT interval = kForce >= 0 ? (UINT)kForce : ((g_presentFollowsDisplay.load() || g_vsync.load()) ? 1u : 0u);
+        if (kForce < 0) if (const UINT p = pulldown_interval()) interval = p;
         // A stall such as a load can leave one extra frame queued, and at a steady 1:1 rate that adds a full refresh of latency forever.
         // Every Present then blocks, so after 30 of those in a row, leave one frame out to empty the queue.
         static int blocked = 0;

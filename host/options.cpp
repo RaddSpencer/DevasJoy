@@ -3,11 +3,19 @@
 // arrow keys pick and change; B or Escape closes. While it is open the game gets a neutral pad (xam.cpp, options_capturing).
 // Settings live in asura.ini under the data root. An ASURA_* variable set by hand still wins, so test runs are unaffected.
 //   resscale = 0 (auto: the smallest multiple of 1280x720 covering the display) or 1..4. Read once at launch: changing it offers a restart.
-//   vsync    = 0 or 1. Applies at once.
+//   vsync    = 0 off, 1 on (both apply at once), 2 on for FreeSync / G-Sync displays: tearing allowed so the display follows the game,
+//              frames released on an even cadence (ASURA_VRR=1, xenos.cpp); needs a restart (the swap chain is made for it).
 //   gamma    = 50..150 (percent, 100 = as the game made it; lower is darker, for bright displays). Applies at once (present pass).
 //   showfps  = 0 or 1: frames per second and frame time in the top-left corner (ASURA_SHOWFPS=1 by hand).
-//   fps      = 30 or 60. 60 needs both of the game's caps lifted: the engine config's MaxSmoothedFrameRate (kfile.cpp reads it as 60:
+//   fps      = 24, 30 or 60 (ASURA_FPS by hand; ASURA_FPS60=1 still means 60). Other than 30 needs both of the game's caps changed: the engine config's MaxSmoothedFrameRate (kfile.cpp reads it as 60:
 //              ASURA_FPS60=1) and presenting every second vblank (the vblank runs at 120 Hz: ASURA_VBLANKHZ=120). Read at launch: restart.
+//              24: the config reads 24 and the vblank runs at 48 Hz. Shown one of two ways (pulldown):
+//   pulldown = 0: presented as soon as ready with tearing allowed (ASURA_VRR=1), for G-Sync / FreeSync displays; without one the
+//              picture tears. 1: 2:3 pulldown as on DVD players: frames held for 3 and 2 refreshes of a 60 Hz display in turn (vsync,
+//              no tearing, film judder; ASURA_PULLDOWN=1; xenos.cpp works out the cadence for other refresh rates).
+// Story Mode (uescript.cpp), each piece its own setting, applied at once; the Story Mode row turns both on or off together:
+//   invincible = 0 or 1: the player takes no damage (ASURA_INVINCIBLE=1 by hand).
+//   qteskip    = 0 or 1: QTEs succeed by themselves with no prompt (ASURA_QTESKIP=1 by hand). BURST prompts stay with the player.
 #define NOMINMAX
 #include "paths.h"
 #include <windows.h>
@@ -28,12 +36,16 @@ void gpu_set_vsync(bool on);                      // xenos.cpp
 void gpu_set_gamma(int percent);                  // xenos.cpp
 int gpu_render_scale();                           // xenos.cpp
 std::string gpu_fps_text();                       // xenos.cpp
+void video_finish();                              // video.cpp
+void story_set(bool invincible, bool qteskip);    // uescript.cpp
+bool story_invincible();
+bool story_qteskip();
 
 namespace {
-struct Settings { int resscale = 0; int vsync = 0; int gamma = 100; int showfps = 0; int fps = 30; };
+struct Settings { int resscale = 0; int vsync = 0; int gamma = 100; int showfps = 0; int fps = 30; int pulldown = 0; int invincible = 0; int qteskip = 0; };
 Settings g_saved;                                 // what asura.ini holds
-bool g_envRes = false, g_envVsync = false, g_envFps = false, g_envVblank = false;   // the variable came from the ini (a restart drops it), not from the user
-int g_runFps = 30;                                // the frame rate this process started with
+bool g_envRes = false, g_envVsync = false, g_envFps = false, g_envVblank = false, g_envVrr = false, g_envPulldown = false;   // the variable came from the ini (a restart drops it), not from the user
+int g_runFps = 30, g_runPulldown = 0, g_runVrr = 0;            // the frame rate (and 24 fps display) this process started with
 std::string ini_path() { return bcr2_data_root() + "\\asura.ini"; }
 void load(Settings& s) {
     if (FILE* f = fopen(ini_path().c_str(), "r")) {
@@ -41,10 +53,13 @@ void load(Settings& s) {
         while (fgets(line, sizeof line, f)) {
             int v;
             if (sscanf(line, " resscale = %d", &v) == 1) s.resscale = v < 0 ? 0 : v > 4 ? 4 : v;
-            else if (sscanf(line, " vsync = %d", &v) == 1) s.vsync = v ? 1 : 0;
+            else if (sscanf(line, " vsync = %d", &v) == 1) s.vsync = v < 0 ? 0 : v > 2 ? 2 : v;
             else if (sscanf(line, " gamma = %d", &v) == 1) s.gamma = v < 50 ? 50 : v > 150 ? 150 : v;
             else if (sscanf(line, " showfps = %d", &v) == 1) s.showfps = v ? 1 : 0;
-            else if (sscanf(line, " fps = %d", &v) == 1) s.fps = v >= 60 ? 60 : 30;
+            else if (sscanf(line, " fps = %d", &v) == 1) s.fps = v >= 60 ? 60 : v <= 24 ? 24 : 30;
+            else if (sscanf(line, " pulldown = %d", &v) == 1) s.pulldown = v ? 1 : 0;
+            else if (sscanf(line, " invincible = %d", &v) == 1) s.invincible = v ? 1 : 0;
+            else if (sscanf(line, " qteskip = %d", &v) == 1) s.qteskip = v ? 1 : 0;
         }
         fclose(f);
     }
@@ -54,14 +69,19 @@ void save(const Settings& s) {
         fprintf(f, "; Asura's Wrath recomp settings (written by the Graphics Options menu)\n");
         fprintf(f, "; resscale: 0 = auto, 1-4 = internal resolution as a multiple of 1280x720 (applies after a restart)\n");
         fprintf(f, "resscale = %d\n", s.resscale);
-        fprintf(f, "; vsync: 0 = off, 1 = on\n");
+        fprintf(f, "; vsync: 0 = off, 1 = on, 2 = on for FreeSync / G-Sync displays (even frame pacing; applies after a restart)\n");
         fprintf(f, "vsync = %d\n", s.vsync);
         fprintf(f, "; gamma: 50-150 percent, 100 = unchanged, lower = darker\n");
         fprintf(f, "gamma = %d\n", s.gamma);
         fprintf(f, "; showfps: 1 = frames per second in the top-left corner\n");
         fprintf(f, "showfps = %d\n", s.showfps);
-        fprintf(f, "; fps: 30 (as on the console) or 60 (applies after a restart)\n");
+        fprintf(f, "; fps: 24, 30 (as on the console) or 60 (applies after a restart)\n");
         fprintf(f, "fps = %d\n", s.fps);
+        fprintf(f, "; pulldown (24 fps only): 0 = for G-Sync / FreeSync displays (tears without one), 1 = 2:3 pulldown on a 60 Hz display\n");
+        fprintf(f, "pulldown = %d\n", s.pulldown);
+        fprintf(f, "; Story Mode: invincible = 1, the player takes no damage; qteskip = 1, QTEs succeed by themselves (BURST stays with the player)\n");
+        fprintf(f, "invincible = %d\n", s.invincible);
+        fprintf(f, "qteskip = %d\n", s.qteskip);
         fclose(f);
     }
 }
@@ -72,7 +92,7 @@ std::mutex g_lock;                                // menu state below, between t
 Settings g_cur;                                   // what the menu shows
 int g_row = 0;
 uint64_t g_version = 1;                           // bumped when the picture changes
-enum Row { kRes, kRate, kVsync, kGamma, kFps, kRestart, kClose, kRows };
+enum Row { kRes, kRate, kVsync, kGamma, kFps, kStory, kInvincible, kQteSkip, kRestart, kClose, kRows };
 std::atomic<bool> g_showFps{false};
 
 int auto_scale() {
@@ -87,15 +107,22 @@ std::wstring res_text(int s) {
 }
 bool restart_needed() {
     const int want = g_cur.resscale == 0 ? auto_scale() : g_cur.resscale;
-    return want != gpu_render_scale() || g_cur.fps != g_runFps;
+    const int wantVrr = g_cur.fps == 24 ? !g_cur.pulldown : g_cur.vsync == 2;
+    return want != gpu_render_scale() || g_cur.fps != g_runFps || (g_cur.fps == 24 && g_cur.pulldown != g_runPulldown) || wantVrr != g_runVrr;
 }
-bool row_enabled(int r) { return r != kRestart || restart_needed(); }
+// The Vsync row holds the 24 fps modes too: 0 Off, 1 On, 2 24 fps for FreeSync / G-Sync displays, 3 24 fps with 2:3 pulldown.
+// The 24 fps choices set fps = 24 (and pulldown); Frame Rate then shows 24 and can't be changed until Vsync is set back to Off or On.
+int vsync_choice() { return g_cur.fps == 24 ? (g_cur.pulldown ? 4 : 3) : g_cur.vsync; }   // 0 Off, 1 On, 2 On (VRR), 3 24 fps VRR, 4 24 fps pulldown
+int g_lastRate = 30;                              // the 30 / 60 setting to return to when Vsync leaves the 24 fps choices
+bool row_enabled(int r) { return (r != kRestart || restart_needed()) && (r != kRate || g_cur.fps != 24); }
 
 void restart() {
     // Variables the ini put in the environment would pin the old values in the new process: drop them so it reads the ini again.
     if (g_envRes) _putenv_s("ASURA_RESSCALE", "");
     if (g_envVsync) _putenv_s("ASURA_VSYNC", "");
-    if (g_envFps) _putenv_s("ASURA_FPS60", "");
+    if (g_envFps) _putenv_s("ASURA_FPS", "");
+    if (g_envVrr) _putenv_s("ASURA_VRR", "");
+    if (g_envPulldown) _putenv_s("ASURA_PULLDOWN", "");
     if (g_envVblank) _putenv_s("ASURA_VBLANKHZ", "");
     STARTUPINFOW si{}; si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
@@ -104,6 +131,7 @@ void restart() {
         CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
         fprintf(stderr, "[options] restarting for the new internal resolution or frame rate\n");
         fflush(stderr);
+        video_finish();                                                     // video.cpp: keep a recording playable
         ExitProcess(0);
     }
     fprintf(stderr, "[options] restart failed (%lu)\n", GetLastError());
@@ -111,10 +139,17 @@ void restart() {
 
 void change(int dir) {
     if (g_row == kRes) { g_cur.resscale = (g_cur.resscale + dir + 5) % 5; }
-    else if (g_row == kRate) { g_cur.fps = g_cur.fps == 60 ? 30 : 60; }
-    else if (g_row == kVsync) { g_cur.vsync ^= 1; gpu_set_vsync(g_cur.vsync != 0); }
+    else if (g_row == kRate) { if (g_cur.fps == 24) return; g_cur.fps = g_lastRate = g_cur.fps == 60 ? 30 : 60; }
+    else if (g_row == kVsync) {                                             // Off, On, 24 fps (FreeSync / G-Sync), 24 fps (2:3 pulldown)
+        const int i = (vsync_choice() + dir + 5) % 5;
+        if (i < 3) { if (g_cur.fps == 24) g_cur.fps = g_lastRate; g_cur.vsync = i; if (!g_runVrr) gpu_set_vsync(i == 1); }
+        else { if (g_cur.fps != 24) g_lastRate = g_cur.fps; g_cur.fps = 24; g_cur.pulldown = i == 4; }
+    }
     else if (g_row == kGamma) { g_cur.gamma = std::clamp(g_cur.gamma + dir * 5, 50, 150); gpu_set_gamma(g_cur.gamma); }
     else if (g_row == kFps) { g_cur.showfps ^= 1; g_showFps = g_cur.showfps != 0; }
+    else if (g_row == kStory) { const int on = (g_cur.invincible && g_cur.qteskip) ? 0 : 1; g_cur.invincible = g_cur.qteskip = on; story_set(on, on); }
+    else if (g_row == kInvincible) { g_cur.invincible ^= 1; story_set(g_cur.invincible, g_cur.qteskip); }
+    else if (g_row == kQteSkip) { g_cur.qteskip ^= 1; story_set(g_cur.invincible, g_cur.qteskip); }
     else return;
     g_saved = g_cur; save(g_saved);
     g_version++;
@@ -152,17 +187,32 @@ uint32_t read_input() {
 }  // namespace
 
 // Before the renderer reads its switches (xenos.cpp calls this first): the ini's values, unless the variable is already set.
+// The frame rate asked for: ASURA_FPS=24|30|60, or ASURA_FPS60=1 (60). kfile.cpp reads the engine config's 30 as this.
+int settings_target_fps() {
+    if (const char* e = getenv("ASURA_FPS")) { const int v = atoi(e); return v >= 60 ? 60 : v > 0 && v <= 24 ? 24 : 30; }
+    if (const char* e = getenv("ASURA_FPS60")) if (atoi(e)) return 60;
+    return 30;
+}
 void settings_apply_to_env() {
     load(g_saved);
     g_cur = g_saved;
     char v[16];
     if (!getenv("ASURA_RESSCALE") && g_saved.resscale > 0) { snprintf(v, sizeof v, "%d", g_saved.resscale); _putenv_s("ASURA_RESSCALE", v); g_envRes = true; }
-    if (!getenv("ASURA_VSYNC")) { snprintf(v, sizeof v, "%d", g_saved.vsync); _putenv_s("ASURA_VSYNC", v); g_envVsync = true; }
-    if (!getenv("ASURA_FPS60") && g_saved.fps == 60) { _putenv_s("ASURA_FPS60", "1"); g_envFps = true; }
-    const bool fps60 = getenv("ASURA_FPS60") && atoi(getenv("ASURA_FPS60")) != 0;
-    if (fps60 && !getenv("ASURA_VBLANKHZ")) { _putenv_s("ASURA_VBLANKHZ", "120"); g_envVblank = true; }
-    g_runFps = fps60 ? 60 : 30;
+    if (!getenv("ASURA_VSYNC")) { snprintf(v, sizeof v, "%d", g_saved.vsync == 1 ? 1 : 0); _putenv_s("ASURA_VSYNC", v); g_envVsync = true; }
+    if (g_saved.vsync == 2 && g_saved.fps != 24 && !getenv("ASURA_VRR")) { _putenv_s("ASURA_VRR", "1"); g_envVrr = true; }
+    if (!getenv("ASURA_FPS") && !getenv("ASURA_FPS60") && g_saved.fps != 30) { _putenv_s("ASURA_FPS", g_saved.fps == 60 ? "60" : "24"); g_envFps = true; }
+    const int fps = settings_target_fps();
+    if (fps != 30 && !getenv("ASURA_VBLANKHZ")) { _putenv_s("ASURA_VBLANKHZ", fps == 60 ? "120" : "48"); g_envVblank = true; }   // the game presents every second vblank
+    if (fps == 24 && !getenv("ASURA_PULLDOWN") && !getenv("ASURA_VRR")) {
+        if (g_saved.pulldown) { _putenv_s("ASURA_PULLDOWN", "1"); g_envPulldown = true; }
+        else { _putenv_s("ASURA_VRR", "1"); g_envVrr = true; }
+    }
+    g_runFps = fps;
+    g_runPulldown = getenv("ASURA_PULLDOWN") && atoi(getenv("ASURA_PULLDOWN")) != 0;
+    g_runVrr = getenv("ASURA_VRR") != nullptr;
     g_cur.fps = g_saved.fps = g_runFps;                                     // the menu shows the frame rate in use, however it was set
+    if (fps == 24) g_cur.pulldown = g_saved.pulldown = g_runPulldown;
+    else g_lastRate = fps;
 }
 int settings_button_set() { return 0; }
 
@@ -181,6 +231,9 @@ void options_frame() {
         if (const char* e = getenv("ASURA_SHOWFPS")) g_saved.showfps = atoi(e) ? 1 : 0;
         g_cur.showfps = g_saved.showfps;
         g_showFps = g_saved.showfps != 0;
+        story_set(g_saved.invincible, g_saved.qteskip);                     // ASURA_INVINCIBLE / ASURA_QTESKIP set by hand win (story_set leaves them)
+        g_cur.invincible = g_saved.invincible = story_invincible() ? 1 : 0;   // shown as the values in use
+        g_cur.qteskip = g_saved.qteskip = story_qteskip() ? 1 : 0;
     }
     static uint32_t prev = 0;
     static int repeatDir = 0; static ULONGLONG repeatAt = 0;
@@ -230,23 +283,26 @@ bool options_picture(int w, int h, std::vector<uint8_t>& rgba, uint64_t& version
     HGDIOBJ oldBmp = SelectObject(dc, bmp);
     memset(bits, 0, (size_t)w * h * 4);
     SetBkMode(dc, TRANSPARENT);
-    const int unit = h / 12;                                                // row height
+    const int unit = h / 15;                                                // row height
     auto font = [&](int px, int weight) { return CreateFontW(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, VARIABLE_PITCH, L"Segoe UI"); };
     HFONT fTitle = font(unit * 7 / 10, FW_SEMIBOLD), fRow = font(unit * 11 / 20, FW_NORMAL), fHint = font(unit * 2 / 5, FW_NORMAL);
     auto text = [&](HFONT f, COLORREF c, int x, int y, int ww, int hh, const std::wstring& s, UINT fmt) {
         SelectObject(dc, f); SetTextColor(dc, c); RECT r{ x, y, x + ww, y + hh }; DrawTextW(dc, s.c_str(), -1, &r, fmt | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
     };
     const int pad = w / 20;
-    text(fTitle, RGB(255, 255, 255), pad, unit / 2, w - 2 * pad, unit, L"Graphics Options", DT_LEFT);
+    text(fTitle, RGB(255, 255, 255), pad, unit / 2, w - 2 * pad, unit, L"Options", DT_LEFT);
     struct Line { std::wstring label, value; bool enabled; };
     const int cur = g_cur.resscale == 0 ? auto_scale() : g_cur.resscale;
     Line lines[kRows] = {
         { L"Internal Resolution", L"◀  " + res_text(g_cur.resscale) + L"  ▶", true },
-        { L"Frame Rate", L"◀  " + std::to_wstring(g_cur.fps) + L" fps  ▶", true },
-        { L"Vsync", std::wstring(L"◀  ") + (g_cur.vsync ? L"On" : L"Off") + L"  ▶", true },
+        { L"Frame Rate", g_cur.fps == 24 ? std::wstring(L"24 fps (set by Vsync)") : L"◀  " + std::to_wstring(g_cur.fps) + L" fps  ▶", g_cur.fps != 24 },
+        { L"Vsync", std::wstring(L"◀  ") + (vsync_choice() == 0 ? L"Off" : vsync_choice() == 1 ? L"On" : vsync_choice() == 2 ? L"On (FreeSync / G-Sync)" : vsync_choice() == 3 ? L"24 fps (FreeSync / G-Sync recommended)" : L"24 fps (2:3 pulldown)") + L"  ▶", true },
         { L"Gamma", L"◀  " + std::to_wstring(g_cur.gamma) + L"%  ▶", true },
         { L"Show FPS", std::wstring(L"◀  ") + (g_cur.showfps ? L"On" : L"Off") + L"  ▶", true },
-        { L"Restart to apply", restart_needed() ? L"now " + res_text(gpu_render_scale()) + L", " + std::to_wstring(g_runFps) + L" fps" : L"", restart_needed() },
+        { L"Story Mode", std::wstring(L"◀  ") + (g_cur.invincible && g_cur.qteskip ? L"On" : g_cur.invincible || g_cur.qteskip ? L"Custom" : L"Off") + L"  ▶", true },
+        { L"    Invincibility", std::wstring(L"◀  ") + (g_cur.invincible ? L"On" : L"Off") + L"  ▶", true },
+        { L"    Automatic QTEs", std::wstring(L"◀  ") + (g_cur.qteskip ? L"On" : L"Off") + L"  ▶", true },
+        { L"Restart to apply", restart_needed() ? L"now " + res_text(gpu_render_scale()) + L", " + std::to_wstring(g_runFps) + L" fps" + (g_runFps == 24 ? (g_runPulldown ? L" pulldown" : L" VRR") : L"") : L"", restart_needed() },
         { L"Close", L"", true },
     };
     (void)cur;
@@ -262,6 +318,9 @@ bool options_picture(int w, int h, std::vector<uint8_t>& rgba, uint64_t& version
         text(fRow, lines[i].enabled ? c : RGB(110, 110, 110), w / 2 - pad, y, w / 2, unit, lines[i].value, DT_RIGHT);
     }
     std::wstring note = restart_needed() ? L"Internal resolution and frame rate change when the game restarts." : L"Settings are saved to asura.ini.";
+    if (g_cur.fps == 24 && (g_row == kVsync || !g_cur.pulldown))
+        note = g_cur.pulldown ? L"24 fps shown 3:2 on a 60 Hz display, as DVD players do: no tearing, slight film judder."
+                              : L"Warning: 24 fps needs a G-Sync or FreeSync display. Without one the picture will tear.";
     text(fHint, RGB(180, 180, 180), pad, h - unit * 2, w - 2 * pad, unit, note, DT_LEFT);
     text(fHint, RGB(180, 180, 180), pad, h - unit * 5 / 4, w - 2 * pad, unit, L"Up/Down: choose    Left/Right: change    A: select    B / Back: close", DT_LEFT);
     GdiFlush();

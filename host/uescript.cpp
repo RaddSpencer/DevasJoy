@@ -6,6 +6,7 @@
 #include <string>
 #include <mutex>
 #include <map>
+#include <atomic>
 #include <cctype>
 #include <cstdarg>
 #include <vector>
@@ -221,6 +222,177 @@ static void script_dump(uint32_t self, const std::string& cls, const std::string
     }
 }
 
+// ASURA_CLASSDUMP=<class text> (debug): once, for the first object of a matching class seen in an event, dump its class object and
+// walk what looks like the class's field list: any pointer in the class to an object whose class ends in "Property" / "Function",
+// followed through the dword at +0x3C (UField::Next), printing each field's name, kind and its dwords +0x3C..+0x7C.
+static void class_dump(uint32_t self, const std::string& cls) {
+    static const char* kWant = getenv("ASURA_CLASSDUMP");
+    static std::map<std::string, bool> done;                                  // a comma-separated list: one dump per entry
+    if (!kWant) return;
+    std::string hit;
+    for (const char* p = kWant; *p;) { const char* q = strchr(p, ','); std::string w(p, q ? q - p : strlen(p)); if (!w.empty() && cls.find(w) != std::string::npos) { hit = w; break; } if (!q) break; p = q + 1; }
+    if (hit.empty() || done[hit]) return;
+    done[hit] = true;
+    auto ends = [](const std::string& s, const char* t) { const size_t n = strlen(t); return s.size() >= n && s.compare(s.size() - n, n, t) == 0; };
+    for (uint32_t c = rd32(self + kClassOff), depth = 0; c && readable(c, 0x100) && depth < 8; depth++) {
+        std::string s = S("[cdump] class %s %08X (class %s):", ue_obj_name(c).c_str(), c, ue_class_name(c).c_str());
+        for (uint32_t o = 0; o < 0x100; o += 4) s += S("%s%08X", o % 32 ? " " : S("\n[cdump]   +%03X ", o).c_str(), rd32(c + o));
+        fprintf(stderr, "%s\n", s.c_str());
+        uint32_t super = 0;
+        for (uint32_t o = 0x3C; o < 0x100; o += 4) {
+            const uint32_t p = rd32(c + o);
+            if (!readable(p, 0x80)) continue;
+            const std::string k = ue_class_name(p);
+            if (k == "Class" && !super && p != c) { super = p; fprintf(stderr, "[cdump]   +%03X -> class %s %08X\n", o, ue_obj_name(p).c_str(), p); continue; }
+            if (!ends(k, "Property") && !ends(k, "Function") && !ends(k, "Const") && !ends(k, "Enum") && !ends(k, "State") && !ends(k, "Struct")) continue;
+            fprintf(stderr, "[cdump]   +%03X -> field list from %s %s\n", o, k.c_str(), ue_obj_name(p).c_str());
+            for (uint32_t f = p, n = 0; f && readable(f, 0x80) && n < 400; f = rd32(f + 0x3C), n++) {
+                std::string l = S("[cdump]     %08X %-16s %-28s", f, ue_class_name(f).c_str(), ue_obj_name(f).c_str());
+                for (uint32_t q = 0x3C; q < 0x80; q += 4) l += S(" %08X", rd32(f + q));
+                fprintf(stderr, "%s\n", l.c_str());
+            }
+        }
+        c = super;
+    }
+}
+
+// UE3 reflection, as laid out in this build (found with ASURA_CLASSDUMP): UField::Next at +0x3C; UStruct::SuperField at +0x40 and
+// Children (the first field) at +0x44; UProperty::Offset at +0x54; UBoolProperty::BitMask at +0x64. ue_field_offset looks a
+// property up by name through a class and its parents (cached per class); -1 if there is none. For a bool, mask gets its bit.
+static int ue_field_offset(uint32_t cls, const char* name, uint32_t* mask = nullptr) {
+    static std::map<std::pair<uint32_t, std::string>, std::pair<int, uint32_t>> cache;
+    const auto key = std::make_pair(cls, std::string(name));
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        std::pair<int, uint32_t> r{-1, 0};
+        for (uint32_t c = cls, depth = 0; c && readable(c, 0x48) && depth < 16 && r.first < 0; c = rd32(c + 0x40), depth++)
+            for (uint32_t f = rd32(c + 0x44), n = 0; f && readable(f, 0x60) && n < 2000; f = rd32(f + 0x3C), n++)
+                if (ue_obj_name(f) == name) { r = { (int)rd32(f + 0x54), rd32(f + 0x64) }; break; }
+        if (r.first < 0 || r.first > 0x10000) r = {-1, 0};
+        fprintf(stderr, "[ue] %s.%s at %s%X%s\n", ue_obj_name(cls).c_str(), name, r.first < 0 ? "(none) " : "+", r.first < 0 ? 0 : r.first,
+                ue_class_name(cls) == "Class" && mask && r.first >= 0 ? S(" mask %08X", r.second).c_str() : "");
+        it = cache.emplace(key, r).first;
+    }
+    if (mask) *mask = it->second.second;
+    return it->second.first;
+}
+
+// Every property of an object with its value, by the class's own field lists (subclass first): ints, floats, bools, bytes, names,
+// object references (by name), and arrays as {count}. Structs are shown as their first dwords. For reading an unknown object's state.
+static std::vector<std::pair<std::string, std::string>> ue_props(uint32_t obj) {
+    std::vector<std::pair<std::string, std::string>> out;
+    if (!readable(obj, 0x40)) return out;
+    for (uint32_t c = rd32(obj + kClassOff), depth = 0; c && readable(c, 0x48) && depth < 6; c = rd32(c + 0x40), depth++) {
+        const std::string cname = ue_obj_name(c);
+        if (cname == "Object") break;
+        for (uint32_t f = rd32(c + 0x44), k = 0; f && readable(f, 0x60) && k < 4000; f = rd32(f + 0x3C), k++) {
+            const std::string kind = ue_class_name(f);
+            if (kind.size() < 8 || kind.compare(kind.size() - 8, 8, "Property") != 0) continue;
+            const uint32_t off = rd32(f + 0x54), size = rd32(f + 0x44);
+            if (off > 0x4000 || !readable(obj + off, 4)) continue;
+            const uint32_t v = rd32(obj + off);
+            std::string val;
+            if (kind == "IntProperty") val = S("%d", (int32_t)v);
+            else if (kind == "FloatProperty") { float x; memcpy(&x, &v, 4); val = S("%g", x); }
+            else if (kind == "BoolProperty") val = (v & rd32(f + 0x64)) ? "true" : "false";
+            else if (kind == "ByteProperty") val = S("%u", g_base[obj + off]);
+            else if (kind == "NameProperty") val = ue_name(v, rd32(obj + off + 4));
+            else if (kind == "ObjectProperty" || kind == "ClassProperty" || kind == "ComponentProperty") val = v ? ue_obj_name(v) : "None";
+            else if (kind == "ArrayProperty") {                                 // the count, and for short arrays each element's first 0x40 bytes
+                const uint32_t cnt = rd32(obj + off + 4);
+                val = S("{%u}", cnt);
+                for (uint32_t e = 0; e < cnt && e < 4 && v && readable(v + e * 0x40, 0x40); e++) {
+                    val += S(" [%u:", e);
+                    for (uint32_t q = 0; q < 0x40; q += 4) val += S(" %08X", rd32(v + e * 0x40 + q));
+                    val += "]";
+                }
+            }
+            else if (kind == "StrProperty") val = "\"" + wide_at(v) + "\"";
+            else { val = S("%08X", v); for (uint32_t q = 4; q < size && q < 0x40; q += 4) val += S(" %08X", rd32(obj + off + q)); }   // structs: all their dwords
+            out.push_back({ cname + "." + ue_obj_name(f), val });
+        }
+    }
+    return out;
+}
+void ue_dump_props(uint32_t obj, const char* tag) {
+    if (!readable(obj, 0x40)) return;
+    std::string out = S("[props] f=%llu %s %s (%s %08X):", (unsigned long long)gpu_frame_number(), tag, ue_obj_name(obj).c_str(), ue_class_name(obj).c_str(), obj);
+    int n = 0;
+    for (auto& kv : ue_props(obj)) out += S("%s%s=%s", n++ % 6 ? "  " : "\n[props]   ", kv.first.c_str(), kv.second.c_str());
+    fprintf(stderr, "%s\n", out.c_str());
+}
+// ASURA_PROPWATCH=<class name>[,<class name>...] (debug): at each Tick of an object of that class, log the properties that changed since
+// its previous Tick ([pwatch]). Slow (the whole property list each Tick): for finding which field means "open", "shown" and so on.
+static void prop_watch(uint32_t self, const std::string& cls, const std::string& ev) {
+    static const char* kWant = getenv("ASURA_PROPWATCH");
+    if (!kWant || ev != "Tick") return;
+    if (("," + std::string(kWant) + ",").find("," + cls + ",") == std::string::npos) return;
+    static std::map<uint32_t, std::map<std::string, std::string>> last;
+    auto& m = last[self];
+    std::string out;
+    for (auto& kv : ue_props(self)) {
+        auto it = m.find(kv.first);
+        if (it != m.end() && it->second != kv.second) out += S("  %s: %s -> %s", kv.first.c_str(), it->second.c_str(), kv.second.c_str());
+        m[kv.first] = kv.second;
+    }
+    if (!out.empty()) fprintf(stderr, "[pwatch] f=%llu %s %08X:%s\n", (unsigned long long)gpu_frame_number(), cls.c_str(), self, out.c_str());
+}
+
+// Story Mode. Each piece is a switch the settings menu sets at run time (options.cpp); ASURA_INVINCIBLE / ASURA_QTESKIP set by hand win.
+static std::atomic<int> g_invincible{-1}, g_qteSkip{-1};                       // -1: not set yet (read the environment)
+static bool env_on(const char* n) { const char* e = getenv(n); return e && *e && strcmp(e, "0") != 0; }
+bool story_invincible() { int v = g_invincible.load(); if (v < 0) { v = env_on("ASURA_INVINCIBLE"); g_invincible = v; } return v != 0; }
+bool story_qteskip() { int v = g_qteSkip.load(); if (v < 0) { v = env_on("ASURA_QTESKIP"); g_qteSkip = v; } return v != 0; }
+void story_set(bool invincible, bool qteskip) {
+    if (!getenv("ASURA_INVINCIBLE")) g_invincible = invincible;
+    if (!getenv("ASURA_QTESKIP")) g_qteSkip = qteskip;
+}
+
+// ASURA_INVINCIBLE=1 (Story Mode): the player takes no damage. The player is BCPawn_Player_asr (and the other BCPawn_Player
+// classes); UE3's Pawn.Health (+0x2D8) and HealthMax (+0x2DC) are looked up by name. At every script event the player gets (Tick
+// each frame, and the damage notifications) its Health is put back to HealthMax, and its Controller's bGodMode is set, which
+// UE3's damage code checks (Pawn.InGodMode) before taking any health off.
+// ASURA_HEALTHLOG=1 logs the player's Health whenever it changes (with or without invincibility).
+static void player_health(uint32_t self, const char* when) {
+    static const bool kLog = env_on("ASURA_HEALTHLOG");
+    const bool inv = story_invincible();
+    if (!inv && !kLog) return;
+    const uint32_t cls = rd32(self + kClassOff);
+    static std::map<uint32_t, bool> isPlayer;
+    auto it = isPlayer.find(cls);
+    if (it == isPlayer.end()) it = isPlayer.emplace(cls, ue_obj_name(cls).rfind("BCPawn_Player", 0) == 0).first;
+    if (!it->second) return;
+    const int hOff = ue_field_offset(cls, "Health"), mOff = ue_field_offset(cls, "HealthMax");
+    if (hOff < 0 || mOff < 0 || !readable(self + mOff, 4)) return;
+    const int32_t h = (int32_t)rd32(self + hOff), hm = (int32_t)rd32(self + mOff);
+    static std::map<uint32_t, int32_t> last;
+    if (kLog && last[self] != h) fprintf(stderr, "[health] f=%llu %s %08X %s: Health %d (was %d) of %d\n", (unsigned long long)gpu_frame_number(),
+                                         ue_obj_name(self).c_str(), self, when, h, last[self], hm);
+    last[self] = h;
+    {   // ASURA_HEALTHLOG=2: also every 300 frames, the player's Health line and all its properties (slow: a diagnostic replay only)
+        static const bool kFull = []{ const char* e = getenv("ASURA_HEALTHLOG"); return e && atoi(e) >= 2; }();
+        static uint64_t next = 0;
+        const uint64_t fr = gpu_frame_number();
+        if (kFull && fr >= next) {
+            next = fr + 300;
+            fprintf(stderr, "[health] f=%llu %s (%s) %08X: Health %d of %d\n", (unsigned long long)fr, ue_obj_name(self).c_str(), ue_obj_name(cls).c_str(), self, h, hm);
+            ue_dump_props(self, "player");
+        }
+    }
+    if (!inv) return;
+    if (hm > 0 && h > 0 && h < hm) { wr32(self + hOff, (uint32_t)hm); last[self] = hm; }
+    const int cOff = ue_field_offset(cls, "Controller");
+    const uint32_t ctl = cOff >= 0 ? rd32(self + cOff) : 0;
+    if (ctl && readable(ctl, 0x40)) {
+        uint32_t mask = 0;
+        const int gOff = ue_field_offset(rd32(ctl + kClassOff), "bGodMode", &mask);
+        if (gOff >= 0 && mask && readable(ctl + gOff, 4) && !(rd32(ctl + gOff) & mask)) {
+            wr32(ctl + gOff, rd32(ctl + gOff) | mask);
+            fprintf(stderr, "[invincible] f=%llu %s: bGodMode set\n", (unsigned long long)gpu_frame_number(), ue_obj_name(ctl).c_str());
+        }
+    }
+}
+
 // ASURA_QTESKIP=1 (Story Mode): every QTE succeeds at once, with no prompt and no prompt sound. A QTE is a Kismet action,
 // BCSeqAct_InputDivergence (vtable 821BED08): Activated fires its "Input Start" output; its native update (sub_82981178) then sends
 // the script event Update each frame (the ProcessEvent call returning to 82981250). The first Update registers the buttons with the
@@ -229,8 +401,7 @@ static void script_dump(uint32_t self, const std::string& cls, const std::string
 // run at all: "Success" is fired and the flags set as on success. Output links: TArray at +0x78 of 0x2C-byte entries {Links TArray,
 // LinkDesc FString at +0x0C, bits at +0x18 (top bit: impulse)}; "Success" is found by its description.
 static bool qte_skip(uint32_t self, uint32_t lr) {
-    static const bool kOn = [] { const char* e = getenv("ASURA_QTESKIP"); return e && *e && strcmp(e, "0") != 0; }();
-    if (!kOn || lr != 0x82981250u || !readable(self, 0x120)) return false;   // any action run by this native update (subclasses too)
+    if (lr != 0x82981250u || !story_qteskip() || !readable(self, 0x120)) return false;   // any action run by this native update (subclasses too)
     // Succeed only after about the time a player takes, so cinematics that expect the input window don't run ahead and then hold
     // (the B mash at ~12,776 in episode 1). +0xDC: the time limit in seconds when the QTE has one (0 otherwise; a no-input QTE
     // with 0.866 there ended after 26 frames); +0x118: presses needed (1, or 15/30 for the mashes). Wait half the limit (0.73 s,
@@ -306,12 +477,75 @@ static void qte_trace(uint32_t self, uint32_t lr, uint32_t parms, const char* wh
     if (!s.empty()) fprintf(stderr, "[qtetrace] f=%llu %08X %s:%s\n", f, self, when, s.c_str());
 }
 
-// UObject::ProcessEvent(UFunction*, void* parms, void* result): every script event sent from native code.
+// A script function of a class (or its parents) by name, or 0 (the same field lists as properties: functions are UFields too).
+static uint32_t ue_find_function(uint32_t cls, const char* name) {
+    static std::map<std::pair<uint32_t, std::string>, uint32_t> cache;
+    const auto key = std::make_pair(cls, std::string(name));
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+    uint32_t r = 0;
+    for (uint32_t c = cls, depth = 0; c && readable(c, 0x48) && depth < 16 && !r; c = rd32(c + 0x40), depth++)
+        for (uint32_t f = rd32(c + 0x44), n = 0; f && readable(f, 0x60) && n < 4000; f = rd32(f + 0x3C), n++)
+            if (ue_class_name(f) == "Function" && ue_obj_name(f) == name) { r = f; break; }
+    fprintf(stderr, "[ue] %s.%s() %s %08X\n", ue_obj_name(cls).c_str(), name, r ? "at" : "not found", r);
+    cache[key] = r;
+    return r;
+}
+// Calling a script function on an object from the host (from inside the ProcessEvent hook, on the game thread): ue_find_function finds
+// it, ue_call_event sends it like an event with a zeroed parameter block. Tried for the Synchronic Y icon that stayed on screen
+// (BCGFxUI_Synchronic.EndSynchronic, BCGFxMovieButton.FinishAll: neither cleared it; the renderer hides it, xenos.cpp); kept for later.
 PPC_FUNC_IMPL(__imp__sub_82260F60);
+static void ue_call_event(PPCContext& ctx, uint8_t* base, uint32_t obj, uint32_t fn) {
+    PPCContext c = ctx;
+    const uint32_t sp = ctx.r1.u32;
+    const uint32_t parms = (sp - 0x400) & ~15u;                            // a zeroed parameter block below the caller's frame
+    memset(g_base + parms, 0, 0x200);
+    c.r1.u64 = (sp - 0x800) & ~15u;                                         // the callee's frames go below the block
+    c.r3.u64 = obj; c.r4.u64 = fn; c.r5.u64 = parms; c.r6.u64 = 0; c.lr = 0;
+    __imp__sub_82260F60(c, base);
+}
+
+// UObject::ProcessEvent(UFunction*, void* parms, void* result): every script event sent from native code.
 PPC_FUNC(sub_82260F60) {
     const uint32_t tSelf = ctx.r3.u32, tLr = (uint32_t)ctx.lr, tParms = ctx.r5.u32;
     qte_trace(tSelf, tLr, tParms, "before");
     if (qte_skip(ctx.r3.u32, (uint32_t)ctx.lr)) return;
+    struct HealthAfter { uint32_t self; ~HealthAfter() { player_health(self, "after"); } } healthAfter{tSelf};   // also on every return path
+    // The Scaleform movie Story Mode looks after, by class (cached per class object, so this costs a lookup per event, not a name)
+    static std::map<uint32_t, int> kinds;                                   // 2 BCGFxUI_Advertise, 0 anything else
+    const uint32_t tCls = readable(tSelf, 0x40) ? rd32(tSelf + kClassOff) : 0;
+    auto kit = kinds.find(tCls);
+    if (kit == kinds.end()) { const std::string n = ue_obj_name(tCls); kit = kinds.emplace(tCls, n == "BCGFxUI_Advertise" ? 2 : 0).first; }
+    // Story Mode: the help popups (BCGFxUI_Advertise with bUsePause: the game waits for A, such as episode 3's Synchronic tutorial)
+    // are closed as soon as they take input: A is pressed once bInputNext is set (the "A Close" hint, about a second after opening;
+    // an A before that is ignored, and setting bInputNext early didn't help: logs\endsync2).
+    if (kit->second == 2 && story_qteskip()) {
+        static uint32_t answered = 0;                                       // the popup (object) already answered while it stays open
+        uint32_t mPause = 0, mNext = 0;
+        const int oPause = ue_field_offset(tCls, "bUsePause", &mPause), oNext = ue_field_offset(tCls, "bInputNext", &mNext);
+        if (oPause >= 0 && oNext >= 0 && mPause && mNext) {
+            const bool open = (rd32(tSelf + oPause) & mPause) != 0;
+            if (!open) answered = 0;
+            else if (answered != tSelf && (rd32(tSelf + oNext) & mNext)) {
+                answered = tSelf;
+                void input_press_at(uint16_t buttons, uint32_t delayMs, uint32_t holdMs);
+                input_press_at(0x1000, 0, 100);                             // A
+                fprintf(stderr, "[story] f=%llu help popup %s closed (A)\n", (unsigned long long)gpu_frame_number(), ue_obj_name(tSelf).c_str());
+            }
+        }
+    }
+    player_health(tSelf, "before");
+    static const bool kClassDump = getenv("ASURA_CLASSDUMP") != nullptr;
+    if (kClassDump) class_dump(tSelf, ue_class_name(tSelf));
+    {   // ASURA_PROPDUMP=<class name>: the property values of the first object of that class (exact name) seen in an event, once
+        static const char* kProp = getenv("ASURA_PROPDUMP");
+        static bool done = false;
+        if (kProp && !done && ue_class_name(tSelf) == kProp) { done = true; ue_dump_props(tSelf, "first event"); }
+    }
+    {   // ASURA_PROPWATCH (debug) and the Story Mode Synchronic UI cleanup: both look at Tick events of particular classes
+        static const bool kWatch = getenv("ASURA_PROPWATCH") != nullptr;
+        if (kWatch) prop_watch(tSelf, ue_class_name(tSelf), ue_obj_name(ctx.r4.u32));
+    }
     static const bool kTrace = getenv("ASURA_QTETRACE") != nullptr;
     if (!scriptlog_active()) { __imp__sub_82260F60(ctx, base); if (kTrace) qte_trace(tSelf, tLr, tParms, "after"); return; }
     const uint32_t self = ctx.r3.u32, fn = ctx.r4.u32, parms = ctx.r5.u32;
@@ -326,3 +560,6 @@ PPC_FUNC(sub_82260F60) {
     script_dump(self, cls, ev, "after");
     if (kTrace) qte_trace(tSelf, tLr, tParms, "after");
 }
+
+// A property's offset in an object, looked up by name through its class (hooks.cpp); -1 if the class has none.
+int ue_object_field(uint32_t obj, const char* name) { return readable(obj, 0x40) ? ue_field_offset(rd32(obj + kClassOff), name) : -1; }

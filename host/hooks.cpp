@@ -237,12 +237,111 @@ static void qtelog(const char* name, uint32_t self, uint32_t result) {
     last[key] = result;
     fprintf(stderr, "[qtelog] f=%llu %s this=%08X -> %08X\n", (unsigned long long)gpu_frame_number(), name, self, result);
 }
+// ASURA_SYNCLOG=1: the timed, graded QTEs (a shrinking ring, rated by timing) are "Synchronic" matinee tracks, BCInterpTrackSynchronic,
+// whose UnrealScript polls the five natives below each frame. They are not BCSeqAct_InputDivergence actions, so ASURA_QTESKIP and the
+// judge-based ASURA_AUTOQTE don't see them. Each change of a native's result is logged with the frame, the input clock (ms, as
+// ASURA_INPUTREC writes it) and the pad state the game was last given; at each change of IsInputStart / IsInputOk / IsInputEnd the
+// track's properties are dumped ([props]), to find its button and timing fields. Episode 1 has none; a later episode is needed.
+static bool synclog_on() { static const bool on = getenv("ASURA_SYNCLOG") != nullptr; return on; }
+static void synclog(const char* name, uint32_t self, uint32_t result) {
+    static std::mutex m; static std::map<std::pair<const char*, uint32_t>, uint32_t> last;
+    std::lock_guard<std::mutex> g(m);
+    auto key = std::make_pair(name, self);
+    auto it = last.find(key);
+    if (it != last.end() && it->second == result) return;
+    last[key] = result;
+    uint32_t input_last_pad(); uint32_t input_clock_ms();
+    const uint32_t pad = input_last_pad();
+    fprintf(stderr, "[sync] f=%llu ms=%u %s this=%08X -> %08X (pad buttons %04X LT %u RT %u)\n", (unsigned long long)gpu_frame_number(), input_clock_ms(),
+            name, self, result, pad & 0xFFFF, (pad >> 16) & 0xFF, pad >> 24);
+    if (strstr(name, "Synchronic.IsInput")) { void ue_dump_props(uint32_t, const char*); ue_dump_props(self, name); }
+}
+// Story Mode's automatic QTEs (ASURA_QTESKIP / the Options row) for Synchronic tracks: when a track's IsInputOk turns true, its button
+// is pressed for 0.1 s at the moment the ring closes, 0.78 s of game time later. Measured in the user's episode 3 run
+// (logs\rec_20261113_134034): IsInputOk turns true at each window's start on the matinee; a press 0.77 s after it was rated EXCELLENT,
+// one at 0.47 s GREAT (the track's RankTimeA 0.1 / RankTimeB 0.3 around the close), and the ring visibly closes at about 0.8 s.
+// Game time, not wall time: episode 3's first window opens a help popup that pauses the game until A closes it, and a press timed in
+// wall time landed during the pause and got no grade. The script polls IsInputOk once per game tick, so the time between polls is
+// counted (each gap capped at 0.1 s; no polls while paused), as the QTE skip's wait does (uescript.cpp).
+// The window's button is the first dword of its Tracks entry (0x18 bytes: {button, 1, start, end, 0, flags}; the active one has flags
+// 0x40000000): 0 is Y, the only one seen so far. Other codes are logged and not pressed (map them when seen).
+// ASURA_SYNCDELAY=<ms> changes the 780 ms.
+// ASURA_SYNCHIDE (on by default with the automatic QTEs; ASURA_SYNCHIDE=0 keeps the prompt): the track shows its prompt, ring and grade
+// through its InHUD reference (BCHUD); with InHUD cleared the script has no HUD to show them on.
+// The track's natives are polled every game tick while it plays. The Scaleform movie still draws its Y icon without the HUD, so the
+// renderer leaves that icon out while a track was polled in the last 0.3 s (xenos.cpp qte_note_texture, synchronic_hiding).
+static std::atomic<long long> g_syncPollQpc{0};
+bool synchronic_hide_enabled() {                                        // Story Mode with the prompts hidden (ASURA_SYNCHIDE, on by default)
+    static const bool kHide = [] { const char* e = getenv("ASURA_SYNCHIDE"); return !e || atoi(e) != 0; }();
+    bool story_qteskip();
+    return kHide && story_qteskip();
+}
+bool synchronic_hiding() {
+    const long long t = g_syncPollQpc.load();
+    if (!t) return false;
+    LARGE_INTEGER q, f; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
+    return (double)(q.QuadPart - t) / (double)f.QuadPart < 0.3;
+}
+static void synchronic_hide(uint32_t self) {
+    static const bool kHide = [] { const char* e = getenv("ASURA_SYNCHIDE"); return !e || atoi(e) != 0; }();
+    bool story_qteskip();
+    if (!kHide || !story_qteskip()) return;
+    { LARGE_INTEGER q; QueryPerformanceCounter(&q); g_syncPollQpc = q.QuadPart; }   // the renderer hides the Y icon while this is recent
+    int ue_object_field(uint32_t obj, const char* name);
+    const int hOff = ue_object_field(self, "InHUD");
+    if (hOff < 0 || !rd32(self + hOff)) return;
+    wr32(self + hOff, 0);
+    fprintf(stderr, "[syncauto] f=%llu track %08X: InHUD cleared (prompt hidden)\n", (unsigned long long)gpu_frame_number(), self);
+}
+static void synchronic_auto(const char* name, uint32_t self, uint32_t result) {
+    if (strncmp(name, "Synchronic.", 11) == 0) synchronic_hide(self);
+    if (strcmp(name, "Synchronic.IsInputOk") != 0) return;
+    struct State { uint32_t last = 0; bool armed = false; double elapsed = 0; LARGE_INTEGER at{}; uint16_t button = 0; uint32_t window = 0; };
+    static std::mutex m; static std::map<uint32_t, State> states;
+    static const double kQpf = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return (double)f.QuadPart; }();
+    static const double kDelay = (getenv("ASURA_SYNCDELAY") ? atoi(getenv("ASURA_SYNCDELAY")) : 780) / 1000.0;
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    std::lock_guard<std::mutex> g(m);
+    State& st = states[self];
+    const uint32_t prev = st.last; st.last = result;
+    if (result != 1) { st.armed = false; return; }
+    if (prev != 1) {                                                        // the window opened: find its button, start counting
+        bool story_qteskip();
+        if (!story_qteskip()) return;
+        int ue_object_field(uint32_t obj, const char* name);
+        const int tOff = ue_object_field(self, "Tracks");
+        uint32_t code = 0, idx = 0;
+        if (tOff >= 0) {
+            const uint32_t data = rd32(self + tOff), n = rd32(self + tOff + 4);
+            for (uint32_t i = 0; i < n && i < 32 && data; i++) if (rd32(data + i * 0x18 + 0x14) & 0x40000000u) { idx = i; break; }
+            if (data && n) code = rd32(data + idx * 0x18);
+        }
+        static const uint16_t kButtons[] = { 0x8000 /* Y */ };
+        if (code >= sizeof kButtons / sizeof kButtons[0]) {
+            fprintf(stderr, "[syncauto] f=%llu track %08X window %u: button code %u not known yet, left to the player\n", (unsigned long long)gpu_frame_number(), self, idx, code);
+            return;
+        }
+        st.armed = true; st.elapsed = 0; st.at = now; st.button = kButtons[code]; st.window = idx;
+        return;
+    }
+    if (!st.armed) return;
+    const double gap = (now.QuadPart - st.at.QuadPart) / kQpf;
+    st.at = now;
+    st.elapsed += gap < 0.1 ? gap : 0.1;
+    if (st.elapsed < kDelay) return;
+    st.armed = false;
+    void input_press_at(uint16_t buttons, uint32_t delayMs, uint32_t holdMs);
+    input_press_at(st.button, 0, 100);
+    fprintf(stderr, "[syncauto] f=%llu track %08X window %u: pressed %04X after %.2f s of game time\n", (unsigned long long)gpu_frame_number(), self, st.window, st.button, st.elapsed);
+}
 #define QTE_HOOK(addr, label) \
     PPC_FUNC_IMPL(__imp__sub_##addr); \
     PPC_FUNC(sub_##addr) { \
         const uint32_t self = ctx.r3.u32, res = ctx.r5.u32; \
         __imp__sub_##addr(ctx, base); \
         if (qtelog_on()) qtelog(label, self, res ? rd32(res) : 0xFFFFFFFFu); \
+        if (synclog_on()) synclog(label, self, res ? rd32(res) : 0xFFFFFFFFu); \
+        if (res) synchronic_auto(label, self, rd32(res)); \
     }
 QTE_HOOK(82950A10, "Synchronic.IsStartTrack")
 QTE_HOOK(82950B50, "Synchronic.IsEndTrack")

@@ -7,6 +7,7 @@
 #include <windows.h>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -197,15 +198,26 @@ static void gpu_thread() {
         if (g_gpu.wbAddr) wr32(phys(g_gpu.wbAddr), rptr); // read pointer write-back
     }
 }
+// The vblank period in use (µs) and the game's frame period, which is two vblanks (it presents every second one): the VRR pacing in
+// xenos.cpp releases frames on this cadence, so it follows this clock exactly (pulldown changes included).
+static std::atomic<long long> g_vblankPeriodUs{16667};
+double gpu_frame_period_ms() { return 2.0 * (double)g_vblankPeriodUs.load() / 1000.0; }
 static void vsync_thread() {
     g_vsyncThread = make_host_guest_thread("vsync");
     auto next = std::chrono::steady_clock::now();
     uint64_t n = 0;
     // ASURA_VBLANKHZ=<hz> (experiment, default 60): the rate of the vblank interrupt. The game presents every second vblank, so 120 asks it for 60 fps.
     static const int kHz = getenv("ASURA_VBLANKHZ") ? std::max(atoi(getenv("ASURA_VBLANKHZ")), 1) : 60;
-    const auto period = std::chrono::microseconds(1000000 / kHz);
+    auto period = std::chrono::microseconds(1000000 / kHz);
     if (kHz != 60) LOG("[gpu] vblank at %d Hz (ASURA_VBLANKHZ)\n", kHz);
+    double pulldownHz = 0;
     for (;;) {
+        {   // 24 fps with 2:3 pulldown (xenos.cpp): follow the display's exact rate (47.952 Hz for a 59.94 Hz display)
+            double gpu_pulldown_vblank_hz();
+            const double p = gpu_pulldown_vblank_hz();
+            if (p > 1 && p != pulldownHz) { const bool show = std::fabs(p - pulldownHz) > 0.002; pulldownHz = p; period = std::chrono::microseconds((long long)(1e6 / p + 0.5)); if (show) LOG("[gpu] vblank at %.3f Hz to match the display (pulldown)\n", p); }
+        }
+        g_vblankPeriodUs = (long long)period.count();
         next += period;
         std::this_thread::sleep_until(next);
         if (std::chrono::steady_clock::now() > next + std::chrono::milliseconds(50)) next = std::chrono::steady_clock::now();

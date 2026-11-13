@@ -128,12 +128,14 @@ static std::shared_ptr<GuestFile> file_of(uint32_t h) {
     auto it = g_files.find(h);
     return it == g_files.end() ? nullptr : it->second;
 }
-// 60 fps mode (ASURA_FPS60=1, or Frame Rate in Graphics Options): UE3 holds the game to the engine config's MaxSmoothedFrameRate, 30 in the
-// console sections of Coalesced_*.bin (UTF-16 strings; the key, then its value as its own string). Every such value of "30" reads as "60".
+// 60 and 24 fps modes (ASURA_FPS=60|24, ASURA_FPS60=1, or Frame Rate in Options): UE3 holds the game to the engine config's MaxSmoothedFrameRate, 30 in the
+// console sections of Coalesced_*.bin (UTF-16 strings; the key, then its value as its own string). Every such value of "30" reads as "60" or "24".
 // The file on disk is not changed.
 static std::vector<std::pair<uint64_t, uint8_t>> coalesced_patches(HANDLE h) {
     std::vector<std::pair<uint64_t, uint8_t>> out;
-    if (!getenv("ASURA_FPS60") || atoi(getenv("ASURA_FPS60")) == 0) return out;
+    int settings_target_fps();                                              // options.cpp: ASURA_FPS (24, 30, 60) or ASURA_FPS60
+    const int fps = settings_target_fps();
+    if (fps == 30) return out;
     LARGE_INTEGER sz; if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > (64ll << 20)) return out;
     std::vector<uint8_t> d((size_t)sz.QuadPart);
     OVERLAPPED ov{}; DWORD n = 0;
@@ -146,7 +148,11 @@ static std::vector<std::pair<uint64_t, uint8_t>> coalesced_patches(HANDLE h) {
         if (k != kl) continue;
         const size_t end = i + kl * 2;
         for (size_t j = end; j + 2 < end + 24 && j + 2 < d.size(); j++)     // the value's first two characters
-            if (d[j] == '3' && (d[j + 2] == '0') && d[j + 1] == 0) { out.push_back({ j, (uint8_t)'6' }); break; }
+            if (d[j] == '3' && (d[j + 2] == '0') && d[j + 1] == 0) {
+                if (fps == 60) out.push_back({ j, (uint8_t)'6' });
+                else { out.push_back({ j, (uint8_t)'2' }); out.push_back({ j + 2, (uint8_t)'4' }); }   // 24
+                break;
+            }
             else if (d[j] >= '0' && d[j] <= '9') break;                     // some other value (62 in the PC sections): leave it
         i = end;
     }
@@ -267,7 +273,7 @@ static void open_file(PPCContext& ctx, uint32_t outH, uint32_t access, uint32_t 
     if (!isDir && StrStrIA(path.c_str(), "TitleMenu_Bg")) { f->titleMovie = true; g_titleMovies++; }
     if (!isDir && StrStrIA(path.c_str(), "Coalesced_")) {
         f->patches = coalesced_patches(h);
-        if (!f->patches.empty()) LOG("[fps] %s: %zu MaxSmoothedFrameRate values of 30 read as 60\n", name.c_str(), f->patches.size());
+        if (!f->patches.empty()) LOG("[fps] %s: %zu MaxSmoothedFrameRate values of 30 read as %d\n", name.c_str(), f->patches.size(), [] { int settings_target_fps(); return settings_target_fps(); }());
     }
     uint32_t gh = handle_create(ob_create(0, 1, 0x10));
     { std::lock_guard<std::mutex> g(g_filesLock); g_files[gh] = f; }

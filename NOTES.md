@@ -174,6 +174,16 @@ The game holds itself to 30 fps with two caps, and both must go:
 Either alone stays at 30 (the vblank at 120 Hz alone: still 30 swaps a second). With both: 60 fps, p50 16.7 ms (logs\fps60c), 56-60 in the heaviest cutscenes at 1x. Game time follows real time: with the wall-clock input replay, the QTE prompts came at 1.96x the 30 fps frame numbers (8107/8350/11332 against 4141/4264/5797) and were all answered, through the shooting section. Not yet checked: movies (Bink) and the rest of the episode by eye.
 Graphics Options: Frame Rate 30/60 (ini `fps`, sets both switches; restart to apply) and Show FPS (ini `showfps`, `ASURA_SHOWFPS=1`): `gpu_fps_text` in a small box in the top-left corner (options.cpp fps_picture, xenos.cpp draw_overlay, shared with the menu panel). `ASURA_OPTIONSTEST` now also ignores real pad and key input (a pad on the desk closed the menu in a test run).
 
+### 24 fps mode: G-Sync / FreeSync or 2:3 pulldown (2026-11-12)
+
+`ASURA_FPS=24` (or Frame Rate in Options): the engine config's MaxSmoothedFrameRate 30 reads as 24 (kfile.cpp patches the two UTF-16 digits; `ASURA_FPS=60` and `ASURA_FPS60=1` still give 60), and the vblank runs at 48 Hz (the game presents every second vblank). Game time follows real time: Tick's DeltaTime is 0x3D2AAACB (1/24 s), a Matinee track advances 0.04167 s a frame, and the episode's area loads land at the same wall-clock times as at 30 fps (logs\fps24a, fps24c, fps30b). The 30 fps episode 1 replay doesn't play back at 24: the opening's in-engine "ASURA'S WRATH / PRESS START" card came at a slightly different moment, so the recorded Start press was missed and the run waited about 80 s there. This is a replay timing quirk, not a speed problem.
+
+Chosen in the Options menu's Vsync row, which reads Off, On, "24 fps (FreeSync / G-Sync recommended)" or "24 fps (2:3 pulldown)". The 24 fps choices save ini `fps = 24` plus `pulldown = 0/1` and need a restart; Frame Rate then shows "24 fps (set by Vsync)" (greyed) until Vsync goes back to Off or On, which restores the earlier 30 or 60. Test launchers in the repo root, double-click: `test_24fps_freesync.cmd` and `test_24fps_pulldown.cmd` (clear any ASURA_* variables, set the mode and the FPS counter, override asura.ini for that run only). Two ways to show it:
+- **G-Sync / FreeSync** (`pulldown = 0`, sets `ASURA_VRR=1`): each frame is presented as soon as it's ready with tearing allowed (the VRR path from BCR2), and the display refreshes when the frame arrives (24 Hz, or 48/72 Hz with the driver's low-framerate compensation). Without a VRR display the picture tears; the menu says so whenever this is chosen. Checked: steady 24.0 fps, 41.67 ms a frame (minimized run, so not seen on a VRR screen yet).
+- **2:3 pulldown** (`pulldown = 1`, `ASURA_PULLDOWN=1`), as DVD players show 24 fps film on a 60 Hz TV: each frame is presented with vsync for 3, then 2, then 3 refreshes (Present sync interval). The cadence comes from the display's rate (`pulldown_interval` in xenos.cpp): 2.5 refreshes a frame at 60 Hz (3, 2), 3 at 72 Hz, 2 or 4 at 48/96 Hz (even, no judder), 2 with an occasional 3 at 50 Hz. Displays over about 100 Hz (120, 144) can't be paced this way, since D3D allows 1-4 refreshes per Present. They fall back to one refresh per frame, and the log says to choose 60 Hz. To keep the game's frames in step with the display, the game's vblank follows the display: 48 x Hz / round(Hz), first from Windows' figure (47.952 Hz for 59.94), then from the rate measured over the run (gpu.cpp vblank thread, `gpu_pulldown_vblank_hz`). Checked on this machine's 59.952 Hz display (logs\pulldown3, visible window): 750 refreshes for every 300 frames, nothing discarded after start-up, vblank settled at 47.962 Hz, Present-to-scanout steady at about 25.5 ms (no drift). No tearing; the usual film judder of 2:3.
+
+Why 30 fps can't be "pulled down" the same way: pulldown only helps when the content rate divides into the display rate unevenly but steadily (24 into 60). 30 fps on a 60 Hz display is already an even 2:2 with vsync. On a 24 Hz-only display, 30 fps would have to drop one frame in five (5:4), which judders worse than running the game at 24. So the game's own 24 fps mode is the right base for both options.
+
 ### Per-object noise (2026-11-11)
 
 Planet (episode 1 opening): fixed. Signed textures were read as unsigned and turned signed in texfix after filtering; bytes 7F (+1) and 80 (-1) are neighbours in unsigned order, so filtering across zero gave values near -1 (sparkle on clouds). Formats with an SNORM twin (R8, R8G8, R8G8B8A8, BC4, BC5) are now created typeless, and a fetch reading every channel signed binds the SNORM view (`[snorm]` log lines; `ASURA_NOSNORM=1` for the old way). Checked: logs\noise3 vs snorm1, frame 1770.
@@ -209,6 +219,90 @@ Success flags (2026-11-12): a real success leaves +0xC4 at 2C800000 (from 188000
 BURST left to the player (2026-11-12, the user's call: BURST can also come up in gameplay): the RT answer and the hiding of the BURST prompt now need `ASURA_BURSTAUTO=1`; `ASURA_QTESKIP` alone leaves the prompt on screen for the player. replays\complete_ep1_qteskip.txt (the user's episode 1 run with the skip on, which pressed RT for both BURSTs) needs `ASURA_QTESKIP=1 ASURA_BURSTAUTO=1` to play back.
 
 Debug aids (host\uescript.cpp): `ASURA_SCRIPTLOG="first,last"` logs every script event sent from native code ([script] lines: object, class, event, parameters, caller), `ASURA_SCRIPTLOGFILTER=<text>` narrows it, `ASURA_SCRIPTDUMP=<class>` dumps such objects before and after each event with their arrays and reachable strings ([sdump]). Names come from UE3's name table, found by scanning for the "None" entry; it moves while the game boots, so the logger finds it on first use.
+
+### Story Mode: invincibility and the menu option (2026-11-12, not yet verified in combat)
+
+UE3 reflection in this build (found with `ASURA_CLASSDUMP=<class>[,<class>...]`, which dumps a class and walks its field lists): UField::Next +0x3C, UStruct::SuperField +0x40, Children +0x44, UProperty::Offset +0x54, UBoolProperty::BitMask +0x5C. `ue_field_offset(class, name)` in uescript.cpp looks a property up by name. The player is `BCPawn_Player_asr` (also `BCPawn_Player`): Pawn.Health +0x2D8 and HealthMax +0x2DC (1500/1500 in episode 1), Controller +0x1E4. BCPlayerController.bGodMode +0x1D8. BCPawnBase also has `DefaultInvincible`, `InvincibleFlag`/`InvincibleFlagTime`, `bIsLifeless`, `PreHealth`, and functions `TakeDamageDead`, `SetHealthVal`, `OnModifyHealth`, `InGodMode`, which are other places to look if the simple approach falls short.
+
+`ASURA_INVINCIBLE=1`: at every script event the player pawn gets (Tick each frame, before and after), Health goes back to HealthMax, and the controller's bGodMode is set (UE3 checks Pawn.InGodMode in its damage path; not yet known whether BC's own TakeDamage does). `ASURA_HEALTHLOG=1` logs the player's Health whenever it changes. Untested against damage: episode 1 can't reach a death or fail state, so it needs a combat episode. Risk: a single hit that kills at once, before the next event, would still kill unless bGodMode covers it.
+
+Menu: the host menu (options.cpp) is now "Options", with Story Mode (On / Off / Custom) and its two pieces, Invincibility and Automatic QTEs, as separate rows. They apply at once and are saved to asura.ini as `invincible` and `qteskip`. `ASURA_INVINCIBLE` / `ASURA_QTESKIP` set by hand still win. `story_set` / `story_invincible` / `story_qteskip` in uescript.cpp hold the live switches. BURST (`ASURA_BURSTAUTO`) stays separate and off.
+
+### Font and texture mods (2026-11-12)
+
+The in-game text is a bitmap font. Scaleform draws it with vs 156EA286C90F5C9D / ps 836B362DD0B3F7C5 from pre-rendered glyph pages: the main one is a 256x256 DXT5 (fmt 20) texture with white colour and the glyphs (about 30 px tall, a serif face: ASCII, a few accented letters, and a second size of A D F H I L O) in alpha. It sat at 01126000, uploaded at frame 54. Its content hash is `BB81A09190EE5BE6`. Every line of it is magnified from those 30 px, so it blurs at any internal resolution. The episode description text and "Difficulty NORMAL" come from other pages, not yet identified (dump at the Episode Menu and look for more DXT5 pages with alpha-only glyphs). Large decorative UI shapes (the Episode Menu petal frame) are vector meshes and stay sharp.
+
+Mechanism (xenos.cpp, "texture mods"): every uploaded texture gets a 64-bit hash of its whole host-side picture (untiled, swapped, all of the base level, size folded in). It is the same in every run wherever the texture sits (checked across runs), and unlike the sampled `range_hash` it tells the LS and RS icons apart.
+- `ASURA_MODDUMP=1` writes each distinct texture once to `mods\dump\<hash>_f<fmt>_<w>x<h>.png` (RGBA, DXT1-5; R8/BC4 as grey, R8G8/BC5 as red/green; Bink movie planes skipped). `ASURA_MODDUMP=256x256,128x128` keeps only those sizes. Episode 1 gives about 1,200 files. Alpha-only textures look white in a viewer: look at their alpha.
+- `mods\textures\**\<hash>*.png` replaces that texture (the name only has to start with the 16 hex digits). Any size with the same aspect ratio: mips are generated, and the draw's coordinate scaling keeps the game's size, so a 4x picture is simply 4x the detail. Checked (logs\modtest1): a 1024x1024 red-tinted copy of the font page turned the menu's white text red and drew at full size.
+- Button Labels: `assets\prompts\playstation\` and `assets\prompts\switch\` are searched first when that set is chosen (`gpu_button_set` 2/3). The QTE icons (kQteTex, 128x128 DXT5) and the menu legend icons (A OK, B Back) can be swapped there by hash, made from the Kenney pack. A set change applies to textures uploaded after it.
+- `ASURA_UITEXLOG=1` logs each distinct texture (and resolved surface) a draw samples, with its shaders: how the font was found. `mods\` is in .gitignore (dumps are game data).
+
+A higher-resolution font therefore needs a 1024x1024 (or 2048x2048) page with each glyph drawn in exactly the same normalised rectangle as the original. Either redraw the same layout from a similar serif font, or upscale the alpha with a good upscaler. A matching open font would let a tool rasterise it at 4x into the measured glyph boxes.
+
+### Test launchers and video recording (2026-11-12)
+
+Double-click launchers in the repo root (each clears ASURA_* first; settings apply to that run only, asura.ini is untouched):
+- `record_test.cmd`: completed save, logos skipped, 30 fps, Story Mode on (invincibility and automatic QTEs, BURST manual), `ASURA_HEALTHLOG=1`, `ASURA_SYNCLOG=1`. Pad input goes to `replays\rec_<date>_<time>.txt`, the log to `logs\rec_<date>_<time>.log`. F9 captures work (--log).
+- `record_test_video.cmd`: the same, plus every frame to `logs\rec_<date>_<time>.mp4`.
+- `test_24fps_freesync.cmd`, `test_24fps_pulldown.cmd`: see "24 fps mode".
+Recorded replays only reproduce scripted stretches: in fights the enemies act differently, so a replay drifts once gameplay starts (the user, episode 2).
+
+`ASURA_VIDEO=<file.mp4>` (host\video.cpp): every presented frame, H.264 through Windows' Media Foundation sink writer (hardware encoder when available, nothing to download), at the game's frame rate. Each frame is timed by its index, so the video plays at game speed. The render thread copies the back buffer into one of three staging textures and reads it back two frames later (never waits on the GPU). An encoder thread converts the 10-bit back buffer to 8-bit BGRA and encodes. If it falls 90 frames behind, frames are left out and counted in the log.
+- Sidecar `<file>.mp4.frames.txt`: `video_frame game_frame input_ms`, so a video time leads to the game frame (logs, [sync]) and the input clock (replay files).
+- Files roll over every 5 minutes (`_2.mp4`, `_3.mp4` ...; video frame numbers restart, game frames run on), so a crash loses at most the open file. An MP4 only becomes playable when it is closed, so `video_finish()` runs on every exit path: the window's close button, HalReturnToFirmware, RtlRaiseException, KeBugCheck, the options restart. Killing the process loses the open file.
+- Bit rate 12 Mbit/s at 1280x720, scaled by area, at most 40 (`ASURA_VIDEOMBPS` to set it). The size is the back buffer's (window size); a size change starts a new file.
+- Checked (a 67 s run): 2,012 frames, 68 MB (about 1 MB/s, so about 1.2 GB for a 20-minute episode), correct colours, frame pacing unchanged (p99 36 ms at 30 fps).
+- Frames out of a video: `thirdparty\ffmpeg\bin\ffmpeg.exe -i <file.mp4> -vf "select=eq(n\,1800)" -frames:v 1 out.png`.
+
+### Invincibility in episode 2 (2026-11-12)
+
+The user's episode 2 run (logs\ep2_rec.log, replays\ep2_rec.txt; recording made with Story Mode on) and two replays of it (logs\ep2rep1 with invincibility, ep2rep_noinv / ep2rep_hp2 without) found:
+- The first fight shows no life meter and can't be lost. The player is hit (BCPawn.LastDamageInfo changes: damage 40, 20) but Health stays 1500 of 1500 even without invincibility. So it proves nothing either way; the test needs an episode with a life meter (the user says a different episode).
+- Bool properties keep their bit mask at UBoolProperty +0x64, not +0x5C. With the wrong offset bGodMode was never set in the user's run; fixed (logs\ep2rep1: "bGodMode set", mask 40000000).
+- Other places damage may be scaled, for when Pawn.Health turns out not to be the meter: BCPawn.TakeDamageRates / CauseDamageRates (BCKeyData_Float objects: per-situation rates), InvincibleFlag / InvincibleFlagTime (BCKeyData objects), DefaultInvincible.
+- ASURA_SYNCLOG's first version dumped the PlayerInput object's properties at every button change (the hook macro is shared with the PlayerInput natives), costing 100+ ms each, about 100 dumps per 300 frames in fights. That was the "severe performance drops in gameplay" in the user's run. Now only the Synchronic natives dump. `ASURA_HEALTHLOG=2` adds the player's full property dump every 300 frames (diagnostics only: a hitch each time).
+
+The one Synchronic QTE in episode 2 (frame 10,728 of that run, during the second fight): IsInputOk turned true, the user pressed Y 22 frames (0.73 s) later. Track properties: StartTime 1.1, EndTime 0.8, RankTimeA 0.1, RankTimeB 0.3, RankTimeC 0.5, RankTimeOver 0.1, RankHitA 1, RankHitB 0.6, RankHitC 0.3, SynchronicType 0, AchieveCount 1, Tracks {1} (the button is probably in there; the dump now prints short arrays' elements). A replay can't reach it (the fight before it plays out differently).
+
+### Performance in the user's episode 3 run (2026-11-13)
+
+The run was at 30 fps, 2560x1440 window, with video recording on. Over 300 frames: p99 36 ms throughout. The spikes:
+- frame 5011, 2.1 s: an F9 capture ("saved the previous 150 images in 2.1 s"), expected while it saves.
+- frame 1158, 650 ms: a level load.
+- frames 2799 and 12140, about 0.5 s each: first-time shader compiles (18 and 16 new shaders); recorded in the manifest, precompiled from then on.
+Frame pacing felt uneven: the display reported an average 56.6 Hz refresh (no discarded frames, present-to-scanout negative), so it is running variable refresh (G-Sync / FreeSync) with plain vsync. Each frame then shows the moment it is presented, and the few milliseconds of render-time variation reach the screen.
+
+Even pacing for VRR displays (2026-11-13): Vsync "On (FreeSync / G-Sync)" in Options (ini `vsync = 2`, sets `ASURA_VRR=1`; restart, since the swap chain allows tearing from creation). In BCR2's VRR present path a frame is held to a fixed time after the game's tick, but this host has no tick (`gpu_note_tick` is never called), so that path presented at once. Now, with no tick, frames are released on an even cadence: one game frame period apart (two vblanks: `gpu_frame_period_ms` in gpu.cpp, 33.3 ms at 30 fps, 16.7 at 60, 41.7 at 24, pulldown changes included), the same clock the game runs on, so they can't drift. A frame ready more than 0.5 ms after its slot is shown at once and the cadence moves to it, so the slot settles just after the slowest recent frame and the rest wait for it. The slot is never more than one period ahead of the frame (the first version ran ahead during loading, when the game presents faster than 30 fps, and froze the start-up). Checked (logs\vrrpace2, visible window, 30 fps): present-to-present p1 33.2, p50 33.3, p99 33.6 ms, against p99 36-37 in the user's run. This machine's window ran at a fixed 59.95 Hz, so a few frames were discarded by the compositor. On a VRR display in fullscreen each evenly spaced present becomes an evenly spaced refresh; the user still has to see it there. The 24 fps FreeSync / G-Sync choice uses the same path (41.7 ms cadence).
+
+### Open rendering issues seen in episode 2 (user, 2026-11-12)
+
+- Shadows drawn in odd places, not attached to what casts them (gameplay). Suspects: the shadow-atlas tile a projection reads (see "Crowd lighting pops") or its light matrix.
+- Blood looks brownish-maroon rather than bright red. The user will compare with hardware first.
+- Near the end, a cut to Mithra in her cell shows her invisible for a moment before she pops in (streaming, LOD or culling at the cut; check whether the console does the same).
+None captured yet: an F9 capture (with --log) at each would give the draw lists.
+
+### Timed, graded QTEs ("Synchronic"): automatic in Story Mode (2026-11-13)
+
+From the user's episode 3 run (logs\rec_20261113_134034: map BC-S020, its video, and replays\rec_20261113_134034.txt): one Synchronic track with three windows. Its `Tracks` entries are 0x18 bytes, {button, 1, start, end, 0, flags}: windows at matinee 2.3-3.3, 3.77-4.77 and 5.33-6.33 s, button 0 (the prompt shows Y), and the flags word 0x40000000 on the active window (0x80000000 after a hit). IsInputOk turns true at each window's start. Grades from the video: a press 0.77 s after IsInputOk was EXCELLENT, one at 0.47 s GREAT (RankTimeA 0.1 / RankTimeB 0.3 around the ring's close at about 0.8 s). The first window is a tutorial: a help popup pauses the game until A closes it.
+
+With Story Mode's automatic QTEs on (`ASURA_QTESKIP` / the Options row), hooks.cpp `synchronic_auto` presses the active window's button for 0.1 s once 0.78 s of game time has passed since IsInputOk turned true (`ASURA_SYNCDELAY=<ms>` to change it). Game time is counted between the script's per-tick IsInputOk polls (gaps capped at 0.1 s), so the tutorial pause doesn't count; a wall-clock timer pressed during the pause and got no grade (logs\syncauto1, removed). The press goes through xam.cpp `input_press_at`. Button codes other than 0 (Y) are logged as `[syncauto] ... not known yet` and left to the player: map them when one turns up. Checked (logs\syncauto2 and its video, the episode 3 replay with the player's Y presses removed): EXCELLENT on all three windows, the tutorial one included.
+
+Hiding the prompt (2026-11-13, `ASURA_SYNCHIDE`, on by default with the automatic QTEs; `ASURA_SYNCHIDE=0` keeps it): the only script event native code sends the track is GetTimeValue (logs\synui1); the ring, the button and the grade are drawn by the track's UnrealScript through its `InHUD` (a BCHUD). On every Synchronic native call with the automatic QTEs on, `InHUD` is cleared; the script sets it again at each window and it is cleared again. The user confirmed the Synchronic sounds no longer play (they went with the HUD).
+
+A Y icon stayed in the middle of the screen after the track (the user's run, logs\rec_20261113_142416_2.mp4 at 0:46; reproduced in the replay). It is the Y prompt icon among the QTE prompt icons (128x128 DXT5 at 014FA000, folded content hash DF3D91A4, dump 18F22E64EC8E0B5A), shown before the hook first sees the track. Calling BCGFxUI_Synchronic.EndSynchronic or BCGFxMovieButton.FinishAll from the host (ue_call_event in uescript.cpp: a script function sent like an event from inside the ProcessEvent hook) did not clear it (logs\endsync2-4). The renderer now leaves that texture out whenever Story Mode hides prompts (`synchronic_hide_enabled`): every other Y prompt is a QTE's, which Story Mode answers without a prompt anyway. Checked (logs\endsync5 and its video): no icon during or after the track, all three windows pressed.
+
+Help popups that pause the game (BCGFxUI_Advertise with `bUsePause`; episode 3's Synchronic tutorial) are closed in Story Mode: once the popup sets `bInputNext` (the "A Close" hint, about a second after it opens), A is pressed once (uescript.cpp; `[story]` log line). An A before that is ignored, and setting `bInputNext` early didn't make it close sooner (logs\endsync2), so the popup still shows for about a second. Found with `ASURA_PROPWATCH=<class>`: logs each property that changed between an object's Ticks (`[pwatch]`).
+
+### Timed, graded QTEs ("Synchronic"): first findings (2026-11-12)
+
+From the user's play: the QTEs with a shrinking ring, graded by timing, are not completed by the QTE skip or the auto-answer. They are matinee tracks, `BCInterpTrackSynchronic`, whose UnrealScript polls five natives (the only ones the class has): IsStartTrack 82950A10, IsEndTrack 82950B50, IsInputOk 82950C80, IsInputStart 82950DA8, IsInputEnd 82950E60 (name/function pairs at 82186F30..). The UI is `BCGFxUI_Synchronic`. Episode 1 has none, so nothing is known yet about where the button and the timing window live.
+
+To capture one: `ASURA_SYNCLOG=1` logs each change of those natives' results (`[sync]`: frame, input clock in ms as `ASURA_INPUTREC` writes it, and the pad state the game was given). At each change of IsInputStart / IsInputOk / IsInputEnd it dumps the track's properties (`[props]`: every UE3 property of the object by name, with its value). A run through a Synchronic QTE with `ASURA_SYNCLOG=1 ASURA_INPUTREC=<file>` should show the window (IsInputOk true), the button field, and when a press was graded. The likely fix then: in Story Mode, press the track's button when IsInputOk turns true (or force the native's result and the grade), the same way for every such track.
+
+`ASURA_PROPDUMP=<exact class name>` dumps the first such object seen in a script event the same way (checked on BCPawn_Player_asr, logs\propdump1).
+
+Testing tip (from the user): Back/Select skips cutscenes, so a run can get past the ones not being tested.
 
 ### QTE judge (2026-11-10)
 
@@ -279,7 +373,7 @@ Things that mattered:
 
 ### Wanted later (from the user, 2026-11-09)
 
-- 60 fps play, and a 24 fps mode for FreeSync/G-Sync displays, if the game's timing allows it.
+- 60 fps play, and a 24 fps mode for FreeSync/G-Sync displays (both done: see "60 fps mode" and "24 fps mode").
 - Watch mode: quick-time events and button prompts complete themselves, and the on-screen display is hidden, to watch the game as a film.
 
 ### Next

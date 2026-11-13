@@ -1110,14 +1110,15 @@ static void RtlRaiseException_(PPCContext& ctx, uint8_t*) {
     }
     fprintf(stderr, "[raise] RtlRaiseException code=%08X flags=%08X addr=%08X lr=%08X\n", code, rd32(rec + 4), rd32(rec + 12), (uint32_t)ctx.lr);
     fflush(stderr);
+    void video_finish(); video_finish();                                    // keep the recording playable (video.cpp)
     TerminateProcess(GetCurrentProcess(), 4);
 }
 static void KeBugCheckEx_(PPCContext& ctx, uint8_t*) {
     fprintf(stderr, "[bugcheck] code=%08X %08X %08X %08X %08X lr=%08X\n", ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, (uint32_t)ctx.lr);
-    fflush(stderr); TerminateProcess(GetCurrentProcess(), 5);
+    fflush(stderr); void video_finish(); video_finish(); TerminateProcess(GetCurrentProcess(), 5);
 }
 static void HalReturnToFirmware_(PPCContext& ctx, uint8_t*) {
-    fprintf(stderr, "[exit] HalReturnToFirmware(%u)\n", ctx.r3.u32); fflush(stderr); TerminateProcess(GetCurrentProcess(), 0);
+    fprintf(stderr, "[exit] HalReturnToFirmware(%u)\n", ctx.r3.u32); fflush(stderr); void video_finish(); video_finish(); TerminateProcess(GetCurrentProcess(), 0);
 }
 static void DbgBreakPoint_(PPCContext& ctx, uint8_t*) { LOG("[dbg] DbgBreakPoint lr=%08X\n", (uint32_t)ctx.lr); }
 // XeCryptSha(in1, len1, in2, len2, in3, len3, out, outlen)

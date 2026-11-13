@@ -33,3 +33,6 @@ thirdparty/*
 
 # player settings written by the Graphics Options menu
 asura.ini
+
+# texture dumps and replacements made from the game (ASURA_MODDUMP, mods/textures)
+mods/
