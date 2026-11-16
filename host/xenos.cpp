@@ -4622,6 +4622,15 @@ static void do_resolve() {
             // macro-tile aligned: 32x32 blocks, bytes per macro tile = 32*32*bpp
             uint32_t mt = delta / (1024u * bytesPerPx);
             ox = (int)((mt % (pitchAligned / 32)) * 32); oy = (int)((mt / (pitchAligned / 32)) * 32);
+            // A tile of that surface only if it fits inside it. A resolve reaching past its end is a new buffer that happens to start inside an
+            // old one (render targets moved after the hot springs in episode 10): writing it into the old surface at an offset left the title
+            // screen showing the old surface, a stale frame with the live one pasted in its lower right. ASURA_RESOLVEINOLD=1: the old behaviour.
+            static const bool kInOld = getenv("ASURA_RESOLVEINOLD") != nullptr;
+            if (!kInOld && (ox + x1 > (int)sf->w || oy + y1 > (int)sf->h)) {
+                static int nl = 0;
+                if (nl++ < 20) fprintf(stderr, "[gfx] resolve to %X starts inside surface %X (%ux%u) but reaches past it: a new surface\n", destBase, sf->base, sf->w, sf->h);
+                sf = nullptr; ox = oy = 0;
+            }
         }
         if (!sf) sf = make_surface(destBase, destPitch, std::max(destH ? destH : (uint32_t)y1, 1u), bytes, fmt);
         if (sf) {

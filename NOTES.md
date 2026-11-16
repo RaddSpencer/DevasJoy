@@ -315,12 +315,12 @@ Resolved: the planet noise (user, 2026-11-14).
 More findings, episodes 9-12 (user, 2026-11-15). Episodes: 9 = rec_20261114_142141, 10 = rec_20261115_154808, 11 = rec_20261115_162855 / rec_20261115_163928, 12 = rec_20261115_170806.
 
 Rendering:
-- [ ] Wide shot of bodies: no shadows (ep 9 1:05).
+- [ ] Wide shot of bodies: no shadows (ep 9 1:05). Replayed (logs\e9t, frame 1,960): the game renders 4 shadow casters there (the characters in the middle) and none for the bodies, so it is the game's choice (UE3 drops per-object shadows by on-screen size and its shadow settings), not a renderer drop. Could be changed only through the engine's shadow settings (an ini or memory tweak), not yet tried.
 - [ ] Shadow issue with citizens again (ep 12 _2.mp4 0:30-0:44).
-- [ ] Render delay on the crowds in front of the fleet (ep 9 1:59).
+- [x] Render delay on the crowds in front of the fleet (ep 9 1:59). A first-time shader compile (3 draws left out at frames 3,576-3,577); covered by the warm-up and generic vertex shaders (2026-11-16).
 - [ ] Asura falling through the atmosphere disappears one frame before the cut (ep 9 _5.mp4 0:51).
-- [ ] Texture glitch in an eye (ep 11 rec_20261115_163928_3.mp4 0:21-0:28).
-- [ ] After "Return to Main Menu", the title menu's background video is offset (ep 10 4:12).
+- [ ] Texture glitch in an eye (ep 11 rec_20261115_163928_3.mp4 0:21-0:28). Part of the eye is solid green, what a Bink plane of zeros gives after YUV conversion; the rest shows a video-like reflection. Possibly the same stale-surface bug as the title movie (fixed 2026-11-16); the replay falls out of step before it (logs\e11r), so the user should look again.
+- [x] After "Return to Main Menu", the title menu's background video is offset (ep 10 4:12). Fixed 2026-11-16, see "Resolves that start inside an older surface".
 
 Story Mode (paused behind graphics and audio, but two are blockers):
 - [x] BLOCKER: the hot springs choice (Drink / Chug / Splash / Stand up) can't be answered with the QTE skip on: the buttons aren't read (ep 10 2:43). The choice must be left to the player. Fixed 2026-11-15, checked in the replay (see "Story Mode blockers, episodes 10 and 11" below).
@@ -356,6 +356,18 @@ Episode 4 0:35-0:38 (Asura's shadow "detached and jumping", replay frames 1,050-
 - The "jump" is the game's light: the light casting Asura's shadow (c259) moves from about (-1136, 599, 573) to (431, 1345, 343) in a single frame at 1143, as the cinematic hands over to gameplay, and the shadow swings from long-left to short-right in that frame. The same happens in every run.
 - So no change was made for this one. If it still looks wrong to the user, a console or Xenia capture of the same moment is the reference needed.
 - Debug recipes used: `ASURA_CONSTLOG=ED6BB71B465780A5:<from>-<to>` (projection constants per caster), `ASURA_DBGPSAT="ED6BB71B465780A5@r2.z=v.z;#1:float4(1.0+clamp((r4.x-r2.z)*60.0,0.0,6.0),1.0,1.0+clamp((r2.z-r4.x)*60.0,0.0,6.0),1.0)"` (red = lit, blue = shadowed, before the soft edge), `...@r0.w=t.x;#1:float4(r4.x<0.999?0.2:1.0,r4.x<0.999?0.2:1.0,1.0,1.0)` (where the projection reads a filled texel).
+
+### Resolves that start inside an older surface (fixed 2026-11-16)
+
+After "Return to Main Menu" from episode 10 (the hot springs), the title screen showed a frozen picture with the live background movie only in its lower right (replay rec_20261115_154808, frame ~7,860; logs\e10r, e10z, e10f). The movie itself was fine: guest memory held the live frame (`ASURA_MEMSAVE`), its texture uploaded every frame, and painting the movie shader red covered the whole screen. The frame is then resolved to C7BB000, which lies inside an older 1280x720 surface at C55F000 left from the title before the episode. The resolve code takes a destination inside an existing surface as a tile of it, so it wrote the new frame into the old surface at offset 0x25C000 (about row 483), and everything sampling C7BB000 got the old surface: the stale title picture with the live frame pasted in its lower right. A resolve is now a tile of an existing surface only if it fits inside it; one reaching past its end gets a surface of its own (`[gfx] resolve to X starts inside surface Y ... a new surface`; `ASURA_RESOLVEINOLD=1` for the old behaviour). Checked: the title movie fills the screen after returning (logs\e10f); the rule never fires in the episode 4 replay, and frame 1,110 there matches the previous build up to the usual drift.
+
+### Episode 8 checks (2026-11-16)
+
+The user's first episode 8 recording (replays\rec_20261114_103357) stays in step through its opening cutscenes, so these replay (logs\e8r, e8t, e8p):
+- 3:35 (replay frame ~6,492): on the first frame of the wide shot after the cut, the girl beside Asura is missing and the rocks are still blurred by the previous close-up's depth of field; both are right one frame later. No draws left out, none predicated out, and her draws are simply not submitted in that frame (her shaders appear only in the next); the 16 occlusion queries there are light halos. So the cinematic applies the new shot's visibility and depth of field one tick after its camera cut: game logic, likely the same on the console. The same pattern may explain "Asura disappears one frame before the cut" (ep 9 _5.mp4 0:51) and Mithra in episode 2; not checked (out of replay reach).
+- 3:17 (flower): the shadow that "appears late" grows in over about 10 frames from the top right in the shape of an approaching figure, the same in the replay: game content.
+- _3.mp4 1:19-1:21 (ground glitch): not identified from the video (an overhead shot of the city); out of replay reach. Needs an F8 mark.
+- Episode 12 _2.mp4 0:30-0:44 (citizens' shadows): its replay falls out of step in the menus; needs an F9 capture or a mark.
 
 ### Pop-in after cuts: first-time shader compiles (2026-11-15)
 
