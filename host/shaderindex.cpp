@@ -251,6 +251,15 @@ bool shaderindex_find(uint64_t key, std::vector<uint32_t>& code) {
     return true;
 }
 size_t shaderindex_size() { return g_byKey.size(); }
+void shaderindex_for_each(bool isVs, const std::function<void(uint64_t, const std::vector<uint32_t>&)>& fn) {
+    std::vector<uint32_t> code;
+    for (const auto& kv : g_byKey) {
+        const Entry& e = g_entries[kv.second];
+        if ((e.isVs != 0) != isVs) continue;
+        code.assign(g_code.begin() + e.offset, g_code.begin() + e.offset + e.words);
+        fn(kv.first, code);
+    }
+}
 
 bool shaderindex_closest(const std::vector<uint32_t>& code, bool isVs, uint64_t& key, std::vector<uint32_t>& base) {
     // by kind and length: built on first use

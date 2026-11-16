@@ -194,17 +194,32 @@ static void qte_from_icons(QteAnswer& a) {                                  // t
 static void qte_apply(uint32_t st) {
     static const char* kMode = getenv("ASURA_AUTOQTE");
     static const bool kSkip = [] { const char* e = getenv("ASURA_BURSTAUTO"); return e && *e && strcmp(e, "0") != 0; }();
-    if (!kMode && !kSkip) return;
-    static const bool kIconsOnly = !kMode || !strcmp(kMode, "icons");
+    bool story_qteskip(); bool story_mash_active();
+    // Story Mode: a tug-of-war prompt (uescript.cpp). Its meter is filled directly there, with no presses (each press played its
+    // sound); ASURA_MASHPRESS=1 presses its buttons here instead, as first done.
+    static const bool kMashPress = [] { const char* e = getenv("ASURA_MASHPRESS"); return e && *e && strcmp(e, "0") != 0; }();
+    const bool mash = story_qteskip() && story_mash_active() && (kMashPress || kMode);
+    if (!kMode && !kSkip && !mash) return;
+    if (!kMode && !mash && story_qteskip() && story_mash_active()) return;  // ASURA_BURSTAUTO during a tug of war: nothing pressed either
+    static const bool kIconsOnly = kMode ? !strcmp(kMode, "icons") : false;
     QteAnswer a;
     if (kIconsOnly || !qte_from_judge(a) || !a.any()) { a = QteAnswer(); qte_from_icons(a); }   // the judge has nothing for BURST: its icon
+    // Story Mode's tug of war (mash only, no ASURA_AUTOQTE / ASURA_BURSTAUTO): the meter ends in an RT BURST, left to the player like
+    // every BURST (the user's call); the renderer shows its prompt again once the RT icon is drawn (xenos.cpp).
+    if (mash && !kMode && !kSkip) a.rt = false;
     if (!a.any()) return;
     const bool tapDown = (GetTickCount64() / 50) % 2 == 0;                 // 50 ms down, 50 ms up
     if (tapDown) wr16(st + 4, rd16(st + 4) | a.buttons);
     if (a.lt) g_base[st + 6] = 255;
     if (a.rt) g_base[st + 7] = 255;
     static const int16_t dx[4] = { -32767, 0, 32767, 0 }, dy[4] = { 0, -32767, 0, 32767 };
-    const double ang = (double)(GetTickCount64() % 500) / 500.0 * 6.283185307;   // counterclockwise, about 2 turns a second
+    // About 2 turns a second. Counterclockwise for a QTE (episode 1's code 37 prompt); clockwise for a tug of war: the user won both
+    // rotate tug of wars turning clockwise (episode 5, episode 11: replays rec_20261113_230159, rec_20261115_163928), and turning
+    // counterclockwise never filled episode 11's meter, a softlock (logs\rec_20261115_162855_2.mp4 3:41). ASURA_MASHROT=cw / ccw forces one way.
+    static const int kRot = [] { const char* e = getenv("ASURA_MASHROT"); return !e ? 0 : !_stricmp(e, "cw") ? 1 : !_stricmp(e, "ccw") ? 2 : 0; }();
+    const bool cw = kRot ? kRot == 1 : mash;
+    double ang = (double)(GetTickCount64() % 500) / 500.0 * 6.283185307;
+    if (cw) ang = -ang;
     const int16_t cx = (int16_t)(cos(ang) * 32000.0), cy = (int16_t)(sin(ang) * 32000.0);
     if (a.lRot) { wr16(st + 8, (uint16_t)cx); wr16(st + 10, (uint16_t)cy); }
     else if (a.lDir >= 0) { wr16(st + 8, (uint16_t)dx[a.lDir]); wr16(st + 10, (uint16_t)dy[a.lDir]); }
@@ -214,7 +229,7 @@ static void qte_apply(uint32_t st) {
     wr32(st, ++packet);                                                     // a new packet number, so the game reads it as changed
     static uint64_t lastSig = 0;
     const uint64_t sig = a.buttons | (uint64_t)a.lt << 16 | (uint64_t)a.rt << 17 | (uint64_t)a.lRot << 18 | (uint64_t)a.rRot << 19 | (uint64_t)(a.lDir + 1) << 20 | (uint64_t)(a.rDir + 1) << 24;
-    if (sig != lastSig) { LOG("[qte] answering: buttons %04X%s%s%s%s left stick %d right stick %d\n", a.buttons, a.lt ? " LT" : "", a.rt ? " RT" : "", a.lRot ? " rotate-L" : "", a.rRot ? " rotate-R" : "", a.lDir, a.rDir); lastSig = sig; }
+    if (sig != lastSig) { LOG("[qte] answering%s: buttons %04X%s%s%s%s%s left stick %d right stick %d\n", mash ? " (tug of war)" : "", a.buttons, a.lt ? " LT" : "", a.rt ? " RT" : "", a.lRot ? " rotate-L" : "", a.rRot ? " rotate-R" : "", (a.lRot || a.rRot) ? (cw ? " clockwise" : " counterclockwise") : "", a.lDir, a.rDir); lastSig = sig; }
 }
 // What the game was last given (buttons, LT << 16, RT << 24), and the input clock (ms since the first poll, as ASURA_INPUTREC writes it):
 // for logs that line game events up with the pad (ASURA_SYNCLOG, hooks.cpp).

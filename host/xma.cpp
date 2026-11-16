@@ -36,6 +36,8 @@ struct Ctx {
 };
 static Ctx g_xma[kContexts];
 static std::mutex g_lock;
+static const bool kXmaLog = getenv("ASURA_XMALOG") != nullptr;   // each buffer started, looped and handed back, and every kick, lock and clear
+uint64_t xma_log_frame();
 
 static inline uint32_t reg_get(uint32_t r) { return *(volatile uint32_t*)(g_base + kRegs + r * 4); }
 static inline uint32_t* cword(uint32_t i, uint32_t w) { return (uint32_t*)(g_base + g_array + i * 64 + w * 4); }
@@ -151,12 +153,16 @@ static void work(uint32_t i) {
             cupdate(i, 2, 0x3FFFFFF, 32); c.lastOffset = 32;
             continue;
         }
+        if (kXmaLog && packet == 0)
+            fprintf(stderr, "[xmalog] f=%llu ctx %u start buf %u at %08X packets %u loops %u loop %u-%u ch %d rate %d\n", (unsigned long long)xma_log_frame(), i, cur, base, count,
+                    (w0 >> 12) & 0xFF, cget(i, 3) & 0x3FFFFFF, w4 & 0x3FFFFFF, channels, rate);
         dec_packet(c, g_base + gpu_phys_to_host(base) + packet * 2048);
         c.packets++;
         offset = (packet + 1) * 2048 * 8 + 32;
         // hardware looping: from loop end back to loop start, loop count times (255 = for ever)
         const uint32_t loops = (w0 >> 12) & 0xFF, loopEnd = w4 & 0x3FFFFFF, loopStart = cget(i, 3) & 0x3FFFFFF;
         if (loops && loopEnd && offset >= loopEnd) {
+            if (kXmaLog) fprintf(stderr, "[xmalog] f=%llu ctx %u loop %u -> %u, count %u\n", (unsigned long long)xma_log_frame(), i, offset, loopStart, loops);
             offset = loopStart;
             if (loops != 255) cupdate(i, 0, 0xFFu << 12, (loops - 1) << 12);
             avcodec_flush_buffers(c.dec);
@@ -180,7 +186,8 @@ static void apply_bank(uint32_t reg, int what) {
             else if (what == 1) c.enabled = false;
             else { c.enabled = false; if (c.dec) avcodec_flush_buffers(c.dec); c.pending.clear(); c.lastOffset = 0xFFFFFFFFu; }
             static int n = 0;
-            if (n++ < 60) LOG("[xma] %s context %u\n", what == 0 ? "kick" : what == 1 ? "lock" : "clear", i);
+            if (kXmaLog) fprintf(stderr, "[xmalog] f=%llu ctx %u %s\n", (unsigned long long)xma_log_frame(), i, what == 0 ? "kick" : what == 1 ? "lock" : "clear");
+            else if (n++ < 60) LOG("[xma] %s context %u\n", what == 0 ? "kick" : what == 1 ? "lock" : "clear", i);
         }
     }
 }

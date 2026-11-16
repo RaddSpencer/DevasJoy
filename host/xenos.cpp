@@ -79,6 +79,7 @@ static double g_perfTicksToMs = 0;
 static double g_tDraw = 0, g_tResolve = 0, g_tTex = 0, g_tPresent = 0;
 static std::atomic<uint64_t> g_waitTicks[3];                                // ring empty, WAIT_REG_MEM, interrupt
 static std::atomic<uint64_t> g_nCompiles{0};
+static thread_local bool t_warmThread = false;                                // a pixel-shader warm-up thread (not counted as the game's compiles)
 static uint64_t g_nUploads = 0, g_upBytes = 0;
 void gpu_note_wait(int kind, uint64_t qpcTicks) { g_waitTicks[kind] += qpcTicks; }
 // Parts of the slowest draw and of the swap, for the [spike] line.
@@ -140,6 +141,7 @@ void capture_request() { g_ringDump = true; fprintf(stderr, "[capture] requested
 bool bcr2_log_requested();   // main.cpp: true when --log was given, also before main() runs
 static const int g_shotRingSize = getenv("ASURA_SHOTRING") ? atoi(getenv("ASURA_SHOTRING")) : (bcr2_log_requested() ? 150 : 0);   // with --log, F9 saves 150 frames (every frame): 3.5 s before the press and 1.5 s after
 static uint64_t g_frame = 0;
+uint64_t xma_log_frame() { return g_frame; }                               // the frame number for audio logs (xma.cpp)
 static ComPtr<ID3D11Device> g_dev;
 static ComPtr<ID3D11DeviceContext> g_ctx;
 static ComPtr<ID3D11DeviceContext1> g_ctx1;
@@ -237,6 +239,13 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_KEYDOWN && w == VK_F12 && !(l & (1 << 30))) g_screenshotWanted = true;
     // F9 (only with --log and BCR2_SHOTDIR set): save the last few seconds if BCR2_SHOTRING is set, else about the next 3 seconds, to catch something seen during play.
     if (m == WM_KEYDOWN && w == VK_F9 && !(l & (1 << 30)) && g_logging) { if (g_shotRingSize > 0) g_ringDump = true; else { g_shotBurstLeft = 180; g_shotStep = 3; } g_lastF9 = g_frame; fprintf(stderr, "[capture] F9 pressed at frame %llu\n", (unsigned long long)g_frame); }
+    // F8: a marker in the log, nothing else (no capture, no stall), so a tester can say "marks 3-5" instead of a video time.
+    if (m == WM_KEYDOWN && w == VK_F8 && !(l & (1 << 30))) {
+        static int marks = 0;
+        uint32_t input_clock_ms();
+        fprintf(stderr, "[mark] %d at frame %llu (input clock %u ms)\n", ++marks, (unsigned long long)g_frame, input_clock_ms());
+        fflush(stderr);
+    }
     if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT && g_modeWanted.load() != kWindowed) { SetCursor(nullptr); return TRUE; }
     if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29))) || (m == WM_KEYDOWN && w == VK_F11)) {
         if (!(l & (1 << 30))) {                                             // ignore auto-repeat
@@ -301,7 +310,7 @@ static ComPtr<ID3DBlob> compile_cached(const std::string& src, const char* entry
     ComPtr<ID3DBlob> blob = load_cached(src, target);
     if (blob) return blob;
     ComPtr<ID3DBlob> err;
-    g_nCompiles++;
+    if (!t_warmThread) g_nCompiles++;                                       // the [spike] count is the game's own compiles
     HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, entry, target,
                             D3DCOMPILE_OPTIMIZATION_LEVEL1 | D3DCOMPILE_ENABLE_STRICTNESS * 0, 0, &blob, &err);
     if (FAILED(hr)) {
@@ -313,11 +322,51 @@ static ComPtr<ID3DBlob> compile_cached(const std::string& src, const char* entry
         }
         return nullptr;
     }
-    if (FILE* f = fopen(path.c_str(), "wb")) { fwrite(blob->GetBufferPointer(), 1, blob->GetBufferSize(), f); fclose(f); }
+    {   // written under a temporary name and renamed: another thread (the warm-up, a compile worker) may read the same file at any moment
+        const std::string tmp = path + S(".%lu.tmp", GetCurrentThreadId());
+        bool ok = false;
+        if (FILE* f = fopen(tmp.c_str(), "wb")) { ok = fwrite(blob->GetBufferPointer(), 1, blob->GetBufferSize(), f) == blob->GetBufferSize(); ok = (fclose(f) == 0) && ok; }
+        if (!ok || !MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) DeleteFileA(tmp.c_str());
+    }
     return blob;
 }
 
 static const char* kVOut = "struct VOut { float4 pos : SV_Position; float4 o[16] : TEXCOORD; };\n";
+// Vertex fetch decoding with the format and flags given at draw time (generic vertex shaders). The same arithmetic as emit_vfetch's per-format code.
+static const char* kVfd = R"(
+float vfc(uint w, uint off, uint bw, uint fl) {
+  uint mask = bw == 32u ? 0xFFFFFFFFu : ((1u << bw) - 1u);
+  float v = (fl & 1u) ? float((int)(w << (32u - off - bw)) >> (32u - bw)) : float((w >> off) & mask);
+  if ((fl & 2u) == 0u) {
+    float umax = bw == 32u ? 4294967295.0 : float(mask);
+    float smax = bw == 32u ? 2147483647.0 : float((1u << (bw - 1u)) - 1u);
+    if (fl & 1u) v = (fl & 4u) ? (2.0 * v + 1.0) / umax : max(v / smax, -1.0);
+    else v = v / umax;
+  }
+  return v;
+}
+float4 vfd(uint va, uint fmt, uint fl) {
+  uint w0 = VB.Load(va), w1 = 0, w2 = 0, w3 = 0; float4 fv = float4(0, 0, 0, 1);
+  switch (fmt) {
+    case 6: fv = float4(vfc(w0, 0, 8, fl), vfc(w0, 8, 8, fl), vfc(w0, 16, 8, fl), vfc(w0, 24, 8, fl)); break;
+    case 7: fv = float4(vfc(w0, 0, 10, fl), vfc(w0, 10, 10, fl), vfc(w0, 20, 10, fl), vfc(w0, 30, 2, fl)); break;
+    case 16: fv.xyz = float3(vfc(w0, 0, 11, fl), vfc(w0, 11, 11, fl), vfc(w0, 22, 10, fl)); break;
+    case 17: fv.xyz = float3(vfc(w0, 0, 10, fl), vfc(w0, 10, 11, fl), vfc(w0, 21, 11, fl)); break;
+    case 25: fv.xy = float2(vfc(w0, 0, 16, fl), vfc(w0, 16, 16, fl)); break;
+    case 26: w1 = VB.Load(va + 4); fv = float4(vfc(w0, 0, 16, fl), vfc(w0, 16, 16, fl), vfc(w1, 0, 16, fl), vfc(w1, 16, 16, fl)); break;
+    case 31: fv.xy = float2(f16tof32(w0 & 0xFFFFu), f16tof32((w0 >> 16) & 0xFFFFu)); break;
+    case 32: w1 = VB.Load(va + 4); fv = float4(f16tof32(w0 & 0xFFFFu), f16tof32((w0 >> 16) & 0xFFFFu), f16tof32(w1 & 0xFFFFu), f16tof32((w1 >> 16) & 0xFFFFu)); break;
+    case 33: fv.x = vfc(w0, 0, 32, fl); break;
+    case 34: w1 = VB.Load(va + 4); fv.xy = float2(vfc(w0, 0, 32, fl), vfc(w1, 0, 32, fl)); break;
+    case 35: w1 = VB.Load(va + 4); w2 = VB.Load(va + 8); w3 = VB.Load(va + 12); fv = float4(vfc(w0, 0, 32, fl), vfc(w1, 0, 32, fl), vfc(w2, 0, 32, fl), vfc(w3, 0, 32, fl)); break;
+    case 36: fv.x = asfloat(w0); break;
+    case 37: w1 = VB.Load(va + 4); fv.xy = float2(asfloat(w0), asfloat(w1)); break;
+    case 57: w1 = VB.Load(va + 4); w2 = VB.Load(va + 8); fv.xyz = float3(asfloat(w0), asfloat(w1), asfloat(w2)); break;
+    case 38: w1 = VB.Load(va + 4); w2 = VB.Load(va + 8); w3 = VB.Load(va + 12); fv = float4(asfloat(w0), asfloat(w1), asfloat(w2), asfloat(w3)); break;
+  }
+  return fv;
+}
+)";
 
 // BCR2_VRR: for a G-Sync or FreeSync display. The game clock runs at exactly 60 Hz and each frame is presented at a fixed time after its tick,
 // with no wait for a refresh, so the panel follows the game. On a display without variable refresh this tears, so it is opt-in.
@@ -546,7 +595,16 @@ struct XShader {
     bool memexport = false;                                                  // vertex shader writes memory (eA/eM exports): drawn through issue_memexport
     uint64_t hash = 0;
     std::atomic<bool> ready{false};                                          // false while a worker is compiling it; ok, vs and ps are valid once true
+    // Generic vertex shaders (see vs_variant): a base is compiled from the unpatched code in the game files and records where its vertex
+    // fetches and interpolator exports are; a variant is one patched copy the game binds, sharing its base's compiled shader.
+    bool dynBase = false;
+    std::vector<uint32_t> fetchPos, expPos;
+    XShader* base = nullptr;
+    uint32_t vsf[32 * 4] = {};
+    int32_t vsx[64] = {};
 };
+// The shader that actually runs: a generic vertex shader's variant runs its base.
+static inline XShader* run_sh(XShader* s) { return s && s->base ? s->base : s; }
 
 // New shaders compile on worker threads, so a mesh seen for the first time costs a frame or two of that mesh, not a freeze of the whole game.
 struct CompileJob { XShader* sh; std::string src; bool isVs; std::string fallback; };   // fallback: compiled if src is refused
@@ -618,8 +676,9 @@ static void queue_compile(XShader* sh, std::string src, bool isVs, std::string f
 // when a level first appears: half a scene missing for most of a second looks worse than a short wait. Otherwise a draw waits only for what is left of a
 // small per-frame budget and is then left out for this frame.
 static double g_compileWaitMs = 0;                                           // used this frame
-static uint64_t g_drawsLeftOut = 0;
+static uint64_t g_drawsLeftOut = 0, g_leftOutVs = 0, g_leftOutPs = 0;   // draws left out, and how many waited on their vertex / pixel shader
 static bool shaders_ready(XShader* a, XShader* b, bool mustWait) {
+    a = run_sh(a); b = run_sh(b);
     auto done = [&] { return (!a || a->ready.load(std::memory_order_acquire)) && (!b || b->ready.load(std::memory_order_acquire)); };
     if (done()) return true;
     static const double kBudgetMs = getenv("ASURA_COMPILEWAIT") ? atof(getenv("ASURA_COMPILEWAIT")) : 5.0;
@@ -636,6 +695,8 @@ static bool shaders_ready(XShader* a, XShader* b, bool mustWait) {
     g_compileWaitMs += (double)(q.QuadPart - s.QuadPart) * g_perfTicksToMs;
     if (done()) return true;
     g_drawsLeftOut++;
+    if (a && !a->ready.load(std::memory_order_acquire)) g_leftOutVs++;
+    if (b && !b->ready.load(std::memory_order_acquire)) g_leftOutPs++;
     return false;
 }
 
@@ -654,6 +715,9 @@ cbuffer CS : register(b1) {
   float4 tfp[32];   // uv scale x/y, exp scale, cube/unused
   uint4 tfsg[32];
   float4 tfi[32];   // 1/width, 1/height of the bound host texture
+  uint4 vsf[32];    // generic vertex shaders: per vertex fetch x = slot | stride<<8 | format<<16 | flags<<24 (1 signed, 2 int, 4 no-zero, 8 round),
+                    //   y = offset (dwords, signed), z = dest swizzle | exp adjust<<12 | dest register<<18
+  int4 vsx[16];     // generic vertex shaders: per export instruction, the interpolator it writes (-1: blanked by the game)
 };
 Texture2D T2[16] : register(t0);
 TextureCube TC[16] : register(t16);
@@ -788,6 +852,10 @@ struct Translator {
     std::map<uint32_t, TexUse> texs; std::map<uint32_t, uint32_t> vfs;
     int uniq = 0;
     uint32_t prevFull[3] = { 0, 0, 0 };
+    // Generic vertex shader (dynVs): fetch parameters and export targets come from vsf/vsx at draw time, so one compiled shader serves every
+    // patched copy the game makes of it. The word offsets of each vertex fetch and each interpolator export, in emission order.
+    bool dynVs = false;
+    std::vector<uint32_t> dynFetchPos, dynExpPos;
 
     std::string R(int n) {
         n &= 63; usedRegs.insert(n);
@@ -837,6 +905,12 @@ struct Translator {
         uint32_t sop = bits(d0, 26, 6), vop = bits(d2, 24, 5);
         bool pred = bits(d1, 28, 1), predc = bits(d1, 27, 1);
         std::string& B = body;
+        int dynExp = -1;                                                    // generic vertex shader: this export's slot in vsx
+        if (dynVs && isVs && exp && vdst < 16) {
+            dynExp = (int)dynExpPos.size();
+            dynExpPos.push_back((uint32_t)(d - ucode));
+            B += S("if (vsx[%d].%c >= 0) ", dynExp >> 2, comp(dynExp & 3));  // blanked by the game: the whole instruction is a no-op
+        }
         if (pred) B += S("if (p == %s) ", predc ? "true" : "false");
         B += "{\n";
         // vector result needed?
@@ -974,7 +1048,7 @@ struct Translator {
             if (isVs) {
                 if (vdst == 62) dst = "oPos";
                 else if (vdst == 63) dst = "oPts";
-                else if (vdst < 16) dst = S("oI[%u]", vdst);
+                else if (vdst < 16) dst = dynExp >= 0 ? S("oI[vsx[%d].%c]", dynExp >> 2, comp(dynExp & 3)) : S("oI[%u]", vdst);
                 else if (vdst == 32) { dst = "eA"; memexport = true; }                   // memexport: address (see mx_flush)
                 else if (vdst >= 33 && vdst <= 37) { dst = S("eM[%u]", vdst - 33); memexport = true; }   // memexport: data
                 else { logf_once(S("vexp%u", vdst).c_str(), "ignored VS export register %u", vdst); }
@@ -1015,6 +1089,20 @@ struct Translator {
         int exp = sext(bits(d1, 24, 6), 6);
         int offset = sext(bits(d2, 8, 23), 23);
         bool pred = bits(d1, 31, 1), predc = bits(d2, 31, 1);
+        if (dynVs) {
+            const uint32_t f = (uint32_t)dynFetchPos.size();
+            dynFetchPos.push_back((uint32_t)(d - ucode));
+            std::string& B = body;
+            if (pred) B += S("if (p == %s) ", predc ? "true" : "false");
+            const std::string ix = R(srcReg) + S(".%c", comp(srcSw));
+            B += S("{ uint4 P=vsf[%u]; float ix=%s; if(P.x&0x8000000u) ix=round(ix);\n"
+                   " float4 fv=vfd(vfo[(P.x&127u)>>2][P.x&3u]+(uint)((int)ix)*((P.x>>8)&255u)*4u+(uint)((int)P.y*4), (P.x>>16)&63u, P.x>>24);\n"
+                   " int ex=(int)(P.z<<14)>>26; if(ex!=0) fv*=exp2((float)ex);\n"
+                   " uint dr=(P.z>>18)&63u; float4 t=r[dr];\n"
+                   " [unroll] for(uint c=0;c<4;c++){ uint sw=(P.z>>(3*c))&7u; if(sw!=7u) t[c]=sw<4u?fv[sw]:(sw==5u?1.0:0.0); }\n"
+                   " r[dr]=t; }\n", f, ix.c_str());
+            return;
+        }
         auto it = vfs.find(slot);
         if (it == vfs.end() || it->second < stride) vfs[slot] = stride;
         std::string& B = body;
@@ -1214,7 +1302,7 @@ struct Translator {
         bool jumps = false;
         for (auto& c : cfs) if (c.op == 9 || c.op == 11 || c.op == 7) jumps = true;
         for (auto& c : cfs) if (c.op == 7) hasLoop = true;
-        body.clear();
+        body.clear(); dynFetchPos.clear(); dynExpPos.clear();
         std::string& B = body;
         std::vector<std::pair<uint32_t, std::string>> loopEnds;
         for (uint32_t i = 0; i < cfs.size(); i++) {
@@ -1318,22 +1406,11 @@ static void shader_find(const std::vector<uint32_t>& code, bool isVs) {
     }
     fprintf(stderr, "[shaderfind]   %d copies\n", hits);
 }
-static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint32_t paramGen) {
-    static std::unordered_map<uint64_t, XShader*> cache;
-    uint64_t h = fnv64(code.data(), code.size() * 4, isVs ? 0x1234 : 0x5678);
-    h = fnv64(&paramGen, 4, h);
-    auto it = cache.find(h);
-    if (it != cache.end()) return it->second;
-    XShader* sh = new XShader();
-    sh->hash = h;
-    cache[h] = sh;
-    shader_record(code, isVs, paramGen);
-    shader_find(code, isVs);
-    if (const char* ud = getenv("ASURA_UCODEDUMP")) {                         // the raw microcode of each new shader, big-endian as in guest memory
-        std::string p = std::string(ud) + S("\\%s_%016llX.bin", isVs ? "vs" : "ps", (unsigned long long)h);
-        if (FILE* f = fopen(p.c_str(), "wb")) { for (uint32_t w : code) { uint32_t be = _byteswap_ulong(w); fwrite(&be, 4, 1, f); } fclose(f); }
-    }
+// Microcode to HLSL (src; fallback: the level-0 sampling copy for loop shaders, empty if not needed), filling in sh's texture and vertex-fetch
+// use. h is the shader's key (debug switches name shaders by it). Thread-safe: also used by the background pixel-shader warm-up.
+static void translate_shader(const std::vector<uint32_t>& code, bool isVs, uint32_t paramGen, uint64_t h, XShader* sh, std::string& src, std::string& fallback, bool dyn = false) {
     Translator T; T.ucode = code.data(); T.words = (uint32_t)code.size(); T.isVs = isVs; T.out = sh;
+    if (dyn) { T.dynVs = true; T.useArray = true; }                       // dynamic register writes need the register array
     T.decode_cf();
     T.walk();
     if (T.needRel) { T.useArray = true; T.usedRegs.clear(); T.needRel = false; memset(T.prevFull, 0, sizeof(T.prevFull)); T.walk(); }
@@ -1353,7 +1430,8 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
         }
         T.body.swap(b);
     }
-    std::string src = std::string(kCommon) + uv_helper() + kVOut;
+    src = std::string(kCommon) + uv_helper() + kVOut;
+    if (dyn) src += kVfd;
     if (T.memexport) src += kMemExport;
     if (isVs && !getenv("ASURA_VSIMPRECISE")) {
         // Every vertex shader temporary is precise: a depth pre-pass and the colour pass after it run the same microcode in different shaders, and
@@ -1474,12 +1552,31 @@ static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint3
     }
     for (auto& kv : T.texs) sh->tex.push_back(kv.second);
     for (auto& kv : T.vfs) sh->vf.push_back({ kv.first, kv.second });
+    if (dyn) { sh->fetchPos = T.dynFetchPos; sh->expPos = T.dynExpPos; sh->dynBase = !T.memexport && T.dynFetchPos.size() <= 32 && T.dynExpPos.size() <= 64; }
+    fallback = (!isVs && T.hasLoop) ? to_level0(src) : std::string();
+    if (fallback == src) fallback.clear();
+}
+static XShader* build_shader(const std::vector<uint32_t>& code, bool isVs, uint32_t paramGen) {
+    static std::unordered_map<uint64_t, XShader*> cache;
+    uint64_t h = fnv64(code.data(), code.size() * 4, isVs ? 0x1234 : 0x5678);
+    h = fnv64(&paramGen, 4, h);
+    auto it = cache.find(h);
+    if (it != cache.end()) return it->second;
+    XShader* sh = new XShader();
+    sh->hash = h;
+    cache[h] = sh;
+    shader_record(code, isVs, paramGen);
+    shader_find(code, isVs);
+    if (const char* ud = getenv("ASURA_UCODEDUMP")) {                         // the raw microcode of each new shader, big-endian as in guest memory
+        std::string p = std::string(ud) + S("\\%s_%016llX.bin", isVs ? "vs" : "ps", (unsigned long long)h);
+        if (FILE* f = fopen(p.c_str(), "wb")) { for (uint32_t w : code) { uint32_t be = _byteswap_ulong(w); fwrite(&be, 4, 1, f); } fclose(f); }
+    }
+    std::string src, fallback;
+    translate_shader(code, isVs, paramGen, h, sh, src, fallback);
     static int total = 0;
     total++;
-    if (total <= 3 || (total % 50) == 0) fprintf(stderr, "[gfx] shaders translated=%d (last %s %u dwords, %zu tex, %zu vf)\n", total, isVs ? "vs" : "ps", T.words, sh->tex.size(), sh->vf.size());
+    if (total <= 3 || (total % 50) == 0) fprintf(stderr, "[gfx] shaders translated=%d (last %s %zu dwords, %zu tex, %zu vf)\n", total, isVs ? "vs" : "ps", code.size(), sh->tex.size(), sh->vf.size());
     static const bool kSync = getenv("ASURA_SYNCSHADERS") != nullptr;         // compile on this thread, as before
-    std::string fallback = (!isVs && T.hasLoop) ? to_level0(src) : std::string();
-    if (fallback == src) fallback.clear();
     auto blob = load_cached(src, isVs ? "vs_5_0" : "ps_5_0");                // already compiled once: cheap enough to do right here
     if (!blob && kSync) {
         blob = compile_cached(src, "main", isVs ? "vs_5_0" : "ps_5_0");
@@ -1587,6 +1684,168 @@ static void shader_record(const std::vector<uint32_t>& code, bool isVs, uint32_t
     if (FILE* f = fopen(g_manifestPath.c_str(), "a")) { fprintf(f, "%s\n", line.c_str()); fclose(f); }
 }
 static void show_compile_progress(int pct);   // draws the "Compiling shaders... NN%" screen (defined with the sprites, below)
+// ---- generic vertex shaders ----
+// The game patches every vertex shader when it binds it: the vertex fetches get the mesh's layout (destination register, stream, stride,
+// offset, format, swizzle, exponent) and the interpolator exports are renumbered or blanked to link with the pixel shader. Each patched
+// copy used to be its own shader, compiled the first time it was drawn (objects popped in a few frames after camera cuts). Now the
+// unpatched shader from the game files (the shader index) is compiled once as a generic shader that takes those fields from vsf/vsx, and
+// each patched copy is just a set of constants. Any difference the generic form can't express keeps the old per-copy shader.
+// ASURA_STATICVS=1: every copy compiled on its own, as before.
+static uint64_t g_vsGeneric = 0, g_vsFallback = 0;
+static XShader* build_vs_base(const std::vector<uint32_t>& code) {
+    static std::unordered_map<uint64_t, XShader*> cache;
+    const uint64_t h = fnv64(code.data(), code.size() * 4, 0x9D7B);
+    auto it = cache.find(h);
+    if (it != cache.end()) return it->second;
+    XShader* sh = new XShader();
+    sh->hash = h;
+    cache[h] = sh;
+    std::string src, fallback;
+    translate_shader(code, true, 0xFFFFFFFFu, h, sh, src, fallback, true);
+    if (!sh->dynBase) return sh;                                            // memexport, or too many fetches or exports: not used as a base
+    static const bool kSync = getenv("ASURA_SYNCSHADERS") != nullptr;
+    auto blob = load_cached(src, "vs_5_0");
+    if (!blob && kSync) blob = compile_cached(src, "main", "vs_5_0");
+    if (blob || kSync) finish_shader(sh, blob.Get(), true);
+    else queue_compile(sh, std::move(src), true);
+    return sh;
+}
+// One patched copy (pc) of base code bc, as the generic base b's constants. False if the patch touches anything but the expected fields.
+static bool vs_extract(const XShader* b, const std::vector<uint32_t>& bc, const std::vector<uint32_t>& pc, XShader* v, std::string& why) {
+    if (bc.size() != pc.size()) { why = "length"; return false; }
+    auto bits = [](uint32_t x, int lo, int n) { return (x >> lo) & ((n == 32) ? 0xFFFFFFFFu : ((1u << n) - 1)); };
+    std::vector<uint8_t> covered(pc.size(), 0);
+    uint32_t prevP[3] = { 0, 0, 0 }, prevB[3] = { 0, 0, 0 };
+    std::map<uint32_t, uint32_t> vfs;
+    for (size_t f = 0; f < b->fetchPos.size(); f++) {
+        const uint32_t pos = b->fetchPos[f];
+        if (pos + 3 > pc.size()) { why = "fetch position"; return false; }
+        const uint32_t* d = &pc[pos]; const uint32_t* o = &bc[pos];
+        covered[pos] = covered[pos + 1] = covered[pos + 2] = 1;
+        if ((d[0] & 31) != 0) { why = "fetch replaced"; return false; }
+        if (!bits(d[1], 30, 1)) memcpy(prevP, d, 12);
+        if (!bits(o[1], 30, 1)) memcpy(prevB, o, 12);
+        const uint32_t* fp = bits(d[1], 30, 1) ? prevP : d;
+        const uint32_t* fb = bits(o[1], 30, 1) ? prevB : o;
+        if (bits(fp[0], 5, 6) != bits(fb[0], 5, 6) || bits(fp[0], 30, 2) != bits(fb[0], 30, 2)) { why = "fetch index register"; return false; }
+        if (bits(d[1], 31, 1) != bits(o[1], 31, 1) || bits(d[2], 31, 1) != bits(o[2], 31, 1)) { why = "fetch predicate"; return false; }
+        const uint32_t slot = bits(fp[0], 20, 5) * 3 + bits(fp[0], 25, 2), stride = bits(fp[2], 0, 8), rounded = bits(fp[1], 15, 1);
+        const uint32_t dst = bits(d[0], 12, 6), dsw = bits(d[1], 0, 12), fmt = bits(d[1], 16, 6);
+        const uint32_t flags = bits(d[1], 12, 1) | (bits(d[1], 13, 1) << 1) | (bits(d[1], 14, 1) << 2) | (rounded << 3);
+        const uint32_t ex = bits(d[1], 24, 6), off = bits(d[2], 8, 23);
+        if (slot >= 96) { why = "fetch slot"; return false; }
+        v->vsf[f * 4 + 0] = slot | (stride << 8) | (fmt << 16) | (flags << 24);
+        v->vsf[f * 4 + 1] = (uint32_t)(((int32_t)(off << 9)) >> 9);          // sign-extended, in dwords
+        v->vsf[f * 4 + 2] = dsw | (ex << 12) | (dst << 18);
+        auto it = vfs.find(slot);
+        if (it == vfs.end() || it->second < stride) vfs[slot] = stride;
+    }
+    static const uint32_t kBlank[3] = { 0xC8000000u, 0x00000000u, 0x02000000u };
+    for (size_t e = 0; e < b->expPos.size(); e++) {
+        const uint32_t pos = b->expPos[e];
+        if (pos + 3 > pc.size()) { why = "export position"; return false; }
+        const uint32_t* d = &pc[pos]; const uint32_t* o = &bc[pos];
+        covered[pos] = covered[pos + 1] = covered[pos + 2] = 1;
+        if (d[0] == o[0] && d[1] == o[1] && d[2] == o[2]) v->vsx[e] = (int32_t)bits(o[0], 0, 6);
+        else if (d[0] == kBlank[0] && d[1] == kBlank[1] && d[2] == kBlank[2]) v->vsx[e] = -1;
+        else if (d[1] == o[1] && d[2] == o[2] && ((d[0] ^ o[0]) & ~0x3Fu) == 0 && (d[0] & 0x3F) < 16) v->vsx[e] = (int32_t)(d[0] & 0x3F);
+        else { why = "export changed"; return false; }
+    }
+    for (size_t i = 0; i < pc.size(); i++)
+        if (pc[i] != bc[i] && !covered[i]) { why = S("word %zu", i); return false; }
+    v->vf.clear();
+    for (auto& kv : vfs) v->vf.push_back({ kv.first, kv.second });
+    return true;
+}
+static XShader* vs_variant(const std::vector<uint32_t>& code) {
+    static const bool kStatic = getenv("ASURA_STATICVS") != nullptr;
+    const uint32_t pg = 0xFFFFFFFFu;
+    if (kStatic || !g_indexReady) return build_shader(code, true, pg);
+    static std::unordered_map<uint64_t, XShader*> cache;
+    uint64_t h = fnv64(code.data(), code.size() * 4, 0x1234); h = fnv64(&pg, 4, h);
+    auto it = cache.find(h);
+    if (it != cache.end()) return it->second;
+    XShader* res = nullptr;
+    std::string why = "not in the shader index";
+    uint64_t key = 0; std::vector<uint32_t> bc;
+    if (shaderindex_closest(code, true, key, bc)) {
+        XShader* b = build_vs_base(bc);
+        if (!b->dynBase) why = "base not generic (memexport or too many fetches/exports)";
+        else {
+            XShader* v = new XShader();
+            if (vs_extract(b, bc, code, v, why)) {
+                v->hash = h; v->base = b; v->tex = b->tex; v->ok = true;
+                res = v;
+                shader_record(code, true, pg);                              // still listed in the manifest
+                g_vsGeneric++;
+            } else delete v;
+        }
+    }
+    if (!res) {
+        res = build_shader(code, true, pg);
+        g_vsFallback++;
+        static int nl = 0;
+        if (nl++ < 40) fprintf(stderr, "[vsgen] vs %016llX compiled on its own: %s\n", (unsigned long long)h, why.c_str());
+    }
+    if (((g_vsGeneric + g_vsFallback) % 100) == 0) fprintf(stderr, "[vsgen] %llu generic, %llu compiled on their own\n", (unsigned long long)g_vsGeneric, (unsigned long long)g_vsFallback);
+    cache[h] = res;
+    return res;
+}
+
+// Pixel-shader warm-up (Asura). The shader index holds every pixel shader in the game files, and the game binds nearly all of them unchanged
+// (93% of the pixel shaders first seen in episodes 4-8 had no patched words and paramGen FFFFFFFF). A shader the game used for the first time
+// had to compile while its draws were left out, so objects and lighting appeared a few frames after a camera cut. These threads translate and
+// compile every indexed pixel shader into the disk cache, at the lowest priority, so build_shader finds the compiled blob at first use and the
+// draw goes ahead in the same frame. Nothing is registered or recorded. Done once per build and render scale (stamp file);
+// ASURA_NOPSWARM=1 turns it off, ASURA_PSWARMTHREADS=n sets the thread count (default a quarter of the cores).
+static void start_ps_warmup() {
+    if (getenv("ASURA_NOPSWARM") || getenv("ASURA_SYNCSHADERS") || shaderindex_size() == 0) return;
+    WIN32_FILE_ATTRIBUTE_DATA fa{}; wchar_t ew[MAX_PATH]; GetModuleFileNameW(nullptr, ew, MAX_PATH); GetFileAttributesExW(ew, GetFileExInfoStandard, &fa);
+    const std::string stampWant = S("%08lX%08lX scale=%d index=%zu vs=%d", fa.ftLastWriteTime.dwHighDateTime, fa.ftLastWriteTime.dwLowDateTime, g_resScale, shaderindex_size(), getenv("ASURA_STATICVS") ? 0 : 1);
+    const std::string stampPath = shader_cache_dir() + "\\pswarm.stamp";
+    if (FILE* f = fopen(stampPath.c_str(), "r")) {
+        char b[160] = {}; const size_t n = fread(b, 1, sizeof b - 1, f); fclose(f);
+        if (stampWant == std::string(b, n)) { fprintf(stderr, "[pswarm] every indexed pixel shader is compiled already\n"); return; }
+    }
+    // pixel shaders as they are, and every vertex shader as its generic base (see vs_variant); vertex shaders first, they are fewer
+    auto list = std::make_shared<std::vector<std::pair<bool, std::vector<uint32_t>>>>();
+    static const bool kStaticVs = getenv("ASURA_STATICVS") != nullptr;
+    if (!kStaticVs) shaderindex_for_each(true, [&](uint64_t, const std::vector<uint32_t>& code) { list->push_back({ true, code }); });
+    shaderindex_for_each(false, [&](uint64_t, const std::vector<uint32_t>& code) { list->push_back({ false, code }); });
+    const unsigned nThreads = getenv("ASURA_PSWARMTHREADS") ? (unsigned)std::max(1, atoi(getenv("ASURA_PSWARMTHREADS"))) : std::max(1u, std::thread::hardware_concurrency() / 4);
+    auto next = std::make_shared<std::atomic<size_t>>(0);
+    auto left = std::make_shared<std::atomic<unsigned>>(nThreads);
+    auto compiled = std::make_shared<std::atomic<size_t>>(0), failed = std::make_shared<std::atomic<size_t>>(0);
+    LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
+    fprintf(stderr, "[pswarm] compiling %zu indexed shaders (generic vertex shaders, then pixel shaders) into the cache on %u low-priority threads\n", list->size(), nThreads);
+    for (unsigned t = 0; t < nThreads; t++) std::thread([=] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        t_warmThread = true;
+        for (;;) {
+            const size_t i = next->fetch_add(1);
+            if (i >= list->size()) break;
+            const bool isVs = (*list)[i].first;
+            const std::vector<uint32_t>& code = (*list)[i].second;
+            const uint32_t pg = 0xFFFFFFFFu;
+            uint64_t h = isVs ? fnv64(code.data(), code.size() * 4, 0x9D7B) : fnv64(&pg, 4, fnv64(code.data(), code.size() * 4, 0x5678));
+            XShader tmp; std::string src, fallback;
+            translate_shader(code, isVs, pg, h, &tmp, src, fallback, isVs);
+            if (isVs && !tmp.dynBase) continue;
+            const char* target = isVs ? "vs_5_0" : "ps_5_0";
+            if (load_cached(src, target)) continue;
+            ComPtr<ID3DBlob> blob = compile_cached(src, "main", target);
+            if (!blob && !fallback.empty()) blob = compile_cached(fallback, "main", target);
+            (blob ? *compiled : *failed)++;
+            if ((i + 1) % 2000 == 0) fprintf(stderr, "[pswarm] %zu of %zu\n", i + 1, list->size());
+        }
+        if (--*left == 0) {
+            LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
+            fprintf(stderr, "[pswarm] done: %zu compiled now, %zu failed, %zu were cached, %.0f s\n", compiled->load(), failed->load(),
+                    list->size() - compiled->load() - failed->load(), (double)(t1.QuadPart - t0.QuadPart) * g_perfTicksToMs / 1000.0);
+            if (FILE* f = fopen(stampPath.c_str(), "w")) { fputs(stampWant.c_str(), f); fclose(f); }
+        }
+    }).detach();
+}
 static void shader_precompile() {
     manifest_read();
     // The index of the player's own shaders (shaderindex.cpp): built once from the cooked packages (about 1.5 minutes), then
@@ -1623,6 +1882,7 @@ static void shader_precompile() {
             }
         }
     }
+    if (!pack_load()) start_ps_warmup();                                     // every pixel shader in the game files, in the background
     if (getenv("ASURA_NOPRECOMPILE") || getenv("ASURA_SYNCSHADERS")) return;
     // Done already for this build, render scale and manifest? Cached shaders load quickly on first use, so nothing more is needed.
     WIN32_FILE_ATTRIBUTE_DATA fa{}; wchar_t ew[MAX_PATH]; GetModuleFileNameW(nullptr, ew, MAX_PATH); GetFileAttributesExW(ew, GetFileExInfoStandard, &fa);
@@ -1665,7 +1925,7 @@ static void shader_precompile() {
                 const char* p = line.c_str() + used; unsigned idx = 0, val = 0; int adv = 0;   // the words the game patched
                 while (sscanf(p, " %u=%x%n", &idx, &val, &adv) == 2) { if (idx < code.size()) code[idx] = val; p += adv; }
                 builtLocal.insert(shader_code_key(code.data(), code.size(), vs));
-                build_shader(code, vs, pg);
+                if (vs) vs_variant(code); else build_shader(code, vs, pg);
                 nManifest++;
                 continue;
             }
@@ -1681,7 +1941,7 @@ static void shader_precompile() {
             const char* p = line.c_str() + 1 + used; size_t k = 0; unsigned val = 0; int adv = 0;
             while (k < n && sscanf(p, " %x%n", &val, &adv) == 1) { code[k++] = val; p += adv; }
             if (k != n || builtLocal.count(shader_code_key(code.data(), n, line[0] == 'V'))) continue;
-            build_shader(code, line[0] == 'V', pg);
+            if (line[0] == 'V') vs_variant(code); else build_shader(code, false, pg);
             nManifest++;
         }
         fprintf(stderr, "[shader] references: %zu, from the shader index %zu (index holds %zu), from the local record %zu, missing %zu\n",
@@ -1934,6 +2194,7 @@ struct HostTex {
     ComPtr<ID3D11ShaderResourceView> srvSigned;                             // the same texels read as signed (SNORM), made on first use
     DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN; uint32_t faces = 1;
     uint64_t hash = 0, lastFrame = ~0ull, mxEpoch = 0; uint32_t hostW = 0, hostH = 0, levels = 0;
+    bool white = false;                                                     // DXT5 that is white wherever it is not transparent (font pages)
     HostTex* mod = nullptr;                                                 // a replacement from the mods folder for the current contents
 };
 // Signed textures (normal maps above all) were read as unsigned and turned signed in texfix after filtering. Byte 7F (+1) and 80 (-1) are neighbours
@@ -2230,16 +2491,44 @@ static uint32_t g_qteFrame = 0;
 // on screen can only be a BURST prompt.
 static const bool kHidePrompts = [] { const char* e = getenv("ASURA_BURSTAUTO"); return e && *e && strcmp(e, "0") != 0; }();
 static bool g_hideDraw = false;
-static void qte_note_texture(uint32_t base, uint64_t hash, uint32_t fmt, uint32_t w, uint32_t h2) {
+static bool g_mashBurst = false;                                            // a tug of war has shown its RT BURST prompt (qte_note_texture)
+static void qte_note_texture(uint32_t base, uint64_t hash, uint32_t fmt, uint32_t w, uint32_t h2, bool ui, bool white) {
     const uint32_t h = (uint32_t)(hash ^ (hash >> 32));
     {   // each pixel texture's folded hash once while tracing, and any texture at a prompt address whose hash is not the table's
         static std::set<uint64_t> seen;
         const bool atPrompt = std::any_of(std::begin(kQteTex), std::end(kQteTex), [&](const QteTex& q) { return q.addr == base && q.hash && q.hash != h; });
         if ((g_trace > 0 || atPrompt) && seen.insert((uint64_t)base << 32 | h).second) fprintf(stderr, "[qtetex] f=%llu base=%08X hash=%08X%s\n", (unsigned long long)g_frame, base, h, atPrompt ? " (prompt address, other hash)" : "");
     }
+    bool story_mash_active();                                               // Story Mode answering a tug-of-war prompt (uescript.cpp): hide its icons
+    const bool hideMash = story_mash_active();
+    {   // ASURA_MASHTEXLOG=1 (debug): each fmt-20 (DXT5, the UI's format) texture once outside a tug of war and once during one, to
+        // tell the tug-of-war meter's textures from the HUD's
+        static const bool kLog = getenv("ASURA_MASHTEXLOG") != nullptr;
+        static std::set<uint64_t> seenOut, seenIn;
+        if (kLog && fmt == 20 && (hideMash ? seenIn : seenOut).insert(hash).second)
+            fprintf(stderr, "[mashtex] f=%llu %s hash=%016llX base=%08X %ux%u%s%s%s\n", (unsigned long long)g_frame, hideMash ? "during" : "outside", (unsigned long long)hash, base, w, h2,
+                    hideMash && !seenOut.count(hash) ? " (only seen during)" : "", white ? " white" : "", ui ? " ui" : "");
+    }
+    // A tug of war that ends in an RT BURST (episode 11's rotate meter): Story Mode leaves RT to the player (xam.cpp qte_apply), so from
+    // the first RT icon on, nothing of the tug of war is hidden any more and the BURST prompt shows; until it has gone (story_mash_recent).
+    bool story_mash_recent();
+    bool& mashBurst = g_mashBurst;
+    const bool mashRecent = story_mash_recent();
+    if (!mashRecent) mashBurst = false;
     for (const QteTex& q : kQteTex)
-        if ((q.addr == base && (q.hash == 0 || q.hash == h)) || (kHidePrompts && q.hash && q.hash == h)) { g_qteFrame |= q.action; if (kHidePrompts) g_hideDraw = true; }
+        if ((q.addr == base && (q.hash == 0 || q.hash == h)) || ((kHidePrompts || hideMash) && q.hash && q.hash == h)) {
+            g_qteFrame |= q.action;
+            if (q.action == QTE_RT && mashRecent && !kHidePrompts && !mashBurst) { mashBurst = true; fprintf(stderr, "[qte] f=%llu tug of war: RT BURST prompt, shown and left to the player\n", (unsigned long long)g_frame); }
+            if (kHidePrompts || (hideMash && !mashBurst)) g_hideDraw = true;
+        }
     if (kHidePrompts && g_qteFrame && fmt == 20 && ((w == 128 && h2 == 128) || (w == 512 && h2 == 128) || (w == 1024 && h2 == 1024))) g_hideDraw = true;
+    // Story Mode answering a tug of war (uescript.cpp story_mash_recent): its meter is the HUD's own gauge (the action feeds the Mantra
+    // gauge: bNotSynchronizeMantraGauge false, AdditionalMantraAmount 0.02), drawn by Scaleform from DXT5 (fmt 20) pictures: the gold
+    // ornament sheet 512x512, fire sheets 512x256 / 128x256 / 1024x512, the prompt's B states, emblem, circle and glow at 128x128 / 64x64,
+    // the bar burning away at the end 2048x1024 and 256x256 (episode 5, logs\ep5_run7 / st5b [mashtex]). Their content moves between
+    // runs, so every Scaleform DXT5 picture is left out while it lasts except font pages (white wherever not transparent: HostTex::white),
+    // so subtitles stay. Going by size alone missed the 256x256 burn sheets (the user's episode 11 run, rec_20261115_183431_2.mp4 0:59).
+    if (ui && fmt == 20 && mashRecent && !mashBurst && !white) g_hideDraw = true;
     // Story Mode with its prompts hidden (hooks.cpp synchronic_hide_enabled): the Y prompt icon (128x128 DXT5 at 014FA000 among the QTE
     // prompt icons, folded content hash DF3D91A4) is left out. A Synchronic track shows it before Story Mode can hide the track's
     // prompt, and nothing that runs afterwards takes it off (it stayed for the rest of the scene: the user's episode 3 run,
@@ -2494,10 +2783,20 @@ static HostTex* get_texture(const FetchInfo& fi) {
             }
         }
     }
+    if (fi.fmt == 20 && fi.faces == 1) {                                    // DXT5: white wherever it is not transparent (a font page; Story Mode's tug of war keeps these)
+        bool white = true;
+        for (size_t o = 0; white && o + 16 <= out.size(); o += 16) {
+            const uint8_t* b = out.data() + o;
+            const bool clear = b[0] == 0 && b[1] == 0;                         // both alpha endpoints 0: fully transparent
+            if (!clear && !(b[8] == 0xFF && b[9] == 0xFF && b[10] == 0xFF && b[11] == 0xFF)) white = false;
+        }
+        ht->white = white;
+    }
+    else ht->white = false;
     if (fi.faces == 1 && (mods_active() || mods_dumping())) {                // texture mods: by a hash of the whole picture (mods_texture)
         const uint64_t full = mods_hash(out.data(), out.size()) ^ ((uint64_t)hw << 48 | (uint64_t)hh << 32);
         if (mods_dumping()) mods_dump(full, fi, tf, hw, hh, out.data());
-        if (HostTex* m = mods_texture(full, hw, hh)) { ht->mod = m; return m; }
+        if (HostTex* m = mods_texture(full, hw, hh)) { ht->mod = m; m->white = ht->white; return m; }
     }
     if (fi.fmt == 6 && hw == 1024 && hh == 256 && fi.faces == 1 && out.size() == (size_t)1024 * 256 * 4) {
         static std::set<uint64_t> seenSplash;
@@ -2747,6 +3046,8 @@ struct alignas(16) StateCb {
     float tfp[32 * 4];
     uint32_t tfsg[32 * 4];
     float tfi[32 * 4];
+    uint32_t vsf[32 * 4];
+    int32_t vsx[64];
 };
 
 static uint32_t vb_alloc(uint32_t size, uint8_t*& ptr) {
@@ -2999,7 +3300,66 @@ static void sync_color_alias(Rt* r, uint32_t base, uint32_t fmt, uint32_t pitch)
 // withColor is the mode=4 form: the same rectangle also writes a colour taken from its vertices, to the bound colour targets.
 static bool is_10bit_family(uint32_t f) { return f == 2 || f == 3 || f == 10 || f == 12; }
 static bool is_7e3_float(uint32_t f) { return f == 3 || f == 12; }
-static bool fast_clear(bool withColor) {
+// Clear only these host rectangles of a depth target: a scissored draw whose depth comes from the viewport (MinDepth = MaxDepth = z),
+// stencil replaced with `stencil`. depthToo false: stencil only. The caller has made the target current (sync_depth_alias).
+static void depth_clear_rects(Rt* depth, const std::vector<D3D11_RECT>& rects, float z, UINT8 stencil, bool depthToo) {
+    ID3D11ShaderResourceView* nul[32] = {};
+    g_ctx->PSSetShaderResources(0, 32, nul);
+    g_ctx->OMSetRenderTargets(0, nullptr, depth->dsv.Get());
+    invalidate_binds();
+    g_ctx->VSSetShader(g_vsBlit.Get(), nullptr, 0);
+    g_ctx->PSSetShader(nullptr, nullptr, 0);
+    g_ctx->GSSetShader(nullptr, nullptr, 0);
+    g_ctx->IASetInputLayout(nullptr);
+    g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+    // z on, write, always (or off); stencil on, always, replace on every path; read and write masks FF
+    const uint32_t dcClr = 1u | (depthToo ? (2u | 4u | (7u << 4)) : 0u) | (7u << 8) | (2u << 11) | (2u << 14) | (2u << 17);
+    g_ctx->OMSetDepthStencilState(get_ds(dcClr, 0xFFFF00u, 0), stencil);
+    g_ctx->RSSetState(get_rs(0, true, true, 0, 0));
+    D3D11_VIEWPORT vp{ 0, 0, (float)(depth->w * g_resScale), (float)(depth->h * g_resScale), z, z };
+    g_ctx->RSSetViewports(1, &vp);
+    for (auto& q : rects) { g_ctx->RSSetScissorRects(1, &q); g_ctx->Draw(3, 0); }
+    invalidate_binds();
+}
+// The host rectangles a clear-by-rectangle-list draw covers (the current vertex fetch 0, screen-space positions), clipped to the scissor
+// and scaled by samples per pixel and the render scale, in a host target of hostW x hostH. Returns 0: can't tell (clear the whole
+// target), 1: covers the whole target, 2: the rectangles in `rects`, 3: covers nothing. A list may hold several rectangles (3 vertices each).
+static int clear_rects(uint32_t numVerts, uint32_t msaa, LONG hostW, LONG hostH, std::vector<D3D11_RECT>& rects) {
+    rects.clear();
+    const uint32_t* vf = &g_regs[R_FETCH];
+    static const bool kWhole = getenv("ASURA_FASTCLEARWHOLE") != nullptr;
+    static const bool kFirstOnly = getenv("ASURA_FASTCLEARFIRST") != nullptr;   // the old reading (first rectangle, stride words / 3), to compare
+    const uint32_t vaddr = vf[0] & ~3u, endian = vf[1] & 3;
+    const uint32_t words = (vf[1] >> 2) & 0xFFFFFF, nv = std::max(numVerts, 3u);
+    const uint32_t strideW = kFirstOnly ? words / 3 : words / nv;
+    const uint32_t nRects = kFirstOnly ? 1 : std::max(nv / 3, 1u);
+    if (kWhole || msaa == 1 || strideW < 2) return 0;
+    if (g_regs[R_VTE_CNTL] & 0x3F) { logf_once("clearvte", "rectangle clear with viewport scaling on: whole target cleared"); return 0; }
+    auto rdv = [&](uint32_t a) { uint32_t w = *(const uint32_t*)phys(a);
+        if (endian == 2) w = _byteswap_ulong(w); else if (endian == 1) w = ((w & 0xFF00FF00u) >> 8) | ((w & 0x00FF00FFu) << 8); else if (endian == 3) w = (w >> 16) | (w << 16);
+        float f; memcpy(&f, &w, 4); return f; };
+    int sx0, sy0, sx1, sy1, tx, ty;
+    compute_scissor(sx0, sy0, sx1, sy1); host_tile_shift(tx, ty);
+    const int ss = msaa >= 2 ? 2 : 1;                                       // 4x: 2x2 samples per pixel
+    for (uint32_t r = 0; r < nRects; r++) {
+        float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+        for (uint32_t k = 0; k < 3; k++) {
+            const uint32_t va = vaddr + (r * 3 + k) * strideW * 4;
+            const float x = rdv(va), y = rdv(va + 4);
+            x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y);
+        }
+        int rx0 = std::max((int)lroundf(x0), sx0 + tx), ry0 = std::max((int)lroundf(y0), sy0 + ty);
+        int rx1 = std::min((int)lroundf(x1), sx1 + tx), ry1 = std::min((int)lroundf(y1), sy1 + ty);
+        rx0 = std::max(rx0, 0) * ss * g_resScale; ry0 = std::max(ry0, 0) * ss * g_resScale;
+        rx1 = std::min(rx1 * ss * g_resScale, (int)hostW); ry1 = std::min(ry1 * ss * g_resScale, (int)hostH);
+        if (rx1 <= rx0 || ry1 <= ry0) continue;                             // this one covers nothing
+        if (rx0 > 0 || ry0 > 0 || rx1 < hostW || ry1 < hostH) rects.push_back({ rx0, ry0, rx1, ry1 });
+        else { rects.clear(); return 1; }
+    }
+    return rects.empty() ? 3 : 2;
+}
+static bool fast_clear(bool withColor, uint32_t numVerts) {
     const uint32_t* vf = &g_regs[R_FETCH];
     if ((vf[0] & 3) != 3) return false;
     uint32_t surf = g_regs[R_SURFACE_INFO], pitch = surf & 0x3FFF, msaa = (surf >> 16) & 3;
@@ -3027,52 +3387,22 @@ static bool fast_clear(bool withColor) {
     // vertex positions (a window offset does not move host targets), clipped to the scissor; samples per pixel scale them.
     D3D11_RECT clr{ 0, 0, (LONG)(depth->w * g_resScale), (LONG)(depth->h * g_resScale) };
     bool partial = false;
+    // A rectangle list may hold several rectangles (3 vertices each). UE3 clears a shadow-atlas tile that isn't EDRAM-tile aligned with
+    // a 4x MSAA rectangle for the aligned part and a two-rectangle 1x list for the strips around it; reading only the first three
+    // vertices (with the stride taken as words / 3) built one wrong rectangle from vertices 0, 2 and 4 and left a strip uncleared,
+    // so depth from earlier casters stayed in the tile: straight-edged shadow fragments with no caster (episode 8's crowd).
+    std::vector<D3D11_RECT> rects;
     {
-        static const bool kWhole = getenv("ASURA_FASTCLEARWHOLE") != nullptr;
-        const uint32_t strideW = ((vf[1] >> 2) & 0xFFFFFF) / 3;
-        if (!kWhole && msaa != 1 && strideW >= 2 && !(g_regs[R_VTE_CNTL] & 0x3F)) {
-            auto rdv = [&](uint32_t a) { uint32_t w = *(const uint32_t*)phys(a);
-                if (endian == 2) w = _byteswap_ulong(w); else if (endian == 1) w = ((w & 0xFF00FF00u) >> 8) | ((w & 0x00FF00FFu) << 8); else if (endian == 3) w = (w >> 16) | (w << 16);
-                float f; memcpy(&f, &w, 4); return f; };
-            float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
-            for (uint32_t k = 0; k < 3; k++) {
-                const float x = rdv(vaddr + k * strideW * 4), y = rdv(vaddr + k * strideW * 4 + 4);
-                x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y);
-            }
-            int sx0, sy0, sx1, sy1, tx, ty;
-            compute_scissor(sx0, sy0, sx1, sy1); host_tile_shift(tx, ty);
-            const int ss = msaa >= 2 ? 2 : 1;                                   // 4x: 2x2 samples per pixel
-            int rx0 = std::max((int)lroundf(x0), sx0 + tx), ry0 = std::max((int)lroundf(y0), sy0 + ty);
-            int rx1 = std::min((int)lroundf(x1), sx1 + tx), ry1 = std::min((int)lroundf(y1), sy1 + ty);
-            rx0 = std::max(rx0, 0) * ss * g_resScale; ry0 = std::max(ry0, 0) * ss * g_resScale;
-            rx1 = std::min(rx1 * ss * g_resScale, (int)clr.right); ry1 = std::min(ry1 * ss * g_resScale, (int)clr.bottom);
-            if (rx1 <= rx0 || ry1 <= ry0) return true;                          // nothing covered
-            if (rx0 > 0 || ry0 > 0 || rx1 < clr.right || ry1 < clr.bottom) { clr = { rx0, ry0, rx1, ry1 }; partial = true; }
+        const int got = clear_rects(numVerts, msaa, clr.right, clr.bottom, rects);
+        if (got == 3) return true;                                              // nothing covered
+        if (got == 2) {
+            partial = true;
+            clr = rects[0];
+            for (auto& q : rects) { clr.left = std::min(clr.left, q.left); clr.top = std::min(clr.top, q.top); clr.right = std::max(clr.right, q.right); clr.bottom = std::max(clr.bottom, q.bottom); }
         }
     }
     if (!partial) g_ctx->ClearDepthStencilView(depth->dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, z, (UINT8)stencil);
-    else {
-        sync_depth_alias(depth, base, hostPitch);                               // the rest of the target keeps its contents
-        ID3D11ShaderResourceView* nul[32] = {};
-        g_ctx->PSSetShaderResources(0, 32, nul);
-        g_ctx->OMSetRenderTargets(0, nullptr, depth->dsv.Get());
-        invalidate_binds();
-        g_ctx->VSSetShader(g_vsBlit.Get(), nullptr, 0);
-        g_ctx->PSSetShader(nullptr, nullptr, 0);                                // depth from the viewport: blit z is 0, MinDepth = MaxDepth = z
-        g_ctx->GSSetShader(nullptr, nullptr, 0);
-        g_ctx->IASetInputLayout(nullptr);
-        g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
-        // z on, write, always; stencil on, always, replace on every path; read and write masks FF
-        const uint32_t dcClr = 1u | 2u | 4u | (7u << 4) | (7u << 8) | (2u << 11) | (2u << 14) | (2u << 17);
-        g_ctx->OMSetDepthStencilState(get_ds(dcClr, 0xFFFF00u, 0), stencil);
-        g_ctx->RSSetState(get_rs(0, true, true, 0, 0));
-        D3D11_VIEWPORT vp{ 0, 0, (float)(depth->w * g_resScale), (float)(depth->h * g_resScale), z, z };
-        g_ctx->RSSetViewports(1, &vp);
-        g_ctx->RSSetScissorRects(1, &clr);
-        g_ctx->Draw(3, 0);
-        invalidate_binds();
-    }
+    else { sync_depth_alias(depth, base, hostPitch); depth_clear_rects(depth, rects, z, (UINT8)stencil, true); }   // the rest of the target keeps its contents
     depth->seq = ++g_rtSeq;
     // Every colour target at this base and pitch shares those EDRAM bits, whatever its format. UE3 clears its 7e3 scene target
     // (format 3) this way each frame; clearing only the 8-bit views left the scene uncleared wherever no geometry drew (the
@@ -3091,7 +3421,7 @@ static bool fast_clear(bool withColor) {
             for (int i = 0; i < 3; i++) c[i] = is_7e3_float(f) ? from7e3(ch[i]) : ch[i] / 1023.0f;
             c[3] = (word >> 30) / 3.0f;
         } else continue;                                                    // 64-bit and other formats: only a zero word is known to be safe
-        if (partial) { if (g_ctx1) g_ctx1->ClearView(kv.second->rtv.Get(), c, &clr, 1); }
+        if (partial) { if (g_ctx1) g_ctx1->ClearView(kv.second->rtv.Get(), c, rects.data(), (UINT)rects.size()); }
         else g_ctx->ClearRenderTargetView(kv.second->rtv.Get(), c);
         kv.second->seq = g_rtSeq - 1;
     }
@@ -3112,7 +3442,7 @@ static bool fast_clear(bool withColor) {
             uint64_t key = ((uint64_t)(ci & 0xFFF) << 32) | ((uint64_t)((ci >> 16) & 0xF) << 16) | (hostPitch & 0xFFFF);
             if (i == 0 || g_rts.count(key)) {                               // later slots may hold stale registers: only touch known targets
                 Rt* r = get_color_rt(ci & 0xFFF, (ci >> 16) & 0xF, hostPitch);
-                if (partial) { if (g_ctx1) g_ctx1->ClearView(r->rtv.Get(), vc, &clr, 1); }
+                if (partial) { if (g_ctx1) g_ctx1->ClearView(r->rtv.Get(), vc, rects.data(), (UINT)rects.size()); }
                 else g_ctx->ClearRenderTargetView(r->rtv.Get(), vc);
                 r->seq = g_rtSeq - 1;
             }
@@ -3120,7 +3450,8 @@ static bool fast_clear(bool withColor) {
     }
     static int nl = 0;
     if (nl++ < 6 || g_trace > 0) fprintf(stderr, "[gfx] fast clear base=%X pitch=%u(%u) z=%g stencil=%u word=%08X rect=%ld,%ld-%ld,%ld%s\n", base, pitch, hostPitch, z, stencil, word,
-                                         clr.left, clr.top, clr.right, clr.bottom, partial ? " (part)" : "");
+                                         clr.left, clr.top, clr.right, clr.bottom, partial ? S(" (part, %zu)", rects.size()).c_str() : "");
+    if (g_trace > 0 && rects.size() > 1) for (auto& q : rects) fprintf(stderr, "[gfx]   clear rect %ld,%ld-%ld,%ld\n", q.left, q.top, q.right, q.bottom);
     return true;
 }
 
@@ -3135,7 +3466,7 @@ struct WorstDraw {
 // The current shaders, looked up again only when the loaded code changed (build_shader hashes the whole microcode).
 static XShader* cur_vs() {
     static uint64_t gen = ~0ull; static XShader* s = nullptr;
-    if (!s || gen != g_vsGen) { s = build_shader(g_vsCode, true, 0xFFFFFFFFu); gen = g_vsGen; }
+    if (!s || gen != g_vsGen) { s = vs_variant(g_vsCode); gen = g_vsGen; }
     return s;
 }
 static XShader* cur_ps(uint32_t paramGen) {
@@ -3206,14 +3537,21 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
             ID3D11RenderTargetView* none[1] = { nullptr };
             g_ctx->OMSetRenderTargets(1, none, nullptr);
             invalidate_binds();
-            g_ctx->ClearDepthStencilView(d->dsv.Get(), D3D11_CLEAR_STENCIL, 1.0f, (UINT8)(g_regs[R_STENCIL] & 0xFF));
+            const UINT8 ref = (UINT8)(g_regs[R_STENCIL] & 0xFF);
+            // Only the rectangles drawn: clearing the whole stencil buffer wiped marks the game keeps elsewhere in it (the same mistake
+            // as the shadow-atlas depth clears). ASURA_FASTCLEARWHOLE=1 clears the whole buffer as before.
+            std::vector<D3D11_RECT> rects;
+            const int got = (g_regs[R_FETCH] & 3) == 3 ? clear_rects(num, (surfS >> 16) & 3, (LONG)(d->w * g_resScale), (LONG)(d->h * g_resScale), rects) : 0;
+            if (got == 2) { depth_clear_rects(d, rects, 0.0f, ref, false); d->seq = ++g_rtSeq; }
+            else if (got != 3) g_ctx->ClearDepthStencilView(d->dsv.Get(), D3D11_CLEAR_STENCIL, 1.0f, ref);
             static int nl = 0;
-            if (nl++ < 4 || g_trace > 0) fprintf(stderr, "[gfx] stencil clear base=%X pitch=%u ref=%u\n", base, hostPitch, g_regs[R_STENCIL] & 0xFF);
+            if (nl++ < 4 || g_trace > 0) fprintf(stderr, "[gfx] stencil clear base=%X pitch=%u ref=%u%s\n", base, hostPitch, ref,
+                                                 got == 2 ? S(" (part, %zu)", rects.size()).c_str() : got == 3 ? " (nothing)" : "");
             return;
         }
     }
     if (prim == 8 && srcSel == 2 && (g_regs[R_DEPTHCONTROL] & 0x76) == 0x76 &&
-        (edram == 5 || (edram == 4 && ((g_regs[R_SURFACE_INFO] >> 16) & 3) != 0)) && fast_clear(edram == 4)) return;
+        (edram == 5 || (edram == 4 && ((g_regs[R_SURFACE_INFO] >> 16) & 3) != 0)) && fast_clear(edram == 4, num)) return;
 
     DP(0);
     XShader* vs = cur_vs();
@@ -3291,7 +3629,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     }
     DP(1);
     if (!shaders_ready(vs, ps, prim == 8 || mx)) return;                    // a memexport draw left out would lose the memory it writes
-    if (!vs->ok) return;
+    if (!run_sh(vs)->ok) return;
     if (ps && !ps->ok) ps = nullptr;
 
     // ---- render targets ----
@@ -3598,7 +3936,9 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         if (!ht) return;
         if (texflip_on()) { FlipVal fv; fv.base = base; fv.mip = fi.mipBase; fv.w = w; fv.h = h; fv.fmt = fmt; fv.data = ht->hash; texflip_note(u.slot, fv); }
         if (ringPs && g_shotRingSize > 0) draw_ring_tex(u.slot, base, ht->hash);
-        if (ringPs) qte_note_texture(base, ht->hash, fmt, w, h);
+        // ui: Scaleform's textured pixel shader (vs 4213EBD96F9DECE3, or 8F53E8C836CB1279 for a few), and the two-texture one that burns the
+        // gauge's ornament away at the end of a tug of war (vs 911E415726EAF644 / ps 87E53336364C051F, 36 vertices; episode 5, logs\st5d)
+        if (ringPs) qte_note_texture(base, ht->hash, fmt, w, h, ps && (ps->hash == 0xDDFEE49D043D817Bull || ps->hash == 0x87E53336364C051Full), ht->white);
         {   // ASURA_UITEXLOG=1: each distinct texture a draw samples, once, with the draw's shaders (to find what the UI text is drawn from)
             static const bool kUiLog = getenv("ASURA_UITEXLOG") != nullptr;
             static std::set<std::pair<uint64_t, uint64_t>> seenUi;
@@ -3638,6 +3978,23 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     g_hideDraw = false;
     if (ps) for (auto& u : ps->tex) bind_tex(u);
     ringPs = false;
+    {   // ASURA_MASHTEXLOG=1 (debug): each shader pair once outside a tug of war and once during one (untextured UI pieces too)
+        static const bool kLog = getenv("ASURA_MASHTEXLOG") != nullptr;
+        bool story_mash_recent();
+        if (kLog) {
+            static std::set<uint64_t> seenOut, seenIn;
+            const bool in = story_mash_recent();
+            const uint64_t key = vs->hash * 31 ^ (ps ? ps->hash : 0);
+            if ((in ? seenIn : seenOut).insert(key).second)
+                fprintf(stderr, "[mashdraw] f=%llu %s vs=%016llX ps=%016llX tex=%zu num=%u%s%s\n", (unsigned long long)g_frame, in ? "during" : "outside", (unsigned long long)vs->hash,
+                        (unsigned long long)(ps ? ps->hash : 0), ps ? ps->tex.size() : 0, num, in && !seenOut.count(key) ? " (only seen during)" : "", g_hideDraw ? " hidden" : "");
+        }
+    }
+    {   // Story Mode's tug of war: Scaleform's untextured fills (vs EC0095A648FC30A5 / ps FA64B15F820AC3EA: the gauges' empty bars, a dark
+        // strip across the top otherwise; the user's episode 11 run) go with its textured pieces (qte_note_texture)
+        bool story_mash_recent();
+        if (ps && vs->hash == 0xEC0095A648FC30A5ull && ps->hash == 0xFA64B15F820AC3EAull && !g_mashBurst && story_mash_recent()) g_hideDraw = true;
+    }
     if (g_hideDraw) { g_hideDraw = false; return; }                         // a prompt piece, in Story Mode (qte_note_texture)
     {
         ID3D11ShaderResourceView* vsr[32] = {};
@@ -3693,6 +4050,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     }
     memcpy(cb.bools, &g_regs[R_BOOL], 32);
     memcpy(cb.loops, &g_regs[R_LOOP], 128);
+    if (vs->base) { memcpy(cb.vsf, vs->vsf, sizeof(cb.vsf)); memcpy(cb.vsx, vs->vsx, sizeof(cb.vsx)); }   // a generic vertex shader's patched fields
     upload_cb(g_cbState.Get(), &cb, sizeof(cb));
     // experiment: BCR2_FREEZEWIND holds c1.x at the given value for vertex shaders that use it as a wind clock, and only those: other shaders use c1 for other things.
     // BCR2_FREEZEVS is the comma-separated list of those shaders' hashes.
@@ -3712,7 +4070,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     ID3D11Buffer* cbs[2] = { g_cbFloat.Get(), g_cbState.Get() };
     g_ctx->VSSetConstantBuffers(0, 2, cbs);
     g_ctx->PSSetConstantBuffers(0, 2, cbs);
-    g_ctx->VSSetShader(vs->vs.Get(), nullptr, 0);
+    g_ctx->VSSetShader(run_sh(vs)->vs.Get(), nullptr, 0);
     g_ctx->PSSetShader(ps ? ps->ps.Get() : nullptr, nullptr, 0);
     g_ctx->GSSetShader(rect ? g_gsRect.Get() : nullptr, nullptr, 0);
     if (rect) g_ctx->GSSetConstantBuffers(0, 0, nullptr);
@@ -4295,7 +4653,21 @@ static void do_resolve() {
         ID3D11RenderTargetView* none[1] = { nullptr };
         g_ctx->OMSetRenderTargets(1, none, nullptr);
         invalidate_binds();
-        g_ctx->ClearDepthStencilView(depthRt->dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, (float)((dv >> 8) & 0xFFFFFF) / 16777215.0f, (UINT8)(dv & 0xFF));
+        // Only the resolved rectangle, as the colour clear above: a whole-target clear also erased what the game keeps in the rest of
+        // the buffer (ASURA_FASTCLEARWHOLE=1 for the old whole clear).
+        static const bool kWholeR = getenv("ASURA_FASTCLEARWHOLE") != nullptr;
+        const float zc = (float)((dv >> 8) & 0xFFFFFF) / 16777215.0f;
+        const LONG W = (LONG)(depthRt->w * g_resScale), H = (LONG)(depthRt->h * g_resScale);
+        D3D11_RECT r{ std::max<LONG>((x0 + hostX) * g_resScale, 0), std::max<LONG>((y0 + hostY) * g_resScale, 0),
+                      std::min<LONG>((x1 + hostX) * g_resScale, W), std::min<LONG>((y1 + hostY) * g_resScale, H) };
+        if (kWholeR || (r.left <= 0 && r.top <= 0 && r.right >= W && r.bottom >= H))
+            g_ctx->ClearDepthStencilView(depthRt->dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, zc, (UINT8)(dv & 0xFF));
+        else if (r.right > r.left && r.bottom > r.top) {
+            sync_depth_alias(depthRt, g_regs[R_DEPTH_INFO] & 0xFFF, pitch);
+            depth_clear_rects(depthRt, { r }, zc, (UINT8)(dv & 0xFF), true);
+            static int nl = 0;
+            if (nl++ < 4 || g_trace > 0) fprintf(stderr, "[gfx] resolve depth clear rect %ld,%ld-%ld,%ld of %ldx%ld\n", r.left, r.top, r.right, r.bottom, W, H);
+        }
         depthRt->seq = ++g_rtSeq;
     }
 }
@@ -4713,11 +5085,17 @@ static void do_swap(uint32_t front) {
         static bool done = false;
         if (kOn && !done && g_qteActive.load()) { done = true; g_dumpFrame = (int64_t)g_frame + 1; fprintf(stderr, "[qte] tracing frame %lld\n", (long long)g_dumpFrame); }
     }
+    {   // ASURA_DUMPONMASH=<n>: trace the frame n frames after a tug-of-war prompt (Story Mode, uescript.cpp story_mash_active) starts, once
+        static const char* kOn = getenv("ASURA_DUMPONMASH");
+        static int64_t startAt = -1;
+        bool story_mash_active();
+        if (kOn && startAt < 0 && story_mash_active()) { startAt = (int64_t)g_frame; g_dumpFrame = startAt + atoi(kOn); fprintf(stderr, "[qte] tug of war at %lld: tracing frame %lld\n", (long long)startAt, (long long)g_dumpFrame); }
+    }
     { void options_frame(); options_frame(); }                              // Graphics Options menu input (options.cpp)
     LARGE_INTEGER swapStart; QueryPerformanceCounter(&swapStart);
     if (g_drawsLeftOut) {
-        fprintf(stderr, "[shader] frame=%llu left out %llu draws waiting on a compile, waited %.1f ms\n", (unsigned long long)g_frame, (unsigned long long)g_drawsLeftOut, g_compileWaitMs);
-        g_drawsLeftOut = 0;
+        fprintf(stderr, "[shader] frame=%llu left out %llu draws waiting on a compile (vs %llu, ps %llu), waited %.1f ms\n", (unsigned long long)g_frame, (unsigned long long)g_drawsLeftOut, (unsigned long long)g_leftOutVs, (unsigned long long)g_leftOutPs, g_compileWaitMs);
+        g_drawsLeftOut = g_leftOutVs = g_leftOutPs = 0;
     }
     g_compileWaitMs = 0;
     mem_find();

@@ -120,14 +120,25 @@ static void find_names_header() {
 }
 std::string ue_name(uint32_t idx, uint32_t number = 0) {
     const std::string none = "#" + std::to_string(idx);
-    if (!find_names()) return none;
     static bool hdrTried = false;
-    if (!hdrTried) { hdrTried = true; find_names_header(); }
-    const uint32_t data = g_namesArr ? rd32(g_namesArr) : g_names, count = g_namesArr ? rd32(g_namesArr + 4) : g_namesCount;
-    if (idx >= count && !g_namesArr) { g_names = 0; hdrTried = false; }         // found before the table grew and no header: look again later
-    if (idx >= count || !readable(data + idx * 4, 4)) return none;
-    const uint32_t e = rd32(data + idx * 4);
-    if (!e || !readable(e, g_nameHdr + 2)) return none;
+    uint32_t e = 0;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!find_names()) return none;
+        if (!hdrTried) { hdrTried = true; find_names_header(); }
+        const uint32_t data = g_namesArr ? rd32(g_namesArr) : g_names, count = g_namesArr ? rd32(g_namesArr + 4) : g_namesCount;
+        e = idx < count && readable(data + idx * 4, 4) ? rd32(data + idx * 4) : 0;
+        // Every entry stores its own index: one that doesn't match (or an index past the end) means the table was reallocated since
+        // it was found (the game grows it at level loads; the old copy is freed and reused). Find it again, at most every 300 frames.
+        if (e && readable(e, g_nameHdr + 2) && entry_is(e, idx)) break;
+        e = 0;
+        static long long lastRescan = -1000;
+        const long long now = (long long)gpu_frame_number();
+        if (attempt || now - lastRescan < 300) return none;
+        lastRescan = now;
+        g_names = 0; g_namesArr = 0; hdrTried = false;
+        fprintf(stderr, "[scriptlog] name %u not where the table says (moved?): looking for the table again\n", idx);
+    }
+    if (!e) return none;
     std::string s;
     const bool wide = rd32(e) & 1;
     for (uint32_t i = 0; i < 96; i++) {
@@ -301,9 +312,24 @@ static std::vector<std::pair<std::string, std::string>> ue_props(uint32_t obj) {
             else if (kind == "ArrayProperty") {                                 // the count, and for short arrays each element's first 0x40 bytes
                 const uint32_t cnt = rd32(obj + off + 4);
                 val = S("{%u}", cnt);
-                for (uint32_t e = 0; e < cnt && e < 4 && v && readable(v + e * 0x40, 0x40); e++) {
+                // An array of structs: its element size and the struct's fields (name@offset, bools with their mask). Inner property at
+                // +0x64 (like StructProperty::Struct and BoolProperty::BitMask), its element size at +0x44.
+                uint32_t stride = 0x40;
+                const uint32_t inner = rd32(f + 0x64);
+                if (readable(inner, 0x68) && ue_class_name(inner) == "StructProperty") {
+                    const uint32_t es = rd32(inner + 0x44), st = rd32(inner + 0x64);
+                    if (es >= 4 && es <= 0x200) stride = es;
+                    std::string lay = S(" <%s %X:", readable(st, 0x48) ? ue_obj_name(st).c_str() : "?", stride);
+                    for (uint32_t sf = readable(st, 0x48) ? rd32(st + 0x44) : 0, m = 0; sf && readable(sf, 0x68) && m < 64; sf = rd32(sf + 0x3C), m++) {
+                        const std::string sk = ue_class_name(sf);
+                        lay += S(" %s@%X", ue_obj_name(sf).c_str(), rd32(sf + 0x54));
+                        if (sk == "BoolProperty") lay += S("/%08X", rd32(sf + 0x64));
+                    }
+                    val += lay + ">";
+                }
+                for (uint32_t e = 0; e < cnt && e < 4 && v && readable(v + e * stride, stride < 0x40 ? stride : 0x40); e++) {
                     val += S(" [%u:", e);
-                    for (uint32_t q = 0; q < 0x40; q += 4) val += S(" %08X", rd32(v + e * 0x40 + q));
+                    for (uint32_t q = 0; q < 0x40 && q < stride; q += 4) val += S(" %08X", rd32(v + e * stride + q));
                     val += "]";
                 }
             }
@@ -342,6 +368,16 @@ static void prop_watch(uint32_t self, const std::string& cls, const std::string&
 static std::atomic<int> g_invincible{-1}, g_qteSkip{-1};                       // -1: not set yet (read the environment)
 static bool env_on(const char* n) { const char* e = getenv(n); return e && *e && strcmp(e, "0") != 0; }
 bool story_invincible() { int v = g_invincible.load(); if (v < 0) { v = env_on("ASURA_INVINCIBLE"); g_invincible = v; } return v != 0; }
+// In-combat "tug of war" prompts (mash B, rotate LS; a gold meter scrolls in from the top) are not QTE actions but
+// BCSeqAct_AnimFadeByButtonRep: each press pushes an animation blend (BCAnim_FadeByButtonRep). Its native update sends the script
+// event CheckActivate every frame while it runs (caller 82982600; logs\ep5_run3, episode 5 frames 6,745-6,848). Story Mode presses
+// its buttons for the player while it is active (xam.cpp qte_apply, from the judge like ASURA_AUTOQTE) and the renderer hides
+// the prompt icons meanwhile. Active = polled within the last 3 frames.
+static std::atomic<uint64_t> g_mashSeen{0};
+void story_mash_note() { g_mashSeen = gpu_frame_number() + 1; }
+bool story_mash_active() { const uint64_t s = g_mashSeen.load(); return s && gpu_frame_number() + 1 <= s + 3; }
+// For hiding its UI: also the next 45 frames, while the meter scrolls back out of the top of the screen.
+bool story_mash_recent() { const uint64_t s = g_mashSeen.load(); return s && gpu_frame_number() + 1 <= s + 45; }
 bool story_qteskip() { int v = g_qteSkip.load(); if (v < 0) { v = env_on("ASURA_QTESKIP"); g_qteSkip = v; } return v != 0; }
 void story_set(bool invincible, bool qteskip) {
     if (!getenv("ASURA_INVINCIBLE")) g_invincible = invincible;
@@ -409,12 +445,64 @@ static bool qte_skip(uint32_t self, uint32_t lr) {
     // most half the limit. Until then the script Update is not run, so no prompt opens.
     // Timed in real seconds, the same at any frame rate: each Update adds the wall time since the action's previous Update, capped
     // at 0.1 s so a hitch doesn't count in full. A gap over 2 s (a pause menu, or the action run again later) starts the wait over.
+    {   // Left to the player: an action with no "Success" output is a free choice, not a QTE to pass (episode 10's hot springs:
+        // Drink / Chug / Splash / Stand up; the user's run logs\rec_20261115_154808, frame 4,889). The skip used to hold its Update
+        // back for the wait, then find no Success, run one Update and start a new wait, so the game read the pad one frame in twelve.
+        const uint32_t links = rd32(self + 0x78), n = rd32(self + 0x7C);
+        bool hasSuccess = false;
+        std::string outs;
+        for (uint32_t i = 0; i < n && i < 8 && readable(links + i * 0x2C, 0x2C); i++) {
+            const std::string d = wide_at(rd32(links + i * 0x2C + 0x0C));
+            if (d == "Success") { hasSuccess = true; break; }
+            outs += (outs.empty() ? "" : ", ") + d;
+        }
+        if (!hasSuccess) {
+            static std::map<uint32_t, uint64_t> said;
+            const uint64_t f = gpu_frame_number();
+            if (!said.count(self) || f - said[self] > 300) fprintf(stderr, "[qteskip] f=%llu %08X %s: left to the player (no Success output: %s)\n", (unsigned long long)f, self, ue_obj_name(self).c_str(), outs.c_str());
+            said[self] = f;
+            return false;
+        }
+    }
+    // Left to the player: the "Shut Wyzen Up" (episodes 4 and 5) and "Shut Augus Up" (episode 11) prompts (the user's call, 2026-11-14).
+    // They are the only QTEs seen with no time limit (TimeLimit 0: the game waits for the press) whose buttons are all hidden
+    // (InputButtons, an array of BCButtonInfo {InputButton@0, ButtonName@4, IconType@C, pos@10, PosType@1C, bHidden@20 (80000000),
+    // Tag@24, bShow / bSuccess@2C}, 0x30 bytes each; the game draws its own prompt for them). Checked against episode 5's 16 QTEs
+    // (logs\ep5_qprops2) and the first two of episode 11 (logs\st11c). Wyzen's also has no failure sound and FinEventTrigger 0.5,
+    // Augus's has neither, so those are not the mark.
+    {
+        struct Offs { int tl = -1, btn = -1; };
+        static std::map<uint32_t, Offs> offs;
+        const uint32_t cls = rd32(self + kClassOff);
+        auto o = offs.find(cls);
+        if (o == offs.end()) {
+            Offs v; v.tl = ue_field_offset(cls, "TimeLimit"); v.btn = ue_field_offset(cls, "InputButtons");
+            o = offs.emplace(cls, v).first;
+        }
+        const Offs& v = o->second;
+        if (v.tl > 0 && v.btn > 0 && rd32(self + v.tl) == 0) {
+            const uint32_t b = rd32(self + v.btn), nb = rd32(self + v.btn + 4);
+            bool allHidden = nb > 0 && nb <= 8 && readable(b, nb * 0x30);
+            for (uint32_t i = 0; allHidden && i < nb; i++) allHidden = (rd32(b + i * 0x30 + 0x20) & 0x80000000u) != 0;
+            if (allHidden) {
+                static std::map<uint32_t, uint64_t> said;
+                const uint64_t f = gpu_frame_number();
+                if (!said.count(self) || f - said[self] > 300) fprintf(stderr, "[qteskip] f=%llu %08X %s: left to the player (no time limit, buttons hidden)\n", (unsigned long long)f, self, ue_obj_name(self).c_str());
+                said[self] = f;
+                return false;
+            }
+        }
+    }
     struct Wait { LARGE_INTEGER first, last; double elapsed; };
     static std::map<uint32_t, Wait> waits;
     static const double kQpf = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return (double)f.QuadPart; }();
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
     auto it = waits.find(self);
-    if (it == waits.end()) it = waits.emplace(self, Wait{now, now, 0.0}).first;
+    if (it == waits.end()) {
+        it = waits.emplace(self, Wait{now, now, 0.0}).first;
+        static const bool kProps = getenv("ASURA_QTEPROPS") != nullptr;   // debug: every property of each QTE when it starts
+        if (kProps) ue_dump_props(self, "qte");
+    }
     else {
         const double gap = (now.QuadPart - it->second.last.QuadPart) / kQpf;
         if (gap > 2.0) { it->second.first = now; it->second.elapsed = 0.0; }
@@ -441,12 +529,12 @@ static bool qte_skip(uint32_t self, uint32_t lr) {
         wr32(e + 0x18, rd32(e + 0x18) | 0x80000000u);
         fired = true;
     }
-    if (!fired) { fprintf(stderr, "[qteskip] f=%llu %08X has no Success output: left to run\n", (unsigned long long)gpu_frame_number(), self); return false; }
+    if (!fired) return false;                                              // not reached: checked above
     // The flags as a real success leaves them (+0xC4 18800000 -> 2C800000 in a trace): not the "done" bit 0x01000000, which the
     // native update sets itself after its end-of-QTE work (vtable+400/+404, sub_82980ED8). Setting it here skipped that work and
     // left effects frozen after the QTE (the fire splatter after the B mash, the arm effect on Asura in the last stick QTE).
     wr32(self + 0xC4, (rd32(self + 0xC4) & ~0x10000000u) | 0x24800000u);
-    fprintf(stderr, "[qteskip] f=%llu %08X: Success after %.2f s (limit %.2f, presses %u)\n", (unsigned long long)gpu_frame_number(), self, wait * kScale, limit, presses);
+    fprintf(stderr, "[qteskip] f=%llu %08X %s: Success after %.2f s (limit %.2f, presses %u)\n", (unsigned long long)gpu_frame_number(), self, ue_obj_name(self).c_str(), wait * kScale, limit, presses);
     return true;
 }
 
@@ -510,7 +598,56 @@ PPC_FUNC(sub_82260F60) {
     const uint32_t tSelf = ctx.r3.u32, tLr = (uint32_t)ctx.lr, tParms = ctx.r5.u32;
     qte_trace(tSelf, tLr, tParms, "before");
     if (qte_skip(ctx.r3.u32, (uint32_t)ctx.lr)) return;
+    if (tLr == 0x82982600u && story_qteskip()) {                            // BCSeqAct_AnimFadeByButtonRep.CheckActivate: see story_mash_active
+        story_mash_note();
+        static const bool kProps = getenv("ASURA_QTEPROPS") != nullptr;     // debug: the tug of war's properties when it starts
+        static std::map<uint32_t, uint64_t> dumped;
+        const uint64_t f = gpu_frame_number();
+        if (kProps && (!dumped.count(tSelf) || f - dumped[tSelf] > 300)) ue_dump_props(tSelf, "mash");
+        if (kProps) dumped[tSelf] = f;
+    }
+    uint32_t mashFull = 0;                                                  // a tug-of-war node's ParamForFade to set to 2 after this event
+    // Story Mode's tug of war: the meter is the blend node's ParamForFade (BCAnim_FadeByButtonRep, a BCAnim_FadeByParam; one node per
+    // character), which the node's CalcParam (sent from 82947280 each frame) raises by AdditionWeightByPush (0.08) a press and lets
+    // decay without them; the tug of war is won when it reaches the success child's value (2; it starts at StartPoint, 0.2; logs\st5g).
+    // Pressing the buttons for the player (as first done, xam.cpp) played every press's sound, and a rotation has to turn the right
+    // way. So nothing is pressed: before each CalcParam the value is raised by 0.4 a second of real time (about 5 s from 0.2 to 2, a
+    // player's pace), never lowered. ASURA_MASHPRESS=1 presses instead (xam.cpp). ASURA_QTEPROPS=1 dumps the node every 10 frames.
+    if (tLr == 0x82947280u && story_qteskip() && story_mash_recent()) {
+        static const bool kProps = getenv("ASURA_QTEPROPS") != nullptr;
+        static const bool kPress = env_on("ASURA_MASHPRESS");
+        static std::map<uint32_t, bool> isNode;                             // class object -> BCAnim_FadeByButtonRep
+        const uint32_t cls = rd32(tSelf + kClassOff);
+        auto ni = isNode.find(cls);
+        if (ni == isNode.end()) ni = isNode.emplace(cls, ue_obj_name(cls) == "BCAnim_FadeByButtonRep").first;
+        if (ni->second) {
+            static std::map<uint32_t, uint64_t> last;
+            const uint64_t f = gpu_frame_number();
+            if (kProps && f >= last[tSelf] + 10) { last[tSelf] = f; ue_dump_props(tSelf, "mashnode"); }
+            const int po = ue_field_offset(cls, "ParamForFade");
+            if (!kPress && story_mash_active() && po > 0) {
+                struct Fill { float v; LARGE_INTEGER t; };
+                static std::map<uint32_t, Fill> fills;
+                static const double kQpf = [] { LARGE_INTEGER q; QueryPerformanceFrequency(&q); return (double)q.QuadPart; }();
+                LARGE_INTEGER now; QueryPerformanceCounter(&now);
+                float cur; { const uint32_t u = rd32(tSelf + po); memcpy(&cur, &u, 4); }
+                auto it = fills.find(tSelf);
+                if (it == fills.end() || (now.QuadPart - it->second.t.QuadPart) / kQpf > 1.0) {
+                    it = fills.insert_or_assign(tSelf, Fill{ cur, now }).first;
+                    fprintf(stderr, "[story] f=%llu tug of war: filling %s from %.2f, nothing pressed\n", (unsigned long long)f, ue_obj_name(tSelf).c_str(), cur);
+                }
+                double dt = (now.QuadPart - it->second.t.QuadPart) / kQpf;
+                if (dt > 0.1) dt = 0.1;
+                it->second.t = now;
+                it->second.v = std::max(it->second.v, cur) + (float)(0.4 * dt);
+                if (it->second.v > 2.0f) it->second.v = 2.0f;
+                uint32_t u; memcpy(&u, &it->second.v, 4); wr32(tSelf + po, u);
+                if (it->second.v >= 2.0f) mashFull = tSelf + po;          // full: also written after the script (it holds the value under 2 without a press)
+            }
+        }
+    }
     struct HealthAfter { uint32_t self; ~HealthAfter() { player_health(self, "after"); } } healthAfter{tSelf};   // also on every return path
+    struct MashFull { uint32_t a; ~MashFull() { if (a) wr32(a, 0x40000000u); } } mashFullAfter{mashFull};   // 2.0f, after the script
     // The Scaleform movie Story Mode looks after, by class (cached per class object, so this costs a lookup per event, not a name)
     static std::map<uint32_t, int> kinds;                                   // 2 BCGFxUI_Advertise, 0 anything else
     const uint32_t tCls = readable(tSelf, 0x40) ? rd32(tSelf + kClassOff) : 0;

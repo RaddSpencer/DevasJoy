@@ -56,7 +56,7 @@ void load(Settings& s) {
             else if (sscanf(line, " vsync = %d", &v) == 1) s.vsync = v < 0 ? 0 : v > 2 ? 2 : v;
             else if (sscanf(line, " gamma = %d", &v) == 1) s.gamma = v < 50 ? 50 : v > 150 ? 150 : v;
             else if (sscanf(line, " showfps = %d", &v) == 1) s.showfps = v ? 1 : 0;
-            else if (sscanf(line, " fps = %d", &v) == 1) s.fps = v >= 60 ? 60 : v <= 24 ? 24 : 30;
+            else if (sscanf(line, " fps = %d", &v) == 1) s.fps = v >= 60 ? 60 : 30;   // 24 is no longer offered: an old ini's 24 runs at 30
             else if (sscanf(line, " pulldown = %d", &v) == 1) s.pulldown = v ? 1 : 0;
             else if (sscanf(line, " invincible = %d", &v) == 1) s.invincible = v ? 1 : 0;
             else if (sscanf(line, " qteskip = %d", &v) == 1) s.qteskip = v ? 1 : 0;
@@ -75,7 +75,7 @@ void save(const Settings& s) {
         fprintf(f, "gamma = %d\n", s.gamma);
         fprintf(f, "; showfps: 1 = frames per second in the top-left corner\n");
         fprintf(f, "showfps = %d\n", s.showfps);
-        fprintf(f, "; fps: 24, 30 (as on the console) or 60 (applies after a restart)\n");
+        fprintf(f, "; fps: 30 (as on the console) or 60 (applies after a restart)\n");
         fprintf(f, "fps = %d\n", s.fps);
         fprintf(f, "; pulldown (24 fps only): 0 = for G-Sync / FreeSync displays (tears without one), 1 = 2:3 pulldown on a 60 Hz display\n");
         fprintf(f, "pulldown = %d\n", s.pulldown);
@@ -141,7 +141,7 @@ void change(int dir) {
     if (g_row == kRes) { g_cur.resscale = (g_cur.resscale + dir + 5) % 5; }
     else if (g_row == kRate) { if (g_cur.fps == 24) return; g_cur.fps = g_lastRate = g_cur.fps == 60 ? 30 : 60; }
     else if (g_row == kVsync) {                                             // Off, On, 24 fps (FreeSync / G-Sync), 24 fps (2:3 pulldown)
-        const int i = (vsync_choice() + dir + 5) % 5;
+        const int i = (std::min(vsync_choice(), 2) + dir + 3) % 3;          // the 24 fps choices were removed (2026-11-14, the user's call)
         if (i < 3) { if (g_cur.fps == 24) g_cur.fps = g_lastRate; g_cur.vsync = i; if (!g_runVrr) gpu_set_vsync(i == 1); }
         else { if (g_cur.fps != 24) g_lastRate = g_cur.fps; g_cur.fps = 24; g_cur.pulldown = i == 4; }
     }

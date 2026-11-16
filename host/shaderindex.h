@@ -17,6 +17,8 @@ bool shaderindex_build(const std::string& cookedDir, const std::string& outDir, 
 bool shaderindex_load(const std::string& outDir);
 bool shaderindex_find(uint64_t key, std::vector<uint32_t>& code);
 size_t shaderindex_size();
+// Calls fn(key, code) for every shader of that kind in the index (code in host order). Index order, which groups shaders by package.
+void shaderindex_for_each(bool isVs, const std::function<void(uint64_t, const std::vector<uint32_t>&)>& fn);
 // The index entry of the same kind and length that differs from code in the fewest words (the game patches vertex shaders
 // when it binds them): its key and code. False if none is close (more than a quarter of the words differ).
 bool shaderindex_closest(const std::vector<uint32_t>& code, bool isVs, uint64_t& key, std::vector<uint32_t>& base);
