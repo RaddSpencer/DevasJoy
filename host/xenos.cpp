@@ -4184,6 +4184,17 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     {   // BCR2_DRAWPRINT=<surface info hex>, with BCR2_PROBEQLIGHT: a fingerprint of each draw to that target, to compare a frame's draws against another frame's
         static const char* kPrint = getenv("ASURA_DRAWPRINT");
         static const uint32_t kPrintSurf = kPrint ? (uint32_t)strtoul(kPrint, nullptr, 16) : 0;
+        {   // ASURA_DRAWVERTS in a traced frame (ASURA_DUMPFRAME) on its own: that vertex shader's first stream (up to 64 words) as floats, and c0-c7
+            static const char* kV = getenv("ASURA_DRAWVERTS");
+            const uint32_t vf0 = g_regs[R_FETCH + 95 * 2] & ~3u, vfw = (g_regs[R_FETCH + 95 * 2 + 1] >> 2) & 0xFFFFFF;
+            if (kV && !kPrint && g_trace > 1000 && vf0 && S("%016llX", (unsigned long long)vs->hash) == kV) {
+                std::string v = S("[dpverts] f=%llu vf=%08X/%u:", (unsigned long long)g_frame, vf0, vfw);
+                for (uint32_t k = 0; k < vfw && k < 64; k++) { uint32_t w = _byteswap_ulong(*(const uint32_t*)phys(vf0 + k * 4)); float f; memcpy(&f, &w, 4); v += S(" %.6g", f); }
+                v += " C:";
+                for (int k = 0; k < 32; k++) v += S(" %.7g", reg_f(R_CONST + k));
+                fprintf(stderr, "%s\n", v.c_str());
+            }
+        }
         if (kPrint && g_probeQLight && (kPrint[0] == '*' || g_regs[R_SURFACE_INFO] == kPrintSurf)) {
             uint64_t ch = fnv64(&g_regs[R_CONST], 8192), rh = fnv64(&g_regs[0x2000], 0x400 * 4), fh = fnv64(&g_regs[R_FETCH], 0xC0 * 4);
             uint64_t ih = useIdx ? fnv64(useIdx->data(), useIdx->size() * 4) : 0;
