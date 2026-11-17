@@ -141,7 +141,8 @@ void capture_request() { g_ringDump = true; fprintf(stderr, "[capture] requested
 bool bcr2_log_requested();   // main.cpp: true when --log was given, also before main() runs
 static const int g_shotRingSize = getenv("ASURA_SHOTRING") ? atoi(getenv("ASURA_SHOTRING")) : (bcr2_log_requested() ? 150 : 0);   // with --log, F9 saves 150 frames (every frame): 3.5 s before the press and 1.5 s after
 static uint64_t g_frame = 0;
-uint64_t xma_log_frame() { return g_frame; }                               // the frame number for audio logs (xma.cpp)
+uint64_t xma_log_frame() { return g_frame; }
+std::atomic<int64_t> g_shotFileFrame{-1};                                  // ASURA_SHOTAFTERFILE: the frame its file was opened (kfile.cpp)                               // the frame number for audio logs (xma.cpp)
 static ComPtr<ID3D11Device> g_dev;
 static ComPtr<ID3D11DeviceContext> g_ctx;
 static ComPtr<ID3D11DeviceContext1> g_ctx1;
@@ -4919,6 +4920,17 @@ static void write_shot() {
         }();
         bool inRange = ranges.empty() ? (g_frame >= from && g_frame <= to) : false;
         for (auto& r : ranges) if (g_frame >= r.first && g_frame <= r.second) inRange = true;
+        {   // ASURA_SHOTAFTERFILE="<file name text>:<from>-<to>": frames counted from when a file with that text in its name is first opened
+            // (kfile.cpp), for a cinematic that starts at a different frame in each run (an autopilot run's fights take varying time)
+            extern std::atomic<int64_t> g_shotFileFrame;
+            static const char* kAf = getenv("ASURA_SHOTAFTERFILE");
+            static long long afFrom = 0, afTo = -1;
+            static bool parsed = false;
+            if (kAf && !parsed) { parsed = true; if (const char* c = strrchr(kAf, ':')) sscanf(c + 1, "%lld-%lld", &afFrom, &afTo); }
+            const int64_t at = g_shotFileFrame.load();
+            if (kAf && at >= 0) { inRange = (long long)g_frame >= at + afFrom && (long long)g_frame <= at + afTo; }
+            else if (kAf) inRange = false;
+        }
         burstDir.clear(); if (!every || (g_frame % every) != 0 || !inRange) return;
     }
     const char* dir = burst ? burstDir.c_str() : envDir;
@@ -4930,7 +4942,7 @@ static void write_shot() {
 }
 
 // BCR2_DUMPFRAME=n with BCR2_SHOTDIR: log frame n's draws and resolves, then write each resolved surface as a BMP.
-static int64_t g_dumpFrame = getenv("ASURA_DUMPFRAME") ? _atoi64(getenv("ASURA_DUMPFRAME")) : -1;   // also set by F10 (with --log): the next frame
+static int64_t g_dumpFrame = (getenv("ASURA_DUMPFRAME") && getenv("ASURA_DUMPFRAME")[0] != '+') ? _atoi64(getenv("ASURA_DUMPFRAME")) : -1;   // also set by F10 (with --log): the next frame
 static void dump_surfaces(uint32_t only, int seq) {                          // only/seq: one surface, right after a resolve (ASURA_DUMPRESOLVE)
     const char* dir = getenv("ASURA_SHOTDIR");
     if (!dir) return;
@@ -5099,6 +5111,15 @@ static void do_swap(uint32_t front) {
         static int64_t startAt = -1;
         bool story_mash_active();
         if (kOn && startAt < 0 && story_mash_active()) { startAt = (int64_t)g_frame; g_dumpFrame = startAt + atoi(kOn); fprintf(stderr, "[qte] tug of war at %lld: tracing frame %lld\n", (long long)startAt, (long long)g_dumpFrame); }
+    }
+    {   // ASURA_DUMPFRAME=+<n>: trace the frame n frames after the ASURA_SHOTAFTERFILE file is opened (a cinematic in an autopilot run)
+        extern std::atomic<int64_t> g_shotFileFrame;
+        static const char* kDf = getenv("ASURA_DUMPFRAME");
+        static bool set = false;
+        if (kDf && kDf[0] == '+' && !set && g_shotFileFrame.load() >= 0) {
+            set = true; g_dumpFrame = g_shotFileFrame.load() + atoi(kDf + 1);
+            fprintf(stderr, "[capture] tracing frame %lld (ASURA_DUMPFRAME %s)\n", (long long)g_dumpFrame, kDf);
+        }
     }
     { void options_frame(); options_frame(); }                              // Graphics Options menu input (options.cpp)
     LARGE_INTEGER swapStart; QueryPerformanceCounter(&swapStart);

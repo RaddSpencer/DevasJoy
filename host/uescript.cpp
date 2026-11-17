@@ -392,12 +392,22 @@ void story_set(bool invincible, bool qteskip) {
 static void player_health(uint32_t self, const char* when) {
     static const bool kLog = env_on("ASURA_HEALTHLOG");
     const bool inv = story_invincible();
-    if (!inv && !kLog) return;
+    static const bool kAutopilot = env_on("ASURA_AUTOPILOT");               // testing (xam.cpp): keep the Burst (Mantra) gauge full, so fights end in a BURST
+    if (!inv && !kLog && !kAutopilot) return;
     const uint32_t cls = rd32(self + kClassOff);
     static std::map<uint32_t, bool> isPlayer;
     auto it = isPlayer.find(cls);
     if (it == isPlayer.end()) it = isPlayer.emplace(cls, ue_obj_name(cls).rfind("BCPawn_Player", 0) == 0).first;
     if (!it->second) return;
+    if (kAutopilot) {
+        const int vOff = ue_field_offset(cls, "MantraGaugeVal"), xOff = ue_field_offset(cls, "MantraGaugeValMax");
+        if (vOff >= 0 && xOff >= 0 && readable(self + vOff, 4) && readable(self + xOff, 4) && rd32(self + vOff) != rd32(self + xOff)) {
+            wr32(self + vOff, rd32(self + xOff));                         // same type as the maximum, int or float
+            static int nl = 0;
+            if (nl++ < 20) fprintf(stderr, "[autopilot] f=%llu Burst gauge filled\n", (unsigned long long)gpu_frame_number());
+        }
+        if (!inv && !kLog) return;
+    }
     const int hOff = ue_field_offset(cls, "Health"), mOff = ue_field_offset(cls, "HealthMax");
     if (hOff < 0 || mOff < 0 || !readable(self + mOff, 4)) return;
     const int32_t h = (int32_t)rd32(self + hOff), hm = (int32_t)rd32(self + mOff);

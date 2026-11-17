@@ -210,8 +210,12 @@ static void qte_apply(uint32_t st) {
     if (!a.any()) return;
     const bool tapDown = (GetTickCount64() / 50) % 2 == 0;                 // 50 ms down, 50 ms up
     if (tapDown) wr16(st + 4, rd16(st + 4) | a.buttons);
-    if (a.lt) g_base[st + 6] = 255;
-    if (a.rt) g_base[st + 7] = 255;
+    // Triggers are held, as a QTE asks; with ASURA_AUTOPILOT they are tapped (150 ms down, 150 up): its own RT presses could have RT down
+    // already when a BURST prompt appears, and a trigger held from before never gives the game a new press (episode 8's chase never ended).
+    static const bool kAutoTap = [] { const char* e = getenv("ASURA_AUTOPILOT"); return e && *e && strcmp(e, "0") != 0; }();
+    const bool trigDown = !kAutoTap || (GetTickCount64() / 150) % 2 == 0;
+    if (a.lt) g_base[st + 6] = trigDown ? 255 : 0;
+    if (a.rt) g_base[st + 7] = trigDown ? 255 : 0;
     static const int16_t dx[4] = { -32767, 0, 32767, 0 }, dy[4] = { 0, -32767, 0, 32767 };
     // About 2 turns a second. Counterclockwise for a QTE (episode 1's code 37 prompt); clockwise for a tug of war: the user won both
     // rotate tug of wars turning clockwise (episode 5, episode 11: replays rec_20261113_230159, rec_20261115_163928), and turning
@@ -253,7 +257,31 @@ static void XamInputGetState_(PPCContext& ctx, uint8_t*) {
         bool options_capturing();
         if (options_capturing()) { static uint32_t packet = 0x20000000; wr32(st, ++packet); ctx.r3.u64 = 0; return; }
     }
-    if (!input_play(st) && !auto_input(st)) {
+    // ASURA_AUTOPILOT=1 (testing): once the input replay is over (or stopped by ASURA_INPUTPLAYUNTIL), the game gets the left stick held forward
+    // instead of the pad, so melee stretches move on by themselves; with ASURA_QTESKIP, ASURA_BURSTAUTO and the full Burst gauge (uescript.cpp,
+    // story_autopilot) fights end in a BURST, the same way every run, so a test can reach scenes a replay falls out of step before.
+    static const bool kAutopilot = [] { const char* e = getenv("ASURA_AUTOPILOT"); return e && *e && strcmp(e, "0") != 0; }();
+    bool played = input_play(st);
+    if (!played && kAutopilot && getenv("ASURA_INPUTPLAY")) {
+        static uint32_t packet = 0x30000000;
+        static bool said = false;
+        if (!said) { said = true; LOG("[autopilot] the replay is over: holding the left stick forward from here\n"); }
+        // and fights: B (weak attack) tapped about 7 times a second, Y (strong attack, when available) every ~1.2 s, LT (power move) every ~3 s
+        const ULONGLONG t = GetTickCount64();
+        uint16_t b = ((t / 70) & 1) ? 0x2000 : 0;                           // B
+        if ((t % 1200) < 100) b |= 0x8000;                                  // Y
+        if ((t % 3000) < 1500) b |= 0x4000;                                 // X held: rapid fire in the shooting stretches
+        // ASURA_AUTOSKIP=<frame>: also tap Back (skips cinematics without QTEs) about once a second until that game frame, so the scene to
+        // look at plays normally. While the next part still loads the game shows a "no fast forward" sign and ignores it; a later tap gets in.
+        static const uint64_t kSkipUntil = getenv("ASURA_AUTOSKIP") ? _strtoui64(getenv("ASURA_AUTOSKIP"), nullptr, 10) : 0;
+        uint64_t gpu_frame_number();
+        if (kSkipUntil && gpu_frame_number() < kSkipUntil && (t % 1000) < 100) b |= 0x0020;   // Back
+        wr32(st, ++packet); wr16(st + 4, b); wr16(st + 10, (uint16_t)32767);
+        if ((t % 3000) < 150) g_base[st + 6] = 255;                         // LT
+        if ((t % 2000) >= 1000 && (t % 2000) < 1300) g_base[st + 7] = 255;  // RT: BURST whenever the game allows it (the gauge is kept full)
+        played = true;
+    }
+    if (!played && !auto_input(st)) {
         XINPUT_STATE xs;
         if (pad_read(xs)) {
             const XINPUT_GAMEPAD& g = xs.Gamepad;
