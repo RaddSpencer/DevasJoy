@@ -297,7 +297,7 @@ Rendering:
 - [ ] Enemies cast no shadows until the camera cuts to Asura (ep 4 3:26).
 - [~] Delays after camera cuts before objects or lighting appear: ep 5 _2.mp4 2:25 (planet bottom right), _3.mp4 0:07 (Wyzen); ep 6 several early on (maybe shader compiles); ep 7 _4.mp4 2:17-2:19 (background, then the rest of the rock); ep 8 3:17 (flower lighting), 3:35, _3.mp4 3:13. Cause found for most (2026-11-15): first-time shader compiles, see "Pop-in after cuts: first-time shader compiles". Fixed for both shader kinds 2026-11-16 (pixel-shader warm-up, generic vertex shaders); needs the user's check in play. Ep 8 3:17 and 3:35 had no left-out draws: still open.
 - [ ] Ground glitch in the background (ep 8 _3.mp4 1:19-1:21). PARKED (user, 2026-11-17): shadow flicker on the mountain in the overhead city shot; Xenia shows it too, hardware does not. Findings in "Episode 8 checks".
-- [~] Persistent frame-pacing jitter in scrolling scenes, even with G-Sync active. Fixed for fixed-refresh vsync (2026-11-17, see "Frame pacing: vblank locked to the display"); the user to check in play. The G-Sync / FreeSync path not re-checked.
+- [x] Persistent frame-pacing jitter in scrolling scenes, even with G-Sync active. Fixed-refresh vsync fixed 2026-11-17 (see "Frame pacing: vblank locked to the display"); G-Sync run rec_20261117_193303 measured clean (presents 33.0-33.8 ms, nothing discarded, game DeltaTime 33.33 ms) and the user reports it smooth.
 - [ ] Anti-aliasing and texture filtering options.
 
 Audio:
@@ -381,7 +381,8 @@ Test autopilot (2026-11-16), for scenes a replay can't reach: `ASURA_AUTOPILOT=1
 
 ### Frame pacing: vblank locked to the display (2026-11-17)
 
-Not a CPU or GPU cost problem: in the user's episode 8 run (logsec_20261116_185650, 19,507 frames) only 25 frames took over 40 ms, but Windows discarded 6.3% of the presented frames ([disp] lines: 1,240 of 19,800). The game's 60 Hz vblank interrupt came from a free-running timer (gpu.cpp vsync_thread), the display runs at 59.952 Hz, so the two drifted a refresh apart every ~20 s, and with frame times wobbling a millisecond or two around 33.3 ms, presents kept landing on the wrong side of a refresh: one discarded, the next repeated (judder).
+Not a CPU or GPU cost problem: in the user's episode 8 run (logs
+ec_20261116_185650, 19,507 frames) only 25 frames took over 40 ms, but Windows discarded 6.3% of the presented frames ([disp] lines: 1,240 of 19,800). The game's 60 Hz vblank interrupt came from a free-running timer (gpu.cpp vsync_thread), the display runs at 59.952 Hz, so the two drifted a refresh apart every ~20 s, and with frame times wobbling a millisecond or two around 33.3 ms, presents kept landing on the wrong side of a refresh: one discarded, the next repeated (judder).
 
 Now, with vsync on a fixed-refresh display, the vblank thread waits for the display's real vblank (IDXGIOutput::WaitForVBlank) instead of the timer: one per game vblank at 50-61 Hz, two at 100-123 Hz. Other rates (144 Hz), VRR (`vsync = 2`), pulldown, `ASURA_VBLANKHZ` and `ASURA_FREEVBLANK=1` keep the timer, as does any tick whose wait fails or takes over 40 ms. The display rate comes from DWM (gpu_display_hz). Log: `[gpu] vblank follows the display (59.951 Hz, 1 per game vblank)`.
 
