@@ -307,7 +307,7 @@ Audio:
 Options and UI:
 - [ ] Remove the 24 fps and 24 fps pulldown modes (no motion blur to make them worthwhile).
 - [ ] Dump textures and UI to a subfolder for HD replacements (partly there: `ASURA_MODDUMP`, `mods\textures`).
-- [ ] Button labels: Xbox / PlayStation / Switch.
+- [x] Button labels: Xbox / PlayStation / Switch (2026-11-18). Options row "Button Labels" (ini `buttons` = 0 / 2 / 3, `ASURA_BUTTONS`); applies to textures loaded after the change. Replacements are built from the player's own textures by tools\make_prompts.ps1 from tools\prompts_map.txt (hashes as ASURA_MODDUMP names them) into assets\prompts\<set>\ (out of git: made from game art) and swapped by hash (xenos.cpp mods_texture). In-game prompts (QTEs, BURST): the game's icon is kept and only its label replaced (PlayStation shapes / L1 R1 L2 R2; Switch letters swapped by position, L R ZL ZR); 16 icons from episodes 1, 4 and 8 so far. Menus: one 256x128 glyph atlas (D6A5C18A385CCEE8) that already holds the game's own PlayStation glyphs (from the PS3 version) below the Xbox ones: the PlayStation set copies them up; the Switch set is drawn on those shapes. Checked: episode 1 LS prompt shows "L" (logsp1), Episode Menu legends in both sets (logs\mb2, mb3). Icons from episodes not yet dumped still show Xbox labels: dump them (ASURA_MODDUMP) and add a line to prompts_map.txt.
 - [ ] "Exit Game" option (in the game's menus, or in the host overlay).
 
 Resolved: the planet noise (user, 2026-11-14).

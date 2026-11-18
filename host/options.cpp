@@ -8,6 +8,8 @@
 //   gamma    = 50..150 (percent, 100 = as the game made it; lower is darker, for bright displays). Applies at once (present pass).
 //   showfps  = 0 or 1: frames per second and frame time in the top-left corner (ASURA_SHOWFPS=1 by hand).
 //   aa        = 0 off, 1 FXAA, 2 FXAA high (a wider edge search), in the final pass (ASURA_AA by hand). Applies at once.
+//   buttons   = 0 Xbox (the game's own icons), 2 PlayStation, 3 Switch: button prompts from assets\prompts\<set>\ (tools\make_prompts.ps1),
+//               matched by texture hash (xenos.cpp mods_texture); applies to textures loaded after the change, so from the next episode on.
 //   texfilter = 0 as the game sets each texture, 1 bilinear, 2 trilinear, 3-6 anisotropic 2x 4x 8x 16x, for the textures the game
 //               already filters (xenos.cpp get_sampler; point-sampled data and depth textures are left alone) (ASURA_TEXFILTER by hand).
 //   fps      = 24, 30 or 60 (ASURA_FPS by hand; ASURA_FPS60=1 still means 60). Other than 30 needs both of the game's caps changed: the engine config's MaxSmoothedFrameRate (kfile.cpp reads it as 60:
@@ -39,6 +41,7 @@ void gpu_set_vsync(bool on);                      // xenos.cpp
 void gpu_set_gamma(int percent);                  // xenos.cpp
 void gpu_set_aa(int mode);                        // xenos.cpp
 void gpu_set_texfilter(int mode);                 // xenos.cpp
+void gpu_set_button_set(int s);                   // xenos.cpp
 int gpu_render_scale();                           // xenos.cpp
 std::string gpu_fps_text();                       // xenos.cpp
 void video_finish();                              // video.cpp
@@ -47,7 +50,7 @@ bool story_invincible();
 bool story_qteskip();
 
 namespace {
-struct Settings { int resscale = 0; int vsync = 0; int gamma = 100; int showfps = 0; int fps = 30; int pulldown = 0; int invincible = 0; int qteskip = 0; int aa = 0; int texfilter = 0; };
+struct Settings { int resscale = 0; int vsync = 0; int gamma = 100; int showfps = 0; int fps = 30; int pulldown = 0; int invincible = 0; int qteskip = 0; int aa = 0; int texfilter = 0; int buttons = 0; };
 Settings g_saved;                                 // what asura.ini holds
 bool g_envRes = false, g_envVsync = false, g_envFps = false, g_envVblank = false, g_envVrr = false, g_envPulldown = false;   // the variable came from the ini (a restart drops it), not from the user
 int g_runFps = 30, g_runPulldown = 0, g_runVrr = 0;            // the frame rate (and 24 fps display) this process started with
@@ -67,6 +70,7 @@ void load(Settings& s) {
             else if (sscanf(line, " qteskip = %d", &v) == 1) s.qteskip = v ? 1 : 0;
             else if (sscanf(line, " aa = %d", &v) == 1) s.aa = std::clamp(v, 0, 2);
             else if (sscanf(line, " texfilter = %d", &v) == 1) s.texfilter = std::clamp(v, 0, 6);
+            else if (sscanf(line, " buttons = %d", &v) == 1) s.buttons = (v == 2 || v == 3) ? v : 0;
         }
         fclose(f);
     }
@@ -93,6 +97,8 @@ void save(const Settings& s) {
         fprintf(f, "aa = %d\n", s.aa);
         fprintf(f, "; texfilter: 0 = as the game sets it, 1 = bilinear, 2 = trilinear, 3-6 = anisotropic 2x, 4x, 8x, 16x\n");
         fprintf(f, "texfilter = %d\n", s.texfilter);
+        fprintf(f, "; buttons: button prompts, 0 = Xbox (as the game draws them), 2 = PlayStation, 3 = Switch\n");
+        fprintf(f, "buttons = %d\n", s.buttons);
         fclose(f);
     }
 }
@@ -103,7 +109,7 @@ std::mutex g_lock;                                // menu state below, between t
 Settings g_cur;                                   // what the menu shows
 int g_row = 0;
 uint64_t g_version = 1;                           // bumped when the picture changes
-enum Row { kRes, kRate, kVsync, kGamma, kAA, kTex, kFps, kStory, kInvincible, kQteSkip, kRestart, kClose, kRows };
+enum Row { kRes, kRate, kVsync, kGamma, kAA, kTex, kButtons, kFps, kStory, kInvincible, kQteSkip, kRestart, kClose, kRows };
 std::atomic<bool> g_showFps{false};
 
 int auto_scale() {
@@ -159,6 +165,7 @@ void change(int dir) {
     else if (g_row == kGamma) { g_cur.gamma = std::clamp(g_cur.gamma + dir * 5, 50, 150); gpu_set_gamma(g_cur.gamma); }
     else if (g_row == kAA) { g_cur.aa = (g_cur.aa + dir + 3) % 3; gpu_set_aa(g_cur.aa); }
     else if (g_row == kTex) { g_cur.texfilter = (g_cur.texfilter + dir + 7) % 7; gpu_set_texfilter(g_cur.texfilter); }
+    else if (g_row == kButtons) { static const int order[3] = { 0, 2, 3 }; int i = g_cur.buttons == 2 ? 1 : g_cur.buttons == 3 ? 2 : 0; g_cur.buttons = order[(i + dir + 3) % 3]; gpu_set_button_set(g_cur.buttons); }
     else if (g_row == kFps) { g_cur.showfps ^= 1; g_showFps = g_cur.showfps != 0; }
     else if (g_row == kStory) { const int on = (g_cur.invincible && g_cur.qteskip) ? 0 : 1; g_cur.invincible = g_cur.qteskip = on; story_set(on, on); }
     else if (g_row == kInvincible) { g_cur.invincible ^= 1; story_set(g_cur.invincible, g_cur.qteskip); }
@@ -229,7 +236,10 @@ void settings_apply_to_env() {
     if (fps == 24) g_cur.pulldown = g_saved.pulldown = g_runPulldown;
     else g_lastRate = fps;
 }
-int settings_button_set() { return 0; }
+int settings_button_set() {                                                 // read by xenos.cpp at the first texture (ASURA_BUTTONS=0|2|3 by hand wins)
+    if (const char* e = getenv("ASURA_BUTTONS")) { const int v = atoi(e); return (v == 2 || v == 3) ? v : 0; }
+    return g_saved.buttons;
+}
 
 bool options_open() { return g_open.load(); }
 bool options_capturing() { return g_capture.load(); }
@@ -248,7 +258,8 @@ void options_frame() {
         g_showFps = g_saved.showfps != 0;
         if (const char* e = getenv("ASURA_AA")) g_saved.aa = std::clamp(atoi(e), 0, 2);   // set by hand: shown and kept as the value in use
         if (const char* e = getenv("ASURA_TEXFILTER")) g_saved.texfilter = std::clamp(atoi(e), 0, 6);
-        g_cur.aa = g_saved.aa; g_cur.texfilter = g_saved.texfilter;
+        g_saved.buttons = settings_button_set();
+        g_cur.aa = g_saved.aa; g_cur.texfilter = g_saved.texfilter; g_cur.buttons = g_saved.buttons;
         gpu_set_aa(g_saved.aa); gpu_set_texfilter(g_saved.texfilter);
         story_set(g_saved.invincible, g_saved.qteskip);                     // ASURA_INVINCIBLE / ASURA_QTESKIP set by hand win (story_set leaves them)
         g_cur.invincible = g_saved.invincible = story_invincible() ? 1 : 0;   // shown as the values in use
@@ -302,7 +313,7 @@ bool options_picture(int w, int h, std::vector<uint8_t>& rgba, uint64_t& version
     HGDIOBJ oldBmp = SelectObject(dc, bmp);
     memset(bits, 0, (size_t)w * h * 4);
     SetBkMode(dc, TRANSPARENT);
-    const int unit = h / 17;                                                // row height
+    const int unit = h / 18;                                                // row height
     auto font = [&](int px, int weight) { return CreateFontW(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, VARIABLE_PITCH, L"Segoe UI"); };
     HFONT fTitle = font(unit * 7 / 10, FW_SEMIBOLD), fRow = font(unit * 11 / 20, FW_NORMAL), fHint = font(unit * 2 / 5, FW_NORMAL);
     auto text = [&](HFONT f, COLORREF c, int x, int y, int ww, int hh, const std::wstring& s, UINT fmt) {
@@ -320,6 +331,7 @@ bool options_picture(int w, int h, std::vector<uint8_t>& rgba, uint64_t& version
         { L"Anti-aliasing", std::wstring(L"◀  ") + (g_cur.aa == 0 ? L"Off" : g_cur.aa == 1 ? L"FXAA" : L"FXAA (high)") + L"  ▶", true },
         { L"Texture Filtering", L"◀  " + std::wstring(g_cur.texfilter == 0 ? L"As the game sets it" : g_cur.texfilter == 1 ? L"Bilinear" : g_cur.texfilter == 2 ? L"Trilinear"
                                  : L"Anisotropic " + std::to_wstring(1 << (g_cur.texfilter - 2)) + L"x") + L"  ▶", true },
+        { L"Button Labels", std::wstring(L"◀  ") + (g_cur.buttons == 2 ? L"PlayStation" : g_cur.buttons == 3 ? L"Switch" : L"Xbox") + L"  ▶", true },
         { L"Show FPS", std::wstring(L"◀  ") + (g_cur.showfps ? L"On" : L"Off") + L"  ▶", true },
         { L"Story Mode", std::wstring(L"◀  ") + (g_cur.invincible && g_cur.qteskip ? L"On" : g_cur.invincible || g_cur.qteskip ? L"Custom" : L"Off") + L"  ▶", true },
         { L"    Invincibility", std::wstring(L"◀  ") + (g_cur.invincible ? L"On" : L"Off") + L"  ▶", true },
@@ -339,7 +351,7 @@ bool options_picture(int w, int h, std::vector<uint8_t>& rgba, uint64_t& version
         text(fRow, c, pad, y, w / 2, unit, lines[i].label, DT_LEFT);
         text(fRow, lines[i].enabled ? c : RGB(110, 110, 110), w / 2 - pad, y, w / 2, unit, lines[i].value, DT_RIGHT);
     }
-    std::wstring note = restart_needed() ? L"Internal resolution and frame rate change when the game restarts." : L"Settings are saved to asura.ini.";
+    std::wstring note = g_row == kButtons ? L"Button labels change from the next episode or menu screen that loads." : restart_needed() ? L"Internal resolution and frame rate change when the game restarts." : L"Settings are saved to asura.ini.";
     if (g_cur.fps == 24 && (g_row == kVsync || !g_cur.pulldown))
         note = g_cur.pulldown ? L"24 fps shown 3:2 on a 60 Hz display, as DVD players do: no tearing, slight film judder."
                               : L"Warning: 24 fps needs a G-Sync or FreeSync display. Without one the picture will tear.";

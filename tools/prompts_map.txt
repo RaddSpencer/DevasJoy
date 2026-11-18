@@ -1,0 +1,22 @@
+# Button icons the game draws (texture hash as ASURA_MODDUMP names them) and the Xbox button each shows. tools\make_prompts.ps1 reads this.
+# <hash> <button> [text]   button: A B X Y LB RB LT RT LS RS BACK START; "text" = a text-only icon (no button body behind the label)
+# Episode 1 (QTE prompts)
+0185F893EBD3ABFC LT
+18F22E64EC8E0B5A Y
+31EC0CF2D6D11668 RT
+32FB386954FF0F9A B
+4402A6084B94B04C RT text
+485639753FF7F7F3 B
+9D647C6E57178202 B
+AF27E6CC5B6FB463 RT
+B0A19F991D7ECDDC RS
+C1531EAF2B9F2CB1 B
+C9BD96CE1CDFA3B7 RT
+CAC6B7272CDCE5DF LS
+D4F1C8EFF8608781 B
+# Episodes 4 and 8
+067DB97B7F2F1C00 Y
+423147C3DFD0039C Y
+13DC05520D422A5D LT text
+# The menus' button atlas (the game's own PlayStation glyphs are in it)
+D6A5C18A385CCEE8 atlas

@@ -36,3 +36,6 @@ asura.ini
 
 # texture dumps and replacements made from the game (ASURA_MODDUMP, mods/textures)
 mods/
+
+# button prompts built from the game's icons (tools\make_prompts.ps1): game art
+assets/prompts/
