@@ -219,7 +219,29 @@ static void vsync_thread() {
         }
         g_vblankPeriodUs = (long long)period.count();
         next += period;
-        std::this_thread::sleep_until(next);
+        // Display-locked vblank (fixed-refresh displays with vsync, 50-61 Hz or twice that): the game's vblank follows the display's
+        // own, so its frames, two vblanks each, start on a refresh and can't drift across refresh boundaries. A free-running 60 Hz
+        // timer against a 59.95 Hz display slipped a refresh every 20 s, and with frame times wobbling around 33.3 ms Windows
+        // discarded 6% of the presented frames (judder; user's episode 8 run). Off with VRR, pulldown, ASURA_VBLANKHZ or
+        // ASURA_FREEVBLANK=1; any failure or a wait over 40 ms falls back to the timer for that tick.
+        bool waited = false;
+        {
+            bool gpu_vblank_lock_wanted(); bool gpu_wait_vblank(); double gpu_display_hz();
+            static const bool kFree = getenv("ASURA_FREEVBLANK") != nullptr;
+            const double hz = gpu_display_hz();
+            const int per = (hz > 49.5 && hz < 61.5) ? 1 : (hz > 99 && hz < 123) ? 2 : 0;   // real vblanks per game vblank
+            if (!kFree && kHz == 60 && pulldownHz == 0 && per && gpu_vblank_lock_wanted()) {
+                const auto t0 = std::chrono::steady_clock::now();
+                bool ok = true;
+                for (int k = 0; k < per && ok; k++) ok = gpu_wait_vblank();
+                const auto t1 = std::chrono::steady_clock::now();
+                waited = ok && t1 - t0 < std::chrono::milliseconds(40);
+                if (waited) next = t1;
+                static bool said = false;
+                if (waited && !said) { said = true; LOG("[gpu] vblank follows the display (%.3f Hz, %d per game vblank)\n", hz, per); }
+            }
+        }
+        if (!waited) std::this_thread::sleep_until(next);
         if (std::chrono::steady_clock::now() > next + std::chrono::milliseconds(50)) next = std::chrono::steady_clock::now();
         wr32(reg_addr(0x1951), 1);                        // D1MODE_VBLANK_STATUS
         wr32(reg_addr(0x194C), (uint32_t)(n * 750));      // D1MODE_V_COUNTER, roughly

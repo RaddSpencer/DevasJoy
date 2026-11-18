@@ -44,6 +44,8 @@
 #include <vector>
 #include <unordered_set>
 #include <wincodec.h>
+#include <dwmapi.h>
+#pragma comment(lib, "dwmapi.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -4731,6 +4733,19 @@ bool gpu_wait_vblank() {
     ComPtr<IDXGIOutput> o;
     { std::lock_guard<std::mutex> lk(g_outputLock); o = g_output; }
     return o && SUCCEEDED(o->WaitForVBlank());
+}
+// For the display-locked vblank (gpu.cpp): only with vsync on a fixed-refresh display (VRR has its own even cadence; pulldown its own rate).
+bool gpu_vblank_lock_wanted() { return g_vsync.load() && !g_tearing && g_pulldownVblank.load() == 0; }
+// The display's exact refresh rate (DWM's composition rate, e.g. 59.952), checked every 2 s; 0 if unknown.
+double gpu_display_hz() {
+    static std::atomic<double> hz{0}; static std::atomic<ULONGLONG> at{0};
+    const ULONGLONG now = GetTickCount64();
+    if (now - at.load() > 2000) {
+        at = now;
+        DWM_TIMING_INFO ti{}; ti.cbSize = sizeof ti;
+        if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &ti)) && ti.rateRefresh.uiDenominator) hz = (double)ti.rateRefresh.uiNumerator / ti.rateRefresh.uiDenominator;
+    }
+    return hz.load();
 }
 
 // What reached the screen, as opposed to what was submitted: refresh rate, frames discarded before scanout, and Present-to-scanout time.
