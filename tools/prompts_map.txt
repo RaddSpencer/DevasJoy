@@ -20,3 +20,6 @@ D4F1C8EFF8608781 B
 13DC05520D422A5D LT text
 # The menus' button atlas (the game's own PlayStation glyphs are in it)
 D6A5C18A385CCEE8 atlas
+# Episodes 10, 13, 14
+B8EA81B0940F57F0 A
+CC055E919DB1A5E1 A

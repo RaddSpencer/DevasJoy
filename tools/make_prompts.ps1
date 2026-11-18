@@ -23,6 +23,8 @@ public static class Prompts {
     // a letter's darker grey part (the Y icon's letter fades from white to grey): neutral, fairly bright, mostly opaque; grown into from a light piece only
     static bool IsGreyLetter(Color c) { int mn = Math.Min(c.R, Math.Min(c.G, c.B)), mx = Math.Max(c.R, Math.Max(c.G, c.B)); return c.A > 150 && mx - mn <= 12 && (c.R + c.G + c.B) / 3 > 85; }
     // a letter's warm lower part (the orange Y icon's letter fades from white to pale yellow): grown into from a light piece only
+    // a tinted light letter part (the green A icon: pale green): every channel fairly bright
+    static bool IsTintLetter(Color c) { return c.A > 150 && Math.Min(c.R, Math.Min(c.G, c.B)) > 110 && 0.299 * c.R + 0.587 * c.G + 0.114 * c.B > 165; }
     static bool IsWarmLetter(Color c) { return c.A > 150 && c.R > 230 && c.G > 188 && c.B > 25; }
     static bool IsLetter(Color c) { int mn = Math.Min(c.R, Math.Min(c.G, c.B)), mx = Math.Max(c.R, Math.Max(c.G, c.B)); return c.A > 90 && mn > 150 && mx - mn < 120; }
 
@@ -81,7 +83,7 @@ public static class Prompts {
                 var comp = new List<int[]>(); var st = new Stack<int[]>(); st.Push(new int[] { sx, sy }); seen[sx, sy] = true;
                 int cx0 = sx, cx1 = sx;
                 while (st.Count > 0) { var p = st.Pop(); comp.Add(p); cx0 = Math.Min(cx0, p[0]); cx1 = Math.Max(cx1, p[0]);
-                    for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) { int xx = p[0] + dx, yy = p[1] + dy; if (xx < 0 || yy < 0 || xx >= w || yy >= h || seen[xx, yy] || !(IsLetter(px[xx, yy]) || IsGreyLetter(px[xx, yy]) || IsWarmLetter(px[xx, yy]))) continue; seen[xx, yy] = true; st.Push(new int[] { xx, yy }); } }
+                    for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) { int xx = p[0] + dx, yy = p[1] + dy; if (xx < 0 || yy < 0 || xx >= w || yy >= h || seen[xx, yy] || !(IsLetter(px[xx, yy]) || IsGreyLetter(px[xx, yy]) || IsWarmLetter(px[xx, yy]) || IsTintLetter(px[xx, yy]))) continue; seen[xx, yy] = true; st.Push(new int[] { xx, yy }); } }
                 if (cx1 - cx0 + 1 > 0.85 * (ox1 - ox0 + 1) || comp.Count < 4) continue;
                 foreach (var p in comp) { mask[p[0], p[1]] = true; x0 = Math.Min(x0, p[0]); x1 = Math.Max(x1, p[0]); y0 = Math.Min(y0, p[1]); y1 = Math.Max(y1, p[1]); }
             }
