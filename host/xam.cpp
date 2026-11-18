@@ -192,7 +192,7 @@ static void qte_from_icons(QteAnswer& a) {                                  // t
 // ASURA_BURSTAUTO=1: with ASURA_QTESKIP (uescript.cpp), which passes the QTEs without showing them, any prompt the renderer still sees
 // is a gameplay one, the BURST prompt (RT at a full gauge): answered from its icon, which the renderer also hides. Off by default.
 static void qte_apply(uint32_t st) {
-    static const char* kMode = getenv("ASURA_AUTOQTE");
+    static const char* kMode = [] { const char* e = getenv("ASURA_AUTOQTE"); return (e && *e && strcmp(e, "0") != 0) ? e : (const char*)nullptr; }();   // "0" means off
     static const bool kSkip = [] { const char* e = getenv("ASURA_BURSTAUTO"); return e && *e && strcmp(e, "0") != 0; }();
     bool story_qteskip(); bool story_mash_active();
     // Story Mode: a tug-of-war prompt (uescript.cpp). Its meter is filled directly there, with no presses (each press played its
