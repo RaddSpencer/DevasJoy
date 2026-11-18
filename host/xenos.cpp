@@ -5485,6 +5485,27 @@ void gpu_packet(uint8_t* base, uint32_t op, const uint32_t* b, uint32_t cnt) {
                                  c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], (endZPass || endZFail) ? " end" : "");
         memset(c, 0, 32);
 
+        // ASURA_OCCLUSION=1 (experiment): real counts. A report without the end markers starts a host occlusion query, the next
+        // one with them ends it; the count (host samples over the render scale squared) is written at once (a GPU sync per query).
+        static const bool kReal = getenv("ASURA_OCCLUSION") != nullptr;
+        static ComPtr<ID3D11Query> open;
+        if (kReal) {
+            if (!(endZPass || endZFail)) {
+                if (!open) { D3D11_QUERY_DESC qd{ D3D11_QUERY_OCCLUSION, 0 }; g_dev->CreateQuery(&qd, &open); if (open) g_ctx->Begin(open.Get()); }
+                break;
+            }
+            uint64_t n = 0;
+            if (open) {
+                g_ctx->End(open.Get());
+                while (g_ctx->GetData(open.Get(), &n, sizeof n, 0) == S_FALSE) SwitchToThread();
+                open.Reset();
+            }
+            n /= (uint64_t)(g_resScale * g_resScale);
+            const uint32_t v = (uint32_t)std::min<uint64_t>(n, 0x7FFFFFFF);
+            c[4] = v; c[0] = v;
+            if (g_trace > 0) fprintf(stderr, "[zpd] f=%llu real count %u\n", (unsigned long long)g_frame, v);
+            break;
+        }
         if (endZPass || endZFail) { c[4] = 1000; c[0] = 1000; }
         static int nl = 0;
         if (nl++ < 4) fprintf(stderr, "[gfx] occlusion query report at %08X finished=%d\n", addr, (int)(endZPass || endZFail));
