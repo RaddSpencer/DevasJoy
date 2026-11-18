@@ -4114,6 +4114,10 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
                     reg_f(R_OFFSET_FRONT_SCALE + 2), reg_f(R_OFFSET_FRONT_SCALE + 3), polyScale, polyOff);
     }
     bool clipOff = (g_regs[R_CLIP_CNTL] >> 16) & 1;
+    {   // ASURA_NOCLIPVS=<vs hash prefix>: draws with that vertex shader get no near/far clipping (depth clamped), to test clipping effects
+        static const char* kNc = getenv("ASURA_NOCLIPVS");
+        if (kNc && S("%016llX", (unsigned long long)vs->hash).compare(0, strlen(kNc), kNc) == 0) clipOff = true;
+    }
     g_ctx->RSSetState(get_rs(mode, rect, clipOff, polyScale, polyOff));
     D3D11_VIEWPORT vp{ 0, 0, (float)(rw * g_resScale), (float)(rh * g_resScale), 0, 1 };
     g_ctx->RSSetViewports(1, &vp);
@@ -4123,10 +4127,11 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
     g_ctx->RSSetScissorRects(1, &sc);
 
     struct ProbeAfter {                                                     // BCR2_PROBE="x,y": log draws that change this pixel in target 0
-        ID3D11Resource* res = nullptr; uint32_t px = 0, py = 0, rw_, rh_, before = 0; bool have = false;
-        bool read(uint32_t& v) {
+        ID3D11Resource* res = nullptr; uint32_t px = 0, py = 0, rw_, rh_; uint64_t before = 0; bool have = false, wide = false;
+        bool read(uint64_t& v) {                                            // 8-bit RGBA, or 16-bit float RGBA (the scene's 7e3 targets)
             D3D11_TEXTURE2D_DESC d; ((ID3D11Texture2D*)res)->GetDesc(&d);
-            if (d.Format != DXGI_FORMAT_R8G8B8A8_UNORM) return false;
+            if (d.Format != DXGI_FORMAT_R8G8B8A8_UNORM && d.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) return false;
+            wide = d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
             d.Width = 1; d.Height = 1; d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
             ComPtr<ID3D11Texture2D> st;
             if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &st))) return false;
@@ -4134,7 +4139,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
             g_ctx->CopySubresourceRegion(st.Get(), 0, 0, 0, 0, res, 0, &box);
             D3D11_MAPPED_SUBRESOURCE ms;
             if (FAILED(g_ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &ms))) return false;
-            v = *(uint32_t*)ms.pData; g_ctx->Unmap(st.Get(), 0);
+            v = wide ? *(uint64_t*)ms.pData : *(uint32_t*)ms.pData; g_ctx->Unmap(st.Get(), 0);
             return true;
         }
         ProbeAfter(ID3D11RenderTargetView* rtv, uint32_t rw, uint32_t rh, uint32_t pr) : rw_(rw), rh_(rh) {
@@ -4152,8 +4157,13 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         }
         ~ProbeAfter() {
             if (!res) return;
-            uint32_t v;
-            if (have && read(v) && v != before) fprintf(stderr, "[probe] rt=%p at %u,%u %08X -> %08X (above draw, %ux%u)\n", res, px, py, before, v, rw_, rh_);
+            uint64_t v;
+            auto txt = [&](uint64_t x) {
+                if (!wide) return S("%08X", (uint32_t)x);
+                auto h = [](uint16_t u) { const uint32_t sgn = (u >> 15) & 1, e = (u >> 10) & 31, m = u & 1023; float f = e == 0 ? m / 1024.0f / 16384.0f : (e == 31 ? 65504.0f : ldexpf(1.0f + m / 1024.0f, (int)e - 15)); return sgn ? -f : f; };
+                return S("%.4f,%.4f,%.4f,%.4f", h((uint16_t)x), h((uint16_t)(x >> 16)), h((uint16_t)(x >> 32)), h((uint16_t)(x >> 48)));
+            };
+            if (have && read(v) && v != before) fprintf(stderr, "[probe] rt=%p at %u,%u %s -> %s (above draw, %ux%u)\n", res, px, py, txt(before).c_str(), txt(v).c_str(), rw_, rh_);
             res->Release();
         }
     } probe(rtvs[0], rw, rh, 0);
