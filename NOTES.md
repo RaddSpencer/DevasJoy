@@ -296,7 +296,7 @@ Rendering:
 - [x] Broken shadows, like episode 1's praying people before the fast-clear fix: ep 4 0:37; ep 7 monsters at the opening; ep 8 _3.mp4 0:50-0:55, 1:30-1:34 (block-shaped shadow bottom left), 1:42-1:46, 2:33-2:41, 2:55-2:57, 3:38-3:42, 4:44; ep 8 3:19. Fixed (2026-11-15, see "Shadow atlas: two-rectangle tile clears"); confirmed by the user. Ep 4 0:37 (Asura): not a renderer fault as far as can be measured, see the same section.
 - [ ] Enemies cast no shadows until the camera cuts to Asura (ep 4 3:26).
 - [~] Delays after camera cuts before objects or lighting appear: ep 5 _2.mp4 2:25 (planet bottom right), _3.mp4 0:07 (Wyzen); ep 6 several early on (maybe shader compiles); ep 7 _4.mp4 2:17-2:19 (background, then the rest of the rock); ep 8 3:17 (flower lighting), 3:35, _3.mp4 3:13. Cause found for most (2026-11-15): first-time shader compiles, see "Pop-in after cuts: first-time shader compiles". Fixed for both shader kinds 2026-11-16 (pixel-shader warm-up, generic vertex shaders); needs the user's check in play. Ep 8 3:17 and 3:35 had no left-out draws: still open.
-- [ ] Ground glitch in the background (ep 8 _3.mp4 1:19-1:21).
+- [ ] Ground glitch in the background (ep 8 _3.mp4 1:19-1:21). PARKED (user, 2026-11-17): shadow flicker on the mountain in the overhead city shot; Xenia shows it too, hardware does not. Findings in "Episode 8 checks".
 - [ ] Persistent frame-pacing jitter in scrolling scenes, even with G-Sync active.
 - [ ] Anti-aliasing and texture filtering options.
 
