@@ -319,6 +319,9 @@ Rendering:
 - [ ] Shadow issue with citizens again (ep 12 _2.mp4 0:30-0:44).
 - [x] Render delay on the crowds in front of the fleet (ep 9 1:59). A first-time shader compile (3 draws left out at frames 3,576-3,577); covered by the warm-up and generic vertex shaders (2026-11-16).
 - [ ] Asura falling through the atmosphere disappears one frame before the cut (ep 9 _5.mp4 0:51).
+- [ ] Ep 13 (user, 2026-11-18): near the end, a character shown on a screen during a conversation vanishes and reappears (culled and back).
+- [ ] Ep 14: flickering on a ship; F9 captures in hostuild\_debug_capture (f9_2784 / f9_1583, logsec_20261118_122344 / 123448).
+- [x] Ep 13 mash B slow and ep 14 LS-up/RS-down QTE softlock, BURST answered by itself: record_test_dump.cmd set ASURA_AUTOQTE=0, which still turned the automatic answers on; their forced presses fought the player's (B held half the time, both sticks pushed down). "0" now means off (2026-11-18).
 - [x] Texture glitch in an eye (ep 11 rec_20261115_163928_3.mp4 0:21-0:28). Fixed by the resolve-surface change (user, 2026-11-16). Part of the eye is solid green, what a Bink plane of zeros gives after YUV conversion; the rest shows a video-like reflection. Possibly the same stale-surface bug as the title movie (fixed 2026-11-16); the replay falls out of step before it (logs\e11r), so the user should look again.
 - [x] After "Return to Main Menu", the title menu's background video is offset (ep 10 4:12). Fixed 2026-11-16, see "Resolves that start inside an older surface".
 
