@@ -9,6 +9,7 @@
 // is let through one instruction, and is applied at once (a background scan catches anything that slips past).
 #include "kernel.h"
 #include <windows.h>
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -32,6 +33,7 @@ struct Ctx {
     int channels = 0, rate = 0;
     std::vector<int16_t> pending;     // decoded, interleaved, waiting for room in the output ring
     uint32_t lastOffset = 0xFFFFFFFFu;  // the input read offset we last wrote: anything else means the game moved it
+    uint32_t skipBits = 0;              // after a loop: the loop start, so the next packet drops the samples before it
     uint64_t packets = 0, blocks = 0;
 };
 static Ctx g_xma[kContexts];
@@ -156,12 +158,33 @@ static void work(uint32_t i) {
         if (kXmaLog && packet == 0)
             fprintf(stderr, "[xmalog] f=%llu ctx %u start buf %u at %08X packets %u loops %u loop %u-%u ch %d rate %d\n", (unsigned long long)xma_log_frame(), i, cur, base, count,
                     (w0 >> 12) & 0xFF, cget(i, 3) & 0x3FFFFFF, w4 & 0x3FFFFFF, channels, rate);
+        const size_t before = c.pending.size();
         dec_packet(c, g_base + gpu_phys_to_host(base) + packet * 2048);
         c.packets++;
         offset = (packet + 1) * 2048 * 8 + 32;
         // hardware looping: from loop end back to loop start, loop count times (255 = for ever)
         const uint32_t loops = (w0 >> 12) & 0xFF, loopEnd = w4 & 0x3FFFFFF, loopStart = cget(i, 3) & 0x3FFFFFF;
+        {   // Loop points are bit offsets and usually fall inside a 2 KB packet, but packets are decoded whole: the loop's last packet
+            // played to its end (episode 8's crowd loop: ~9% extra per pass, a repeated fragment of speech each time round, on five
+            // emitters at once), and a loop start inside a packet played that packet's beginning again. Keep only the share of this
+            // packet's samples inside the loop (frames are close to evenly spread over a packet). ASURA_XMALOOPFULL=1: whole packets.
+            static const bool kFull = getenv("ASURA_XMALOOPFULL") != nullptr;
+            const uint32_t pStart = packet * 2048 * 8 + 32, pBits = 2048 * 8 - 32;
+            const size_t got = c.pending.size() - before, ch = (size_t)std::max(c.channels, 1);
+            if (!kFull && got >= ch) {
+                size_t from = 0, to = got / ch;
+                if (c.skipBits && c.skipBits > pStart && c.skipBits < pStart + pBits) from = (size_t)((double)(c.skipBits - pStart) / pBits * (got / ch));
+                if (loops && loopEnd > pStart && loopEnd < offset) to = (size_t)((double)(loopEnd - pStart) / pBits * (got / ch));
+                if (from > 0 || to < got / ch) {
+                    if (to < from) to = from;
+                    std::vector<int16_t> keep(c.pending.begin() + before + from * ch, c.pending.begin() + before + to * ch);
+                    c.pending.resize(before); c.pending.insert(c.pending.end(), keep.begin(), keep.end());
+                }
+            }
+            c.skipBits = 0;
+        }
         if (loops && loopEnd && offset >= loopEnd) {
+            c.skipBits = loopStart;                                         // the loop start's packet: drop what comes before it
             if (kXmaLog) fprintf(stderr, "[xmalog] f=%llu ctx %u loop %u -> %u, count %u\n", (unsigned long long)xma_log_frame(), i, offset, loopStart, loops);
             offset = loopStart;
             if (loops != 255) cupdate(i, 0, 0xFFu << 12, (loops - 1) << 12);
