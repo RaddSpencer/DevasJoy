@@ -59,7 +59,8 @@ static bool snd_muted(uint64_t h) {
     if (std::find(kList.begin(), kList.end(), h) == kList.end()) return false;
     bool boss_prompt_recent(); bool story_qteskip(); bool story_mash_recent();
     bool story_choice_recent();
-    return story_qteskip() && (boss_prompt_recent() || story_mash_recent() || story_choice_recent());   // and as a tug of war Story Mode filled ends, and around the X/B choice it answers
+    bool combat_prompt_recent();
+    return story_qteskip() && (boss_prompt_recent() || story_mash_recent() || story_choice_recent() || combat_prompt_recent());   // and as a tug of war Story Mode filled ends, and around the X/B choice it answers
 }
 static Ctx g_xma[kContexts];
 static std::mutex g_lock;

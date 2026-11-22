@@ -2527,6 +2527,8 @@ static const bool kHidePrompts = [] { const char* e = getenv("ASURA_BURSTAUTO");
 static bool g_hideDraw = false;
 static bool g_bossFrame = false, g_bossPrev = false;                        // episode 22's boss prompt drawn in this / the previous frame
 static std::atomic<uint64_t> g_bossMs{0};                                   // when one was last drawn (GetTickCount64)
+static std::atomic<uint64_t> g_combatMs{0};                                 // when a combat Y/B medallion was last drawn
+bool combat_prompt_recent() { const uint64_t t = g_combatMs.load(); return t && GetTickCount64() - t < 3000; }
 bool boss_prompt_recent() { const uint64_t t = g_bossMs.load(); return t && GetTickCount64() - t < 3000; }   // xma.cpp: the chime's mute
 static bool g_mashBurst = false;                                            // a tug of war has shown its RT BURST prompt (qte_note_texture)
 static void qte_note_texture(uint32_t base, uint64_t hash, uint32_t fmt, uint32_t w, uint32_t h2, bool ui, bool white) {
@@ -2575,7 +2577,10 @@ static void qte_note_texture(uint32_t base, uint64_t hash, uint32_t fmt, uint32_
         // flash still showed (the red B at f=26791 and 26876, logs\rec_20261122_133826; textures from the X/B capture f9_22996)
         bool story_choice_recent1s();
         static const uint32_t kChoice[] = { 0x7358E170u, 0x557DF1F3u, 0xA0467C6Bu, 0xC616B372u, 0x02CB6CDCu, 0x9DA45AA1u, 0x4E25A304u, 0xF741C256u };
-        if (std::find(std::begin(kChoice), std::end(kChoice), h) != std::end(kChoice) && story_choice_recent1s()) g_hideDraw = true;
+        // and always in episode 22's Story Mode, where Story Mode answers every medallion of this kind (the Y/B ones of its boss
+        // fight included, uescript.cpp)
+        bool story_qteskip(); bool map_is_ep22();
+        if (std::find(std::begin(kChoice), std::end(kChoice), h) != std::end(kChoice) && (story_choice_recent1s() || (story_qteskip() && map_is_ep22()))) g_hideDraw = true;
     }
     // And for 1.5 s after one of episode 22's boss prompts: the boss's own QTEs end in a success or failure emblem (the black splatter at
     // f=28945, the user's run logs\rec_20261122_133826), drawn once the medallion has gone. Subtitles (font pages) stay.
@@ -2599,15 +2604,18 @@ static void qte_note_texture(uint32_t base, uint64_t hash, uint32_t fmt, uint32_
         static const bool kBossHide = [] { const char* e = getenv("ASURA_BOSSHIDE"); return !e || atoi(e) != 0; }();
         static const uint64_t kBoss[] = { 0x01B121DCE79B255Dull, 0x16FBC54B37D163B1ull, 0x70415191AE185B7Eull, 0xA8A3DDBF28B73879ull,
                                           0xA995243BAA6A564Full, 0xC438BFCB45354102ull, 0xA5478B82E1D0ED9Aull };
-        bool story_qteskip();
+        bool story_qteskip(); bool map_is_ep22();
+        // In episode 22's map the pieces beside the medallion are left out from its first frame too: going by the previous frame alone
+        // let a red burst through on each one's first frame (f=29051, logs\rec_20261122_140702)
+        const bool inEp22 = map_is_ep22();
         if (kBossHide && ui && story_qteskip()) {
             if (std::find(std::begin(kBoss), std::end(kBoss), hash) != std::end(kBoss)) { g_bossFrame = true; g_hideDraw = true; }
             // with them: the button circles, the gray flame (1024x512 sheet) and the flash (1024x1024, the BURST prompt's too); seen
             // left over beside the hidden medallion at f=22868 (the user's run, logs\rec_20261122_122628)
-            else if (g_bossPrev && (hash == 0xCC6068FA8245CBFEull || hash == 0xF38A8EE504CB4CB3ull || hash == 0xE9455A62A1BBE4B3ull || hash == 0x16799D79086AAB4Bull)) g_hideDraw = true;
+            else if ((g_bossPrev || inEp22) && (hash == 0xCC6068FA8245CBFEull || hash == 0xF38A8EE504CB4CB3ull || hash == 0xE9455A62A1BBE4B3ull || hash == 0x16799D79086AAB4Bull)) g_hideDraw = true;
             // and the boss's mash prompt's effects (the burst at each press and its rings, folded hashes as draws_<frame>.txt shows them:
             // the user's capture f9_30578, prompt on screen 30430-30585)
-            else if (g_bossPrev && (h == 0x3B47C236u || h == 0x174F53FEu || h == 0x6FFC018Bu || h == 0x9DA45AA1u)) g_hideDraw = true;
+            else if ((g_bossPrev || inEp22) && (h == 0x3B47C236u || h == 0x174F53FEu || h == 0x6FFC018Bu || h == 0x9DA45AA1u)) g_hideDraw = true;
         }
     }
 }
@@ -2622,6 +2630,7 @@ static void qte_publish() {                                                 // a
     last = g_qteFrame;
     if (g_bossFrame != g_bossPrev) fprintf(stderr, "[qte] frame %llu: boss prompt %s\n", (unsigned long long)g_frame, g_bossFrame ? "on screen (hidden)" : "gone");
     if (g_bossFrame) g_bossMs = GetTickCount64();
+    if (g_qteFrame & (QTE_YC | QTE_B)) g_combatMs = GetTickCount64();   // a combat Y/B medallion (xma.cpp: its chime muted in Story Mode)
     g_bossPrev = g_bossFrame; g_bossFrame = false;
     g_qteActive = g_qteFrame;
     g_qteFrame = 0;

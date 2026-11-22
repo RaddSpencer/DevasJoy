@@ -524,6 +524,11 @@ static void button_enum_dump(uint32_t self) {
     fprintf(stderr, "[enum] %s: names not found\n", ue_obj_name(en).c_str());
 }
 
+// The episode's map ("BC-S250" for episode 22), set by kfile.cpp as its packages open
+static std::mutex g_mapLock; static std::string g_map;
+void set_current_map(const char* m) { std::lock_guard<std::mutex> g(g_mapLock); if (g_map != m) { g_map = m; fprintf(stderr, "[story] map %s\n", m); } }
+static std::string current_map() { std::lock_guard<std::mutex> g(g_mapLock); return g_map; }
+bool map_is_ep22() { static thread_local std::string last; static thread_local bool v = false; std::string m = current_map(); if (m != last) { last = m; v = (m == "BC-S250"); } return v; }
 // A QTE Story Mode leaves to the player (below) was updated in the last 0.5 s: xam.cpp then presses no combat prompt for it
 static std::atomic<uint64_t> g_manualMs{0};
 bool story_manual_recent() { const uint64_t t = g_manualMs.load(); return t && GetTickCount64() - t < 500; }
@@ -569,9 +574,9 @@ static bool qte_skip(uint32_t self, uint32_t lr) {
                 if (!ch.seen || now - ch.seen > 2000) { ch = Choice(); ch.first = now; ch.button = nextB ? 0x2000 : 0x4000; nextB = !nextB; }
                 ch.seen = now;
                 g_choiceMs = now;                                           // the renderer hides its prompt (xenos.cpp, story_choice_active)
-                // X and B mashed alternately, about 10 presses a second (50 ms down): one press a second, one button per choice, let each
+                // X and B mashed alternately, a press every 0.25 s (50 ms down; the user's pace, 2026-11-22): one press a second, one button per choice, let each
                 // choice time out into its failure (the user's run, logs\rec_20261122_124809 f=25583-25904: failure emblem and sound)
-                if (now - ch.first >= 300 && now - ch.pressed >= 100) {
+                if (now - ch.first >= 300 && now - ch.pressed >= 250) {
                     ch.pressed = now;
                     void input_press_at(uint16_t buttons, uint32_t delayMs, uint32_t holdMs);
                     input_press_at(ch.button, 0, 50);
@@ -605,6 +610,18 @@ static bool qte_skip(uint32_t self, uint32_t lr) {
             const uint32_t b = rd32(self + v.btn), nb = rd32(self + v.btn + 4);
             bool allHidden = nb > 0 && nb <= 8 && readable(b, nb * 0x30);
             for (uint32_t i = 0; allHidden && i < nb; i++) allHidden = (rd32(b + i * 0x30 + 0x20) & 0x80000000u) != 0;
+            // Except in episode 22 (BC-S250): its boss fight has QTEs of the same kind, a Y or B medallion, that Story Mode answers (the
+            // user's runs, logs\rec_20261122_140702 f=12466 / medallion 14259). Such a QTE is active long before its moment, so its
+            // Update runs untouched until its input opens (bStartInput, when the medallion would show; the renderer hides it,
+            // xenos.cpp), and from then on it is passed like any QTE.
+            if (allHidden && current_map() == "BC-S250") {
+                static std::map<uint32_t, std::pair<int, uint32_t>> si;
+                auto it = si.find(cls);
+                if (it == si.end()) { uint32_t m = 0; const int off = ue_field_offset(cls, "bStartInput", &m); it = si.emplace(cls, std::make_pair(off, m)).first; }
+                const bool started = it->second.first > 0 && it->second.second && (rd32(self + it->second.first) & it->second.second);
+                if (!started) return false;
+                allHidden = false;                                          // its input is open: on to the wait and the pass below
+            }
             if (allHidden) {
                 static std::map<uint32_t, uint64_t> said;
                 const uint64_t f = gpu_frame_number();
@@ -667,13 +684,13 @@ static bool qte_skip(uint32_t self, uint32_t lr) {
     // A Mantra gauge QTE (mash B, each press adds MantraAmount to the Burst gauge; done at SuccessfulMantraGauge): the scene after it
     // goes on only once the gauge is full and the player BURSTs, so passing the action alone left episode 22's punch exchange with
     // Chakravartin repeating for ever (the user's run, logs\rec_20261122_110058 f=26059 on). The player's gauge is filled as well
-    // (player_health, after 5 or 6 s of the exchange); the BURST itself stays the player's, like every BURST.
+    // (player_health, after 5 or 8 s of the exchange); the BURST itself stays the player's, like every BURST.
     if (ue_obj_name(self).find("MantraGauge") != std::string::npos) {
-        // 5 s for the first exchange of a fight and 6 s after it (the user's call, 2026-11-22: episode 22 has two, ~30 s apart); a
+        // 5 s for the first exchange of a fight and 8 s after it (the user's call, 2026-11-22: episode 22 has two, ~30 s apart); a
         // new fight is one more than 2 minutes after the last exchange. Then the gauge is kept full for 2 s (player_health).
         static uint64_t lastAt = 0;
         const uint64_t fr = gpu_frame_number();
-        const uint64_t wait = (!lastAt || fr - lastAt > 3600) ? 150 : 180;
+        const uint64_t wait = (!lastAt || fr - lastAt > 3600) ? 150 : 240;   // 5 s, then 8 s (the user, 2026-11-22)
         lastAt = fr;
         g_mantraFillFrom = fr + wait;
         g_mantraFillUntil = fr + wait + 60;

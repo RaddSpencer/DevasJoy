@@ -281,6 +281,10 @@ static void open_file(PPCContext& ctx, uint32_t outH, uint32_t access, uint32_t 
     uint32_t info = !existed ? 2 : (disposition == 0 ? 0 : (disposition >= 4 ? 3 : 1));   // created / superseded / overwritten / opened
     set_iosb(iosb, STATUS_SUCCESS, info);
     LOG("[file] open '%s'%s -> %08X\n", name.c_str(), isDir ? " (dir)" : "", gh);
+    {   // the episode's map, from its cooked packages (BC-S250_... is episode 22): current_map() for rules that differ by episode
+        const size_t p = name.find("\\BC-S");
+        if (p != std::string::npos && name.size() >= p + 8) { void set_current_map(const char*); set_current_map(name.substr(p + 1, 7).c_str()); }
+    }
     {   // ASURA_SHOTAFTERFILE="<file name text>:<from>-<to>" (xenos.cpp): note the frame that file is first opened
         static const std::string kAf = [] { const char* e = getenv("ASURA_SHOTAFTERFILE"); std::string v = e ? e : ""; const size_t c = v.rfind(':'); return c == std::string::npos ? v : v.substr(0, c); }();
         extern std::atomic<int64_t> g_shotFileFrame; uint64_t xma_log_frame();
