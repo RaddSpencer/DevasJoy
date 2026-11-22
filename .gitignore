@@ -39,3 +39,6 @@ mods/
 
 # button prompts built from the game's icons (tools\make_prompts.ps1): game art
 assets/prompts/
+
+# input recordings of the user's own runs (local test data)
+replays/

@@ -8,12 +8,12 @@ setlocal
 cd /d "%~dp0"
 for /f "delims==" %%v in ('set ASURA_ 2^>nul') do set "%%v="
 for /f %%t in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set STAMP=%%t
-set ASURA_SAVESEED=saves_complete\SAVEDATA.DAT
+set ASURA_SAVESEED=saves\SAVEDATA.DAT
 set ASURA_SKIPINTRO=1
 set ASURA_FPS=30
 set ASURA_INVINCIBLE=1
 set ASURA_QTESKIP=0
-set ASURA_AUTOQTE=1
+set ASURA_AUTOQTE=0
 set ASURA_INPUTREC=replays\rec_%STAMP%.txt
 set ASURA_LOGFILE=logs\rec_%STAMP%.log
 set ASURA_MODDUMP=128x128,64x64,128x64,64x32,256x128
