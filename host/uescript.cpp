@@ -389,22 +389,62 @@ void story_set(bool invincible, bool qteskip) {
 // each frame, and the damage notifications) its Health is put back to HealthMax, and its Controller's bGodMode is set, which
 // UE3's damage code checks (Pawn.InGodMode) before taking any health off.
 // ASURA_HEALTHLOG=1 logs the player's Health whenever it changes (with or without invincibility).
+static std::atomic<uint64_t> g_mantraFillFrom{0}, g_mantraFillUntil{0};  // Story Mode: fill the Burst gauge in these frames (qte_skip, Mantra gauge QTEs)
 static void player_health(uint32_t self, const char* when) {
     static const bool kLog = env_on("ASURA_HEALTHLOG");
     const bool inv = story_invincible();
     static const bool kAutopilot = env_on("ASURA_AUTOPILOT");               // testing (xam.cpp): keep the Burst (Mantra) gauge full, so fights end in a BURST
-    if (!inv && !kLog && !kAutopilot) return;
+    const bool fill = kAutopilot || (gpu_frame_number() >= g_mantraFillFrom.load() && gpu_frame_number() < g_mantraFillUntil.load());
+    // ASURA_BURSTSTART=<percent> (testing, and the start of Story Mode's "Burst start" item): each new player pawn (every gameplay
+    // segment spawns one) starts with the Burst gauge at least that full. Raised during the pawn's first 2 s, since the segment's
+    // script may set the gauge itself just after the spawn.
+    static const int kBurstStart = [] { const char* e = getenv("ASURA_BURSTSTART"); const int v = e ? atoi(e) : 0; return v < 0 ? 0 : v > 100 ? 100 : v; }();
+    if (!inv && !kLog && !fill && !kBurstStart) return;
     const uint32_t cls = rd32(self + kClassOff);
     static std::map<uint32_t, bool> isPlayer;
     auto it = isPlayer.find(cls);
     if (it == isPlayer.end()) it = isPlayer.emplace(cls, ue_obj_name(cls).rfind("BCPawn_Player", 0) == 0).first;
     if (!it->second) return;
-    if (kAutopilot) {
+    if (kBurstStart) {
+        static uint32_t pawn = 0; static uint64_t since = 0;
+        const uint64_t fr = gpu_frame_number();
+        if (self != pawn) { pawn = self; since = fr; }
+        const int vOff = ue_field_offset(cls, "MantraGaugeVal"), xOff = ue_field_offset(cls, "MantraGaugeValMax");
+        if (fr - since < 60 && vOff >= 0 && xOff >= 0 && readable(self + vOff, 4) && readable(self + xOff, 4)) {
+            const uint32_t rv = rd32(self + vOff), rx = rd32(self + xOff);
+            const bool isInt = rx < 0x10000u;                               // the maximum is 1000: as a float its bits are far above this
+            float cur, mx; if (isInt) { cur = (float)(int32_t)rv; mx = (float)(int32_t)rx; } else { memcpy(&cur, &rv, 4); memcpy(&mx, &rx, 4); }
+            const float want = mx * (float)kBurstStart / 100.0f;
+            if (mx > 0 && cur < want) {
+                uint32_t w; if (isInt) w = (uint32_t)(int32_t)want; else memcpy(&w, &want, 4);
+                wr32(self + vOff, w);
+                static uint32_t said = 0;
+                if (said != self) { said = self; fprintf(stderr, "[story] f=%llu %s: Burst gauge set to %d%% (%.0f of %.0f)\n", (unsigned long long)fr, ue_obj_name(self).c_str(), kBurstStart, want, mx); }
+            }
+        }
+        if (!inv && !kLog && !fill) return;
+    }
+    if (fill) {
         const int vOff = ue_field_offset(cls, "MantraGaugeVal"), xOff = ue_field_offset(cls, "MantraGaugeValMax");
         if (vOff >= 0 && xOff >= 0 && readable(self + vOff, 4) && readable(self + xOff, 4) && rd32(self + vOff) != rd32(self + xOff)) {
-            wr32(self + vOff, rd32(self + xOff));                         // same type as the maximum, int or float
-            static int nl = 0;
-            if (nl++ < 20) fprintf(stderr, "[autopilot] f=%llu Burst gauge filled\n", (unsigned long long)gpu_frame_number());
+            if (kAutopilot) {
+                wr32(self + vOff, rd32(self + xOff));                     // same type as the maximum, int or float
+                static int nl = 0;
+                if (nl++ < 20) fprintf(stderr, "[autopilot] f=%llu Burst gauge filled\n", (unsigned long long)gpu_frame_number());
+            } else {
+                // Story Mode's Mantra gauge QTE: filled at once at every poll, but only from 6 s after the QTE (qte_skip), so the punch
+                // exchange plays out first (filled straight away it was over almost as soon as it began: the user, 2026-11-22). Raising
+                // it a step a frame never filled it: the scene sets the gauge itself each frame (logs\rec_20261122_115831), so only a
+                // full gauge at every poll gets through.
+                const uint64_t fr = gpu_frame_number();
+                static std::map<uint32_t, uint64_t> saidOf;
+                if (fr - saidOf[self] > 90) {
+                    uint32_t rv = rd32(self + vOff); float cur; memcpy(&cur, &rv, 4);
+                    fprintf(stderr, "[qteskip] f=%llu %s: Burst gauge filled (was %.1f)\n", (unsigned long long)fr, ue_obj_name(self).c_str(), cur);
+                    saidOf[self] = fr;
+                }
+                wr32(self + vOff, rd32(self + xOff));
+            }
         }
         if (!inv && !kLog) return;
     }
@@ -484,6 +524,14 @@ static void button_enum_dump(uint32_t self) {
     fprintf(stderr, "[enum] %s: names not found\n", ue_obj_name(en).c_str());
 }
 
+// A QTE Story Mode leaves to the player (below) was updated in the last 0.5 s: xam.cpp then presses no combat prompt for it
+static std::atomic<uint64_t> g_manualMs{0};
+bool story_manual_recent() { const uint64_t t = g_manualMs.load(); return t && GetTickCount64() - t < 500; }
+// Episode 22's X/B choice that Story Mode answers (below) was updated in the last 0.3 s: the renderer hides its prompt
+static std::atomic<uint64_t> g_choiceMs{0};
+bool story_choice_active() { const uint64_t t = g_choiceMs.load(); return t && GetTickCount64() - t < 300; }
+bool story_choice_recent1s() { const uint64_t t = g_choiceMs.load(); return t && GetTickCount64() - t < 1000; }   // xenos.cpp: its pictures
+bool story_choice_recent() { const uint64_t t = g_choiceMs.load(); return t && GetTickCount64() - t < 3000; }   // xma.cpp: the chime's mute
 static bool qte_skip(uint32_t self, uint32_t lr) {
     if (lr == 0x82981250u && readable(self, 0x120)) button_enum_dump(self);
     if (lr != 0x82981250u || !story_qteskip() || !readable(self, 0x120)) return false;   // any action run by this native update (subclasses too)
@@ -510,6 +558,30 @@ static bool qte_skip(uint32_t self, uint32_t lr) {
             const uint64_t f = gpu_frame_number();
             if (!said.count(self) || f - said[self] > 300) fprintf(stderr, "[qteskip] f=%llu %08X %s: left to the player (no Success output: %s)\n", (unsigned long long)f, self, ue_obj_name(self).c_str(), outs.c_str());
             said[self] = f;
+            // Except episode 22's X/B prompt (BCSeqAct_ButtonDivergence, outputs Shot / Assult): Story Mode mashes X and B
+            // alternately (the user's call, 2026-11-22) from 0.3 s after the choice opens while it stays open
+            if (ue_obj_name(self).rfind("BCSeqAct_ButtonDivergence", 0) == 0 && outs.find("Shot") != std::string::npos && outs.find("Assult") != std::string::npos) {
+                struct Choice { uint64_t first = 0, seen = 0, pressed = 0; uint16_t button = 0; };
+                static std::map<uint32_t, Choice> choices;
+                static bool nextB = false;
+                const uint64_t now = GetTickCount64();
+                Choice& ch = choices[self];
+                if (!ch.seen || now - ch.seen > 2000) { ch = Choice(); ch.first = now; ch.button = nextB ? 0x2000 : 0x4000; nextB = !nextB; }
+                ch.seen = now;
+                g_choiceMs = now;                                           // the renderer hides its prompt (xenos.cpp, story_choice_active)
+                // X and B mashed alternately, about 10 presses a second (50 ms down): one press a second, one button per choice, let each
+                // choice time out into its failure (the user's run, logs\rec_20261122_124809 f=25583-25904: failure emblem and sound)
+                if (now - ch.first >= 300 && now - ch.pressed >= 100) {
+                    ch.pressed = now;
+                    void input_press_at(uint16_t buttons, uint32_t delayMs, uint32_t holdMs);
+                    input_press_at(ch.button, 0, 50);
+                    static int nl = 0;
+                    if (nl++ < 40) fprintf(stderr, "[qteskip] f=%llu %08X %s: choice pressed %s\n", (unsigned long long)f, self, ue_obj_name(self).c_str(), ch.button == 0x2000 ? "B (Assult)" : "X (Shot)");
+                    ch.button = ch.button == 0x2000 ? 0x4000 : 0x2000;
+                }
+                return false;
+            }
+            g_manualMs = GetTickCount64();
             return false;
         }
     }
@@ -537,7 +609,7 @@ static bool qte_skip(uint32_t self, uint32_t lr) {
                 static std::map<uint32_t, uint64_t> said;
                 const uint64_t f = gpu_frame_number();
                 if (!said.count(self) || f - said[self] > 300) fprintf(stderr, "[qteskip] f=%llu %08X %s: left to the player (no time limit, buttons hidden)\n", (unsigned long long)f, self, ue_obj_name(self).c_str());
-                said[self] = f;
+                said[self] = f; g_manualMs = GetTickCount64();
                 return false;
             }
         }
@@ -583,7 +655,30 @@ static bool qte_skip(uint32_t self, uint32_t lr) {
     // native update sets itself after its end-of-QTE work (vtable+400/+404, sub_82980ED8). Setting it here skipped that work and
     // left effects frozen after the QTE (the fire splatter after the B mash, the arm effect on Asura in the last stick QTE).
     wr32(self + 0xC4, (rd32(self + 0xC4) & ~0x10000000u) | 0x24800000u);
+    {   // No success sound: episode 22's boss QTEs (the hidden Devanagari medallions, xenos.cpp) still played the QTE success chime when
+        // passed (the user, 2026-11-22). BCSeqAct_InputDivergence.bUseSuccessSE is cleared first; other QTEs were already silent.
+        static std::map<uint32_t, std::pair<int, uint32_t>> se;
+        const uint32_t cls = rd32(self + kClassOff);
+        auto it = se.find(cls);
+        if (it == se.end()) { uint32_t m = 0; const int o = ue_field_offset(cls, "bUseSuccessSE", &m); it = se.emplace(cls, std::make_pair(o, m)).first; }
+        if (it->second.first > 0 && it->second.second) wr32(self + it->second.first, rd32(self + it->second.first) & ~it->second.second);
+    }
     fprintf(stderr, "[qteskip] f=%llu %08X %s: Success after %.2f s (limit %.2f, presses %u)\n", (unsigned long long)gpu_frame_number(), self, ue_obj_name(self).c_str(), wait * kScale, limit, presses);
+    // A Mantra gauge QTE (mash B, each press adds MantraAmount to the Burst gauge; done at SuccessfulMantraGauge): the scene after it
+    // goes on only once the gauge is full and the player BURSTs, so passing the action alone left episode 22's punch exchange with
+    // Chakravartin repeating for ever (the user's run, logs\rec_20261122_110058 f=26059 on). The player's gauge is filled as well
+    // (player_health, after 5 or 6 s of the exchange); the BURST itself stays the player's, like every BURST.
+    if (ue_obj_name(self).find("MantraGauge") != std::string::npos) {
+        // 5 s for the first exchange of a fight and 6 s after it (the user's call, 2026-11-22: episode 22 has two, ~30 s apart); a
+        // new fight is one more than 2 minutes after the last exchange. Then the gauge is kept full for 2 s (player_health).
+        static uint64_t lastAt = 0;
+        const uint64_t fr = gpu_frame_number();
+        const uint64_t wait = (!lastAt || fr - lastAt > 3600) ? 150 : 180;
+        lastAt = fr;
+        g_mantraFillFrom = fr + wait;
+        g_mantraFillUntil = fr + wait + 60;
+        fprintf(stderr, "[qteskip] f=%llu Mantra gauge QTE: filling the Burst gauge\n", (unsigned long long)gpu_frame_number());
+    }
     return true;
 }
 
@@ -655,7 +750,7 @@ PPC_FUNC(sub_82260F60) {
         if (kProps && (!dumped.count(tSelf) || f - dumped[tSelf] > 300)) ue_dump_props(tSelf, "mash");
         if (kProps) dumped[tSelf] = f;
     }
-    uint32_t mashFull = 0;                                                  // a tug-of-war node's ParamForFade to set to 2 after this event
+    uint32_t mashFull = 0; float mashTop = 2.0f;                                                 // a tug-of-war node's ParamForFade to set to 2 after this event
     // Story Mode's tug of war: the meter is the blend node's ParamForFade (BCAnim_FadeByButtonRep, a BCAnim_FadeByParam; one node per
     // character), which the node's CalcParam (sent from 82947280 each frame) raises by AdditionWeightByPush (0.08) a press and lets
     // decay without them; the tug of war is won when it reaches the success child's value (2; it starts at StartPoint, 0.2; logs\st5g).
@@ -688,15 +783,24 @@ PPC_FUNC(sub_82260F60) {
                 double dt = (now.QuadPart - it->second.t.QuadPart) / kQpf;
                 if (dt > 0.1) dt = 0.1;
                 it->second.t = now;
+                // The top: the meter's step count, BCAnim_FadeByParam.Constraints.Num() (2 in episodes 5 and 11 and most of 22; episode
+                // 22's last tug of war has 4 steps, 0 to 3, and stuck at the old fixed 2.0 for ever: logs\rec_20261122_122628 f=28300)
+                float top = 2.0f;
+                {
+                    static std::map<uint32_t, int> cOff;
+                    auto ci = cOff.find(cls);
+                    if (ci == cOff.end()) ci = cOff.emplace(cls, ue_field_offset(cls, "Constraints")).first;
+                    if (ci->second > 0) { const uint32_t n = rd32(tSelf + ci->second + 4); if (n >= 2 && n <= 8) top = (float)n; }
+                }
                 it->second.v = std::max(it->second.v, cur) + (float)(0.4 * dt);
-                if (it->second.v > 2.0f) it->second.v = 2.0f;
+                if (it->second.v > top) it->second.v = top;
                 uint32_t u; memcpy(&u, &it->second.v, 4); wr32(tSelf + po, u);
-                if (it->second.v >= 2.0f) mashFull = tSelf + po;          // full: also written after the script (it holds the value under 2 without a press)
+                if (it->second.v >= top) { mashFull = tSelf + po; mashTop = top; }          // full: also written after the script (it holds the value under 2 without a press)
             }
         }
     }
     struct HealthAfter { uint32_t self; ~HealthAfter() { player_health(self, "after"); } } healthAfter{tSelf};   // also on every return path
-    struct MashFull { uint32_t a; ~MashFull() { if (a) wr32(a, 0x40000000u); } } mashFullAfter{mashFull};   // 2.0f, after the script
+    struct MashFull { uint32_t a; float top; ~MashFull() { if (a) { uint32_t u; memcpy(&u, &top, 4); wr32(a, u); } } } mashFullAfter{mashFull, mashTop};   // the top, after the script
     // The Scaleform movie Story Mode looks after, by class (cached per class object, so this costs a lookup per event, not a name)
     static std::map<uint32_t, int> kinds;                                   // 2 BCGFxUI_Advertise, 0 anything else
     const uint32_t tCls = readable(tSelf, 0x40) ? rd32(tSelf + kClassOff) : 0;

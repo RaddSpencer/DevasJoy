@@ -2494,7 +2494,7 @@ static void splash_override(std::vector<uint8_t>& out) {
 // A QTE prompt is a handful of UI draws whose textures are fixed for each kind of prompt (the button icon, the crest, the ring). A texture
 // in the table below marks the prompt it belongs to while it is drawn; at each swap the frame's set is published, and xam.cpp adds the
 // answer to the pad state (qte_active). Hashes are the texture content hash as draws_<frame>.txt shows it (64-bit hash folded to 32).
-enum : uint32_t { QTE_A = 1, QTE_B = 2, QTE_X = 4, QTE_Y = 8, QTE_LT = 16, QTE_RT = 32, QTE_LS = 64, QTE_RS = 128, QTE_ROTATE = 256 };
+enum : uint32_t { QTE_A = 1, QTE_B = 2, QTE_X = 4, QTE_Y = 8, QTE_LT = 16, QTE_RT = 32, QTE_LS = 64, QTE_RS = 128, QTE_ROTATE = 256, QTE_YC = 512 /* the combat Y medallion: Story Mode presses it (xam.cpp) */ };
 // LS/RS without the rotate arrows: push that stick down (episode 1's "push both sticks down"). With them: circle the stick.
 // The UI textures sit at fixed addresses; LS and RS also share a content hash (the hash samples one dword in eight), so both are matched.
 struct QteTex { uint32_t addr, hash, action; const char* name; };
@@ -2512,7 +2512,7 @@ static const QteTex kQteTex[] = {                                           // f
     { 0x014FA000, 0xDF3D91A4, QTE_Y, "Y" },
     // the combat Y prompt (a gold medallion over a stunned enemy): its Y icon, 128x128 DXT5 at 014D2000, dump 423147C3DFD0039C
     // (the user's episode 16 run, logs\rec_20261122_105305 [mashtex] at f=3248, on screen 3255-3268; answered in rec_20261122_105600)
-    { 0x014D2000, 0x557DF1F3, QTE_Y, "Y" },
+    { 0x014D2000, 0x557DF1F3, QTE_Y | QTE_YC, "Y" },
 };
 static std::atomic<uint32_t> g_qteActive{0};
 static uint32_t g_qteFrame = 0;
@@ -2525,6 +2525,9 @@ static uint32_t g_qteFrame = 0;
 // on screen can only be a BURST prompt.
 static const bool kHidePrompts = [] { const char* e = getenv("ASURA_BURSTAUTO"); return e && *e && strcmp(e, "0") != 0; }();
 static bool g_hideDraw = false;
+static bool g_bossFrame = false, g_bossPrev = false;                        // episode 22's boss prompt drawn in this / the previous frame
+static std::atomic<uint64_t> g_bossMs{0};                                   // when one was last drawn (GetTickCount64)
+bool boss_prompt_recent() { const uint64_t t = g_bossMs.load(); return t && GetTickCount64() - t < 3000; }   // xma.cpp: the chime's mute
 static bool g_mashBurst = false;                                            // a tug of war has shown its RT BURST prompt (qte_note_texture)
 static void qte_note_texture(uint32_t base, uint64_t hash, uint32_t fmt, uint32_t w, uint32_t h2, bool ui, bool white) {
     const uint32_t h = (uint32_t)(hash ^ (hash >> 32));
@@ -2550,13 +2553,13 @@ static void qte_note_texture(uint32_t base, uint64_t hash, uint32_t fmt, uint32_
     const bool mashRecent = story_mash_recent();
     if (!mashRecent) mashBurst = false;
     for (const QteTex& q : kQteTex)
-        if ((q.addr == base && (q.hash == 0 || q.hash == h)) || ((kHidePrompts || hideMash) && q.action != QTE_Y && q.hash && q.hash == h)) {
-            if (q.action == QTE_Y) { g_qteFrame |= q.action; continue; }       // noted for xam.cpp, never hidden here (the Y icon's own rule is below)
+        if ((q.addr == base && (q.hash == 0 || q.hash == h)) || ((kHidePrompts || hideMash) && !(q.action & QTE_Y) && q.hash && q.hash == h)) {
+            if (q.action & QTE_Y) { g_qteFrame |= q.action; continue; }       // noted for xam.cpp, never hidden here (the Y icon's own rule is below)
             g_qteFrame |= q.action;
             if (q.action == QTE_RT && mashRecent && !kHidePrompts && !mashBurst) { mashBurst = true; fprintf(stderr, "[qte] f=%llu tug of war: RT BURST prompt, shown and left to the player\n", (unsigned long long)g_frame); }
             if (kHidePrompts || (hideMash && !mashBurst)) g_hideDraw = true;
         }
-    if (kHidePrompts && (g_qteFrame & ~QTE_Y) && fmt == 20 && ((w == 128 && h2 == 128) || (w == 512 && h2 == 128) || (w == 1024 && h2 == 1024))) g_hideDraw = true;
+    if (kHidePrompts && (g_qteFrame & ~(QTE_Y | QTE_YC)) && fmt == 20 && ((w == 128 && h2 == 128) || (w == 512 && h2 == 128) || (w == 1024 && h2 == 1024))) g_hideDraw = true;
     // Story Mode answering a tug of war (uescript.cpp story_mash_recent): its meter is the HUD's own gauge (the action feeds the Mantra
     // gauge: bNotSynchronizeMantraGauge false, AdditionalMantraAmount 0.02), drawn by Scaleform from DXT5 (fmt 20) pictures: the gold
     // ornament sheet 512x512, fire sheets 512x256 / 128x256 / 1024x512, the prompt's B states, emblem, circle and glow at 128x128 / 64x64,
@@ -2564,12 +2567,49 @@ static void qte_note_texture(uint32_t base, uint64_t hash, uint32_t fmt, uint32_
     // runs, so every Scaleform DXT5 picture is left out while it lasts except font pages (white wherever not transparent: HostTex::white),
     // so subtitles stay. Going by size alone missed the 256x256 burn sheets (the user's episode 11 run, rec_20261115_183431_2.mp4 0:59).
     if (ui && fmt == 20 && mashRecent && !mashBurst && !white) g_hideDraw = true;
+    // The same while Story Mode answers episode 22's X/B choice (uescript.cpp story_choice_active): its medallions, buttons and circles
+    // go, subtitles stay (the user, 2026-11-22)
+    bool story_choice_active();
+    if (ui && fmt == 20 && !white && story_choice_active()) g_hideDraw = true;
+    {   // its own pictures whatever shader draws them, while it is open and for 1 s after: the B/X icons, ornaments, circles and the press
+        // flash still showed (the red B at f=26791 and 26876, logs\rec_20261122_133826; textures from the X/B capture f9_22996)
+        bool story_choice_recent1s();
+        static const uint32_t kChoice[] = { 0x7358E170u, 0x557DF1F3u, 0xA0467C6Bu, 0xC616B372u, 0x02CB6CDCu, 0x9DA45AA1u, 0x4E25A304u, 0xF741C256u };
+        if (std::find(std::begin(kChoice), std::end(kChoice), h) != std::end(kChoice) && story_choice_recent1s()) g_hideDraw = true;
+    }
+    // And for 1.5 s after one of episode 22's boss prompts: the boss's own QTEs end in a success or failure emblem (the black splatter at
+    // f=28945, the user's run logs\rec_20261122_133826), drawn once the medallion has gone. Subtitles (font pages) stay.
+    {
+        bool story_qteskip();
+        const uint64_t bt = g_bossMs.load();
+        if (ui && fmt == 20 && !white && bt && GetTickCount64() - bt < 1500 && story_qteskip()) g_hideDraw = true;
+    }
     // Story Mode with its prompts hidden (hooks.cpp synchronic_hide_enabled): the Y prompt icon (128x128 DXT5 at 014FA000 among the QTE
     // prompt icons, folded content hash DF3D91A4) is left out. A Synchronic track shows it before Story Mode can hide the track's
     // prompt, and nothing that runs afterwards takes it off (it stayed for the rest of the scene: the user's episode 3 run,
     // logs\rec_20261113_142416_2.mp4 at 0:46). Every other Y prompt is a QTE's, and Story Mode answers those without a prompt anyway.
     bool synchronic_hide_enabled();
     if (h == 0xDF3D91A4u && synchronic_hide_enabled()) g_hideDraw = true;
+    // Story Mode: episode 22's boss prompts (a red Devanagari letter on an ornate medallion, for QTEs Story Mode passes anyway) are left
+    // out. Their Scaleform pictures by content hash, all first drawn at the first boss prompt (the user's run, logs\rec_20261122_112050
+    // [mashtex] f=21761-21935, marks 1-6): the ornament, its black backing and glow (256x256), the letters (96x100, 120x120) and the
+    // lotus (128x44). While one was drawn in the previous frame, the faint button circles around it (128x128, shared with the combat
+    // prompts, so only then) go too. ASURA_BOSSHIDE=0 keeps them.
+    {
+        static const bool kBossHide = [] { const char* e = getenv("ASURA_BOSSHIDE"); return !e || atoi(e) != 0; }();
+        static const uint64_t kBoss[] = { 0x01B121DCE79B255Dull, 0x16FBC54B37D163B1ull, 0x70415191AE185B7Eull, 0xA8A3DDBF28B73879ull,
+                                          0xA995243BAA6A564Full, 0xC438BFCB45354102ull, 0xA5478B82E1D0ED9Aull };
+        bool story_qteskip();
+        if (kBossHide && ui && story_qteskip()) {
+            if (std::find(std::begin(kBoss), std::end(kBoss), hash) != std::end(kBoss)) { g_bossFrame = true; g_hideDraw = true; }
+            // with them: the button circles, the gray flame (1024x512 sheet) and the flash (1024x1024, the BURST prompt's too); seen
+            // left over beside the hidden medallion at f=22868 (the user's run, logs\rec_20261122_122628)
+            else if (g_bossPrev && (hash == 0xCC6068FA8245CBFEull || hash == 0xF38A8EE504CB4CB3ull || hash == 0xE9455A62A1BBE4B3ull || hash == 0x16799D79086AAB4Bull)) g_hideDraw = true;
+            // and the boss's mash prompt's effects (the burst at each press and its rings, folded hashes as draws_<frame>.txt shows them:
+            // the user's capture f9_30578, prompt on screen 30430-30585)
+            else if (g_bossPrev && (h == 0x3B47C236u || h == 0x174F53FEu || h == 0x6FFC018Bu || h == 0x9DA45AA1u)) g_hideDraw = true;
+        }
+    }
 }
 static void qte_publish() {                                                 // at the swap
     static uint32_t last = 0;
@@ -2580,6 +2620,9 @@ static void qte_publish() {                                                 // a
         qte_judge_dump(why);
     }
     last = g_qteFrame;
+    if (g_bossFrame != g_bossPrev) fprintf(stderr, "[qte] frame %llu: boss prompt %s\n", (unsigned long long)g_frame, g_bossFrame ? "on screen (hidden)" : "gone");
+    if (g_bossFrame) g_bossMs = GetTickCount64();
+    g_bossPrev = g_bossFrame; g_bossFrame = false;
     g_qteActive = g_qteFrame;
     g_qteFrame = 0;
 }

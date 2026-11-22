@@ -35,7 +35,32 @@ struct Ctx {
     uint32_t lastOffset = 0xFFFFFFFFu;  // the input read offset we last wrote: anything else means the game moved it
     uint32_t skipBits = 0;              // after a loop: the loop start, so the next packet drops the samples before it
     uint64_t packets = 0, blocks = 0;
+    bool muted = false;                 // this sound is decoded but played silent (snd_muted)
 };
+// Sounds by content: the hash of a buffer's first 2 KB packet, the same wherever the game loads it.
+//   ASURA_SNDLOG=1 logs each buffer start with its hash ([snd]), to find a sound by when it plays.
+//   Story Mode silences episode 22's boss QTE success chime (the user, 2026-11-22: the medallions are hidden, xenos.cpp, but the chime
+//   still played when Story Mode passed them) while a boss prompt was on screen in the last 3 s (boss_prompt_recent) or a tug of war it filled has just ended.
+//   ASURA_MUTESND=<hash>[,<hash>...] silences those sounds the same way (to try one).
+static uint64_t snd_hash(const uint8_t* p) {
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (int i = 0; i < 2048; i += 8) { uint64_t v; memcpy(&v, p + i, 8); h = (h ^ v) * 0x100000001B3ull; }
+    return h;
+}
+static bool snd_muted(uint64_t h) {
+    static const std::vector<uint64_t> kList = [] {
+        // the QTE success chime, two layers that always start together (the user's F8 marks 10-22 frames after each pair, episode
+        // 22's boss and its tug of war: logs\rec_20261122_124809 f=22952, 24557, 24734, 24788, 24824)
+        std::vector<uint64_t> v = { 0x0EECA40444880D13ull, 0xC72B01610CA36EDFull,
+                                    0x0699BF07FA295094ull };   // and the boss QTE failure sound (logs\rec_20261122_133826 f=28944)
+        if (const char* e = getenv("ASURA_MUTESND")) for (const char* p = e; *p;) { char* x; const uint64_t t = _strtoui64(p, &x, 16); if (x == p) break; v.push_back(t); p = (*x == ',') ? x + 1 : x; }
+        return v;
+    }();
+    if (std::find(kList.begin(), kList.end(), h) == kList.end()) return false;
+    bool boss_prompt_recent(); bool story_qteskip(); bool story_mash_recent();
+    bool story_choice_recent();
+    return story_qteskip() && (boss_prompt_recent() || story_mash_recent() || story_choice_recent());   // and as a tug of war Story Mode filled ends, and around the X/B choice it answers
+}
 static Ctx g_xma[kContexts];
 static std::mutex g_lock;
 static const bool kXmaLog = getenv("ASURA_XMALOG") != nullptr;   // each buffer started, looped and handed back, and every kick, lock and clear
@@ -155,11 +180,18 @@ static void work(uint32_t i) {
             cupdate(i, 2, 0x3FFFFFF, 32); c.lastOffset = 32;
             continue;
         }
+        if (packet == 0) {
+            static const bool kSndLog = getenv("ASURA_SNDLOG") != nullptr;
+            const uint64_t h = snd_hash(g_base + gpu_phys_to_host(base));
+            c.muted = snd_muted(h);
+            if (kSndLog || c.muted) fprintf(stderr, "[snd] f=%llu ctx %u start %016llX packets %u ch %d%s\n", (unsigned long long)xma_log_frame(), i, (unsigned long long)h, count, channels, c.muted ? " (muted)" : "");
+        }
         if (kXmaLog && packet == 0)
             fprintf(stderr, "[xmalog] f=%llu ctx %u start buf %u at %08X packets %u loops %u loop %u-%u ch %d rate %d\n", (unsigned long long)xma_log_frame(), i, cur, base, count,
                     (w0 >> 12) & 0xFF, cget(i, 3) & 0x3FFFFFF, w4 & 0x3FFFFFF, channels, rate);
         const size_t before = c.pending.size();
         dec_packet(c, g_base + gpu_phys_to_host(base) + packet * 2048);
+        if (c.muted) std::fill(c.pending.begin() + before, c.pending.end(), (int16_t)0);
         c.packets++;
         offset = (packet + 1) * 2048 * 8 + 32;
         // hardware looping: from loop end back to loop start, loop count times (255 = for ever)

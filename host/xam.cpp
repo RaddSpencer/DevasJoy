@@ -221,11 +221,31 @@ static void qte_from_icons(QteAnswer& a) {                                  // t
 static void qte_apply(uint32_t st) {
     static const char* kMode = [] { const char* e = getenv("ASURA_AUTOQTE"); return (e && *e && strcmp(e, "0") != 0) ? e : (const char*)nullptr; }();   // "0" means off
     static const bool kSkip = [] { const char* e = getenv("ASURA_BURSTAUTO"); return e && *e && strcmp(e, "0") != 0; }();
-    bool story_qteskip(); bool story_mash_active();
+    bool story_qteskip(); bool story_mash_active(); bool story_mash_recent();
     // Story Mode: a tug-of-war prompt (uescript.cpp). Its meter is filled directly there, with no presses (each press played its
     // sound); ASURA_MASHPRESS=1 presses its buttons here instead, as first done.
     static const bool kMashPress = [] { const char* e = getenv("ASURA_MASHPRESS"); return e && *e && strcmp(e, "0") != 0; }();
     const bool mash = story_qteskip() && story_mash_active() && (kMashPress || kMode);
+    // Story Mode: the combat prompts (a gold medallion over an enemy, Y or B at random) are not QTE actions, so the skip never saw them
+    // (episode 22's boss, the user's run logs\rec_20261122_121049 f=14655). Pressed from their icons: the combat Y (QTE_YC, not the
+    // QTE/Synchronic Y icon, which episode 22 draws all the time) and B; not while a QTE Story Mode leaves to the player is up
+    // ("Shut Wyzen Up" and the like, uescript.cpp story_manual_recent) or a Synchronic track plays.
+    if (!kMode && !kSkip && !mash && story_qteskip()) {
+        bool story_manual_recent(); bool synchronic_hiding();
+        const uint32_t m = qte_active();
+        // nor during a tug of war, which Story Mode fills without presses (each press plays its sound: the B pressed at episode 22's
+        // f=20711, logs\rec_20261122_122628, was heard)
+        if (!(m & (512 | 2)) || story_manual_recent() || synchronic_hiding() || story_mash_active() || story_mash_recent()) return;
+        QteAnswer s;
+        if (m & 512) s.buttons |= 0x8000;
+        if (m & 2) s.buttons |= 0x2000;
+        if ((GetTickCount64() / 50) % 2 == 0) wr16(st + 4, rd16(st + 4) | s.buttons);
+        static uint32_t packet = 0x50000000;
+        wr32(st, ++packet);
+        static uint16_t lastB = 0;
+        if (s.buttons != lastB) { LOG("[story] combat prompt: pressing %s%s\n", (s.buttons & 0x8000) ? "Y" : "", (s.buttons & 0x2000) ? "B" : ""); lastB = s.buttons; }
+        return;
+    }
     if (!kMode && !kSkip && !mash) return;
     if (!kMode && !mash && story_qteskip() && story_mash_active()) return;  // ASURA_BURSTAUTO during a tug of war: nothing pressed either
     static const bool kIconsOnly = kMode ? !strcmp(kMode, "icons") : false;
