@@ -18,7 +18,7 @@
 #include "gpu.h"
 #include <windows.h>
 #include <d3d11_1.h>
-#include <dxgi1_5.h>
+#include <dxgi1_6.h>
 #include "shaderpack.h"
 #include "shaderindex.h"
 #include "paths.h"
@@ -205,7 +205,7 @@ static uint64_t g_draws = 0, g_resolves = 0, g_drawsFrame = 0;
 // Alt+Enter or F11: windowed fullscreen. BCR2_DISPLAY=window|borderless picks the starting mode. (Exclusive fullscreen was removed.)
 enum DisplayMode { kWindowed = 0, kBorderless = 1, kExclusive = 2 };
 static std::atomic<int> g_modeWanted{kWindowed};
-static std::atomic<bool> g_sizeChanged{false};
+static std::atomic<bool> g_sizeChanged{getenv("ASURA_BACKBUFFER") != nullptr};   // a forced back buffer size applies from the start
 static int g_modeNow = kWindowed;
 int gpu_display_mode() { return g_modeWanted.load(); }
 void gpu_set_display_mode(int mode) { g_modeWanted = mode <= 0 ? kWindowed : kBorderless; }   // exclusive fullscreen was removed: it misbehaved when switching back to a window
@@ -449,6 +449,9 @@ static UINT pulldown_interval() {
     return (UINT)n;
 }
 
+// Laptop drivers (NVIDIA Optimus, AMD switchable graphics) run an exe on the discrete GPU when it exports these.
+extern "C" { __declspec(dllexport) DWORD NvOptimusEnablement = 1; __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1; }
+
 static bool device_init() {
     if (g_trace == 0) if (const char* t = getenv("ASURA_GPUTRACE")) g_trace = atoi(t);
     HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -461,8 +464,28 @@ static bool device_init() {
     if (gpu_vrr()) { sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING; g_swapFlags = sd.Flags; g_tearing = true; }
     fprintf(stderr, "[vrr] %s, present with tearing allowed: %s\n", gpu_vrr() ? "variable refresh pacing" : "fixed refresh pacing", g_tearing ? "yes" : "no");
     D3D_FEATURE_LEVEL want[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 }, got;
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, want, 2, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, &got, &g_ctx);
-    if (FAILED(hr)) hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, want + 1, 1, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, &got, &g_ctx);
+    // The GPU: the high-performance one (DXGI's preference order), not whatever is adapter 0. On a machine with integrated graphics
+    // as well as a discrete card, the default adapter can be the integrated one. ASURA_ADAPTER=<n> picks the n-th in that order.
+    ComPtr<IDXGIAdapter1> adapter;
+    {
+        ComPtr<IDXGIFactory6> f6;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&f6)))) {
+            const UINT pick = getenv("ASURA_ADAPTER") ? (UINT)atoi(getenv("ASURA_ADAPTER")) : 0;
+            for (UINT i = 0;; i++) {
+                ComPtr<IDXGIAdapter1> a;
+                if (FAILED(f6->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&a)))) break;
+                DXGI_ADAPTER_DESC1 ad{}; a->GetDesc1(&ad);
+                char name[128]; WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, name, sizeof name, nullptr, nullptr);
+                const bool sw = (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+                fprintf(stderr, "[gfx] adapter %u: %s, %llu MB video memory%s%s\n", i, name, (unsigned long long)(ad.DedicatedVideoMemory >> 20), sw ? " (software)" : "", i == pick ? " <- used" : "");
+                if (i == pick && !sw) adapter = a;
+            }
+        }
+    }
+    const D3D_DRIVER_TYPE dt = adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE;   // an explicit adapter needs UNKNOWN
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(adapter.Get(), dt, nullptr, 0, want, 2, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, &got, &g_ctx);
+    if (FAILED(hr)) hr = D3D11CreateDeviceAndSwapChain(adapter.Get(), dt, nullptr, 0, want + 1, 1, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, &got, &g_ctx);
+    if (FAILED(hr) && adapter) hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, want, 2, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, &got, &g_ctx);
     if (FAILED(hr)) { fprintf(stderr, "[gfx] D3D11 device creation failed: %08lX; running without rendering\n", hr); return false; }
     g_featureLevel = got;
     g_ctx.As(&g_ctx1);
@@ -3293,6 +3316,61 @@ static void draw_ring_dump(const char* dir) {
     }
     fclose(f);
 }
+// ASURA_GPUPROF=1 (debug): GPU time per frame and per stretch of work, by D3D11 timestamp queries. A mark starts a new stretch with
+// a label: each render-target change (colour base / format / size and depth base), each resolve, the present pass. Results are read
+// back 4 frames later without waiting; every 300 frames the average GPU ms per frame and the labels that took the most are logged
+// ([gpuprof]). For finding what costs the GPU at a high internal resolution.
+static const bool kGpuProf = [] { const char* e = getenv("ASURA_GPUPROF"); return e && *e && strcmp(e, "0") != 0; }();
+struct GpuProfFrame { ComPtr<ID3D11Query> disjoint; std::vector<std::pair<ComPtr<ID3D11Query>, std::string>> marks; size_t used = 0; bool open = false; };
+static GpuProfFrame g_gp[5];
+static int g_gpCur = 0;
+static std::map<std::string, double> g_gpAcc;
+static double g_gpTotal = 0; static int g_gpFrames = 0, g_gpLate = 0;
+static void gpuprof_mark(const std::string& label) {
+    if (!kGpuProf || !g_dev) return;
+    GpuProfFrame& f = g_gp[g_gpCur];
+    if (!f.open) return;
+    if (f.used >= 2000) return;
+    if (f.used == f.marks.size()) { D3D11_QUERY_DESC qd{ D3D11_QUERY_TIMESTAMP, 0 }; ComPtr<ID3D11Query> q; g_dev->CreateQuery(&qd, &q); f.marks.push_back({ q, "" }); }
+    f.marks[f.used].second = label;
+    g_ctx->End(f.marks[f.used].first.Get());
+    f.used++;
+}
+static void gpuprof_frame() {                                               // at each swap: close this frame, read an old one, open the next
+    if (!kGpuProf || !g_dev) return;
+    GpuProfFrame& cur = g_gp[g_gpCur];
+    if (cur.open) { gpuprof_mark("(end)"); g_ctx->End(cur.disjoint.Get()); cur.open = false; }
+    g_gpCur = (g_gpCur + 1) % 5;
+    GpuProfFrame& f = g_gp[g_gpCur];                                       // the oldest: started 4 frames ago
+    if (f.used) {
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{};
+        if (g_ctx->GetData(f.disjoint.Get(), &dj, sizeof dj, D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) g_gpLate++;
+        else if (!dj.Disjoint && dj.Frequency) {
+            std::vector<UINT64> t(f.used);
+            bool ok = true;
+            for (size_t i = 0; i < f.used && ok; i++) ok = g_ctx->GetData(f.marks[i].first.Get(), &t[i], sizeof(UINT64), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+            if (ok) {
+                const double k = 1000.0 / (double)dj.Frequency;
+                for (size_t i = 0; i + 1 < f.used; i++) g_gpAcc[f.marks[i].second] += (double)(t[i + 1] - t[i]) * k;
+                g_gpTotal += (double)(t[f.used - 1] - t[0]) * k; g_gpFrames++;
+            } else g_gpLate++;
+        }
+    }
+    if (g_gpFrames >= 300) {
+        std::vector<std::pair<double, std::string>> v;
+        for (auto& [l, ms] : g_gpAcc) v.push_back({ ms / g_gpFrames, l });
+        std::sort(v.rbegin(), v.rend());
+        std::string out;
+        for (size_t i = 0; i < v.size() && i < 12; i++) { char b[160]; snprintf(b, sizeof b, "\n[gpuprof]   %6.2f ms  %s", v[i].first, v[i].second.c_str()); out += b; }
+        fprintf(stderr, "[gpuprof] frame=%llu scale=%u: GPU %.2f ms a frame (avg of %d; %d not ready)%s\n", (unsigned long long)g_frame, g_resScale, g_gpTotal / g_gpFrames, g_gpFrames, g_gpLate, out.c_str());
+        g_gpAcc.clear(); g_gpTotal = 0; g_gpFrames = 0; g_gpLate = 0;
+    }
+    if (!f.disjoint) { D3D11_QUERY_DESC qd{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 }; g_dev->CreateQuery(&qd, &f.disjoint); }
+    f.used = 0; f.open = true;
+    g_ctx->Begin(f.disjoint.Get());
+    gpuprof_mark("(frame start)");
+}
+
 static void do_resolve();
 static void sync_depth_alias(Rt* depth, uint32_t base, uint32_t pitch);
 static void sync_color_alias(Rt* r, uint32_t base, uint32_t fmt, uint32_t pitch);
@@ -3673,6 +3751,11 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         g_ctx->PSSetShaderResources(0, 32, nul);
         { PerfScope t(g_sRt); g_ctx->OMSetRenderTargets(4, rtvs, dsv); }
         memcpy(g_curRtv, rtvs, sizeof(rtvs)); g_curDsv = dsv;
+        if (kGpuProf) {
+            char b[96]; const uint32_t c0 = g_regs[R_COLOR_INFO];
+            snprintf(b, sizeof b, "draw c%03X/f%u %ux%u d%03X", rtvs[0] ? (c0 & 0xFFF) : 0xFFF, rtvs[0] ? (c0 >> 16) & 0xF : 0, rw, rh, dsv ? (g_regs[R_DEPTH_INFO] & 0xFFF) : 0xFFF);
+            gpuprof_mark(b);
+        }
     }
 
     DP(2);
@@ -4556,6 +4639,7 @@ static void sync_color_alias(Rt* r, uint32_t base, uint32_t fmt, uint32_t pitch)
 }
 
 static void do_resolve() {
+    if (kGpuProf) gpuprof_mark("resolve");
     g_resolves++;
     uint32_t cc = g_regs[R_COPY_CONTROL], surf = g_regs[R_SURFACE_INFO], pitch = surf & 0x3FFF;
     uint32_t srcSel = cc & 7, cmd = (cc >> 20) & 3;
@@ -5073,6 +5157,12 @@ static void update_display() {
     if (!g_sizeChanged.exchange(false)) return;
     RECT rc{}; GetClientRect(g_hwnd, &rc);
     uint32_t w = (uint32_t)(rc.right - rc.left), h = (uint32_t)(rc.bottom - rc.top);
+    {   // ASURA_BACKBUFFER=<w>x<h>: the back buffer at that size whatever the window is (the compositor scales it to the window).
+        // For measuring a 4K output on a smaller display; also used when minimised, so a test run pays the full output cost.
+        static uint32_t fw = 0, fh = 0;
+        static const bool kForce = [] { const char* e = getenv("ASURA_BACKBUFFER"); return e && sscanf(e, "%ux%u", &fw, &fh) == 2 && fw >= 64 && fh >= 64 && fw <= 7680 && fh <= 4320; }();
+        if (kForce) { w = fw; h = fh; }
+    }
     if (w == 0 || h == 0 || (w == g_backW && h == g_backH)) return;         // minimised, or nothing to do
     ID3D11RenderTargetView* none = nullptr;
     g_ctx->OMSetRenderTargets(1, &none, nullptr);
@@ -5135,6 +5225,7 @@ void funcprof_frame(uint64_t frame);   // funcprof.cpp (profiling build only)
 void physwatch_tick();                  // hooks.cpp (ASURA_PHYSWATCH)
 static void do_swap(uint32_t front) {
     funcprof_frame(g_frame);
+    if (kGpuProf) gpuprof_mark("present / swap");
     physwatch_tick();
     qte_publish();
     {   // ASURA_DUMPONPROMPT=1: trace (as ASURA_DUMPFRAME) the frame after a prompt icon first shows, once
@@ -5322,6 +5413,7 @@ static void do_swap(uint32_t front) {
         track_output();
         note_display_stats(presented, g_frame);
     }
+    gpuprof_frame();
     {
         static LARGE_INTEGER last{}; static uint64_t lastFrame = 0, lastDraws = 0, lastRes = 0;
         LARGE_INTEGER now; QueryPerformanceCounter(&now);

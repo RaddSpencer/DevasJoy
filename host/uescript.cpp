@@ -446,7 +446,46 @@ static void player_health(uint32_t self, const char* when) {
 // (done) in the flags word at +0xC4, and the native update then ends the action (Deactivated, StopShowButtonAll). Here Update is not
 // run at all: "Success" is fired and the flags set as on success. Output links: TArray at +0x78 of 0x2C-byte entries {Links TArray,
 // LinkDesc FString at +0x0C, bits at +0x18 (top bit: impulse)}; "Success" is found by its description.
+// ASURA_ENUMDUMP=1 (debug): at the first QTE Update, print the enum behind BCButtonInfo.InputButton (the judge's input codes) with
+// every name, by walking InputButtons (ArrayProperty) -> Inner (StructProperty) -> Struct -> its InputButton (ByteProperty) -> Enum.
+// The pointer each step follows is the first dword after UProperty's own fields that points at an object of the expected kind.
+static void button_enum_dump(uint32_t self) {
+    static bool done = false;
+    if (done || !getenv("ASURA_ENUMDUMP")) return;
+    done = true;
+    auto find_field = [](uint32_t strct, const char* name) -> uint32_t {
+        for (uint32_t c = strct, d = 0; c && readable(c, 0x48) && d < 16; c = rd32(c + 0x40), d++)
+            for (uint32_t f = rd32(c + 0x44), n = 0; f && readable(f, 0x60) && n < 2000; f = rd32(f + 0x3C), n++)
+                if (ue_obj_name(f) == name) return f;
+        return 0;
+    };
+    auto follow = [](uint32_t prop, const char* kind, const char* name) -> uint32_t {   // a pointer in +0x40..+0x80 to that kind (and name)
+        for (uint32_t o = 0x40; o < 0x80; o += 4) {
+            const uint32_t p = rd32(prop + o);
+            if (p == prop || !readable(p, 0x48) || ue_class_name(p) != kind || (name && ue_obj_name(p) != name)) continue;
+            fprintf(stderr, "[enum] %s +%02X -> %s %s\n", ue_obj_name(prop).c_str(), o, kind, ue_obj_name(p).c_str());
+            return p;
+        }
+        fprintf(stderr, "[enum] %s: no %s found\n", ue_obj_name(prop).c_str(), kind);
+        return 0;
+    };
+    const uint32_t arr = find_field(rd32(self + kClassOff), "InputButtons");
+    const uint32_t inner = arr ? follow(arr, "StructProperty", "InputButtons") : 0;   // an array's Inner has the array's name
+    const uint32_t st = inner ? follow(inner, "ScriptStruct", nullptr) : 0;
+    const uint32_t ib = st ? find_field(st, "InputButton") : 0;
+    const uint32_t en = ib ? follow(ib, "Enum", nullptr) : 0;
+    if (!en) return;
+    for (uint32_t o = 0x40; o < 0x60; o += 4) {                         // UEnum::Names, a TArray<FName> {data, count, max}
+        const uint32_t d = rd32(en + o), n = rd32(en + o + 4), mx = rd32(en + o + 8);
+        if (n < 2 || n > 256 || mx < n || !readable(d, n * 8)) continue;
+        for (uint32_t i = 0; i < n; i++) fprintf(stderr, "[enum] %s %u = %s\n", ue_obj_name(en).c_str(), i, ue_name(rd32(d + i * 8), rd32(d + i * 8 + 4)).c_str());
+        return;
+    }
+    fprintf(stderr, "[enum] %s: names not found\n", ue_obj_name(en).c_str());
+}
+
 static bool qte_skip(uint32_t self, uint32_t lr) {
+    if (lr == 0x82981250u && readable(self, 0x120)) button_enum_dump(self);
     if (lr != 0x82981250u || !story_qteskip() || !readable(self, 0x120)) return false;   // any action run by this native update (subclasses too)
     // Succeed only after about the time a player takes, so cinematics that expect the input window don't run ahead and then hold
     // (the B mash at ~12,776 in episode 1). +0xDC: the time limit in seconds when the QTE has one (0 otherwise; a no-input QTE
