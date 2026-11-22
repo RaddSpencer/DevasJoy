@@ -202,7 +202,13 @@ static void qte_from_icons(QteAnswer& a) {                                  // t
     if (m & 1) a.buttons |= 0x1000;
     if (m & 2) a.buttons |= 0x2000;
     if (m & 4) a.buttons |= 0x4000;
-    if (m & 8) a.buttons |= 0x8000;
+    // Y: the combat prompts' Y icon (the user's episode 16 run: never answered, the icon was not in xenos.cpp's table). The timed
+    // (Synchronic) tracks show the same icon, and a Y tapped from the start of their window would be early: those are left to
+    // their timed press (hooks.cpp synchronic_auto) while a track was polled in the last 0.3 s. ASURA_AUTOQTE only: with
+    // ASURA_BURSTAUTO every icon on screen was a BURST prompt, and Y never is.
+    bool synchronic_hiding();
+    static const bool kAutoQte = [] { const char* e = getenv("ASURA_AUTOQTE"); return e && *e && strcmp(e, "0") != 0; }();
+    if ((m & 8) && kAutoQte && !synchronic_hiding()) a.buttons |= 0x8000;
     if (m & 16) a.lt = true;
     if (m & 32) a.rt = true;
     if (m & 256) { if ((m & 64) || !(m & 128)) a.lRot = true; if (m & 128) a.rRot = true; }

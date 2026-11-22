@@ -285,8 +285,9 @@ bool synchronic_hiding() {
 static void synchronic_hide(uint32_t self) {
     static const bool kHide = [] { const char* e = getenv("ASURA_SYNCHIDE"); return !e || atoi(e) != 0; }();
     bool story_qteskip();
+    // the time of the last poll, in every mode: ASURA_AUTOQTE (xam.cpp qte_from_icons) leaves the track's Y icon to the timed press
+    { LARGE_INTEGER q; QueryPerformanceCounter(&q); g_syncPollQpc = q.QuadPart; }
     if (!kHide || !story_qteskip()) return;
-    { LARGE_INTEGER q; QueryPerformanceCounter(&q); g_syncPollQpc = q.QuadPart; }   // the renderer hides the Y icon while this is recent
     int ue_object_field(uint32_t obj, const char* name);
     const int hOff = ue_object_field(self, "InHUD");
     if (hOff < 0 || !rd32(self + hOff)) return;
@@ -307,7 +308,10 @@ static void synchronic_auto(const char* name, uint32_t self, uint32_t result) {
     if (result != 1) { st.armed = false; return; }
     if (prev != 1) {                                                        // the window opened: find its button, start counting
         bool story_qteskip();
-        if (!story_qteskip()) return;
+        // also with the judge-based ASURA_AUTOQTE (testing): it never saw these tracks, so their Y prompts went unanswered (the
+        // user's episode 16 run, logs\rec_20261122_101610: 9 Y windows, all left to the player)
+        static const bool kAuto = [] { const char* e = getenv("ASURA_AUTOQTE"); return e && *e && strcmp(e, "0") != 0; }();
+        if (!story_qteskip() && !kAuto) return;
         int ue_object_field(uint32_t obj, const char* name);
         const int tOff = ue_object_field(self, "Tracks");
         uint32_t code = 0, idx = 0;

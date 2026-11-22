@@ -2507,6 +2507,12 @@ static const QteTex kQteTex[] = {                                           // f
     { 0x01486000, 0x6957789E, QTE_LS, "LS" }, { 0x0148E000, 0x0EC6D4B7, QTE_LS, "LS" },
     { 0x0148A000, 0x6957789E, QTE_RS, "RS" }, { 0x01492000, 0x0EC6D4B7, QTE_RS, "RS" },
     { 0x01456000, 0x091CD8EE, QTE_ROTATE, "rotate" },
+    // the Y icon: combat prompts, QTEs and the Synchronic tracks (the same texture in every capture: f9_11011, f9_15622, f9_19504).
+    // Address and hash both: matched by address only, it never hides a draw (below) and xam.cpp answers it with ASURA_AUTOQTE only.
+    { 0x014FA000, 0xDF3D91A4, QTE_Y, "Y" },
+    // the combat Y prompt (a gold medallion over a stunned enemy): its Y icon, 128x128 DXT5 at 014D2000, dump 423147C3DFD0039C
+    // (the user's episode 16 run, logs\rec_20261122_105305 [mashtex] at f=3248, on screen 3255-3268; answered in rec_20261122_105600)
+    { 0x014D2000, 0x557DF1F3, QTE_Y, "Y" },
 };
 static std::atomic<uint32_t> g_qteActive{0};
 static uint32_t g_qteFrame = 0;
@@ -2544,12 +2550,13 @@ static void qte_note_texture(uint32_t base, uint64_t hash, uint32_t fmt, uint32_
     const bool mashRecent = story_mash_recent();
     if (!mashRecent) mashBurst = false;
     for (const QteTex& q : kQteTex)
-        if ((q.addr == base && (q.hash == 0 || q.hash == h)) || ((kHidePrompts || hideMash) && q.hash && q.hash == h)) {
+        if ((q.addr == base && (q.hash == 0 || q.hash == h)) || ((kHidePrompts || hideMash) && q.action != QTE_Y && q.hash && q.hash == h)) {
+            if (q.action == QTE_Y) { g_qteFrame |= q.action; continue; }       // noted for xam.cpp, never hidden here (the Y icon's own rule is below)
             g_qteFrame |= q.action;
             if (q.action == QTE_RT && mashRecent && !kHidePrompts && !mashBurst) { mashBurst = true; fprintf(stderr, "[qte] f=%llu tug of war: RT BURST prompt, shown and left to the player\n", (unsigned long long)g_frame); }
             if (kHidePrompts || (hideMash && !mashBurst)) g_hideDraw = true;
         }
-    if (kHidePrompts && g_qteFrame && fmt == 20 && ((w == 128 && h2 == 128) || (w == 512 && h2 == 128) || (w == 1024 && h2 == 1024))) g_hideDraw = true;
+    if (kHidePrompts && (g_qteFrame & ~QTE_Y) && fmt == 20 && ((w == 128 && h2 == 128) || (w == 512 && h2 == 128) || (w == 1024 && h2 == 1024))) g_hideDraw = true;
     // Story Mode answering a tug of war (uescript.cpp story_mash_recent): its meter is the HUD's own gauge (the action feeds the Mantra
     // gauge: bNotSynchronizeMantraGauge false, AdditionalMantraAmount 0.02), drawn by Scaleform from DXT5 (fmt 20) pictures: the gold
     // ornament sheet 512x512, fire sheets 512x256 / 128x256 / 1024x512, the prompt's B states, emblem, circle and glow at 128x128 / 64x64,
