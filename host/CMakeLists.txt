@@ -17,7 +17,7 @@ target_include_directories(asura PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/generated
     C:/dev/XenonRecomp/thirdparty/simde)
 target_link_libraries(asura PRIVATE user32 gdi32 ole32 shell32 bcrypt xinput winmm d3d11 dxgi d3dcompiler windowscodecs comdlg32 ole32)
-target_link_options(asura PRIVATE /MAP:asura.map)
+target_link_options(asura PRIVATE /MAP:asura.map /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)   # a windowed program: no console window (main.cpp)
 set(ASURA_GUEST_OPT "/O2" CACHE STRING "Optimisation flag for the recompiled game code")
 # guest memory is shared between threads and read through byte-swapping macros, so strict aliasing stays off (as in BCR2)
 set_source_files_properties(${PPC_SRC} PROPERTIES COMPILE_OPTIONS "${ASURA_GUEST_OPT};/w;-msse4.1;/clang:-fno-strict-aliasing")

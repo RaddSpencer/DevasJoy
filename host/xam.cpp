@@ -149,10 +149,14 @@ static void input_record(const XINPUT_GAMEPAD& g) {
 // source. Buttons are tapped at about 10 presses a second, which both answers a single press and mashes; triggers and stick pushes are held.
 uint32_t qte_active();   // xenos.cpp
 // The answer to put on the pad: buttons tapped, triggers held, a stick direction held (0 left, 1 down, 2 right, 3 up) or circled.
-struct QteAnswer { uint16_t buttons = 0; bool lt = false, rt = false, lRot = false, rRot = false; int lDir = -1, rDir = -1; bool any() const { return buttons || lt || rt || lRot || rRot || lDir >= 0 || rDir >= 0; } };
-// From the game's QTE judge (hooks.cpp): its active prompts and their input codes. Codes seen in episode 1 (NOTES.md "QTE judge"):
-// 7 LT, 8 RT, 30 B, 17-20 left stick left/down/right/up, 21-24 right stick, 37 rotate the left stick. Returns false if a code is
-// unknown, so the icon detection answers instead.
+struct QteAnswer { uint16_t buttons = 0; bool lt = false, rt = false, lRot = false, rRot = false; int lDir = -1, rDir = -1; int rot = 0; /* 1 clockwise, 2 counterclockwise, 0 default */ bool any() const { return buttons || lt || rt || lRot || rRot || lDir >= 0 || rDir >= 0; } };
+// From the game's QTE judge (hooks.cpp): its active prompts and their input codes. The codes are the game's EBCGameButtonCommand
+// (dumped with ASURA_ENUMDUMP, 2026-11-21): 1 A, 2 X, 3 Y, 4 B, 5 Start, 6 Back, 7 LT, 8 RT, 9 LB, 10 RB, 11-14 d-pad up/left/down/right,
+// 15/16 LS/RS click, 17-20 left stick up/down/left/right, 21-24 right stick up/down/left/right, 25-29 Random_ABXY / LRButton /
+// LRTrigger / LSRS / All, 30 Assult (B), 31 HeavyAssult (Y), 32 Jump (A), 33 Shot (X), 34 FinishAttack, 35 Burst (RT), 36/37 the
+// stick clockwise / counterclockwise, 38/39 LS, 40/41 RS clockwise / counterclockwise, 42 RightDown. The stick codes were read as
+// left/down/right/up before, so a "both sticks left" QTE got both sticks pushed right (episode 16's softlock). Returns false for a
+// code with no fixed button (the Random ones, FinishAttack), so the icon detection answers instead.
 uint32_t qte_judge();   // hooks.cpp
 static bool qte_from_judge(QteAnswer& a) {
     const uint32_t j = qte_judge();
@@ -165,12 +169,29 @@ static bool qte_from_judge(QteAnswer& a) {
         const uint32_t from = kind == 0 ? pos : 0, to = kind == 0 ? pos + 1 : (kind == 1 ? 1 : cn);
         for (uint32_t k = from; k < to && k < cn; k++) {
             const uint8_t c = g_base[cp + k];
-            if (c == 7) a.lt = true;
-            else if (c == 8) a.rt = true;
-            else if (c == 30) a.buttons |= 0x2000;                          // B
-            else if (c >= 17 && c <= 20) a.lDir = c - 17;
-            else if (c >= 21 && c <= 24) a.rDir = c - 21;
-            else if (c == 37) a.lRot = true;
+            static const uint16_t kFace[5] = { 0, 0x1000, 0x4000, 0x8000, 0x2000 };   // A X Y B
+            static const int kDir[4] = { 3, 1, 0, 2 };                      // up, down, left, right -> this file's 0 left 1 down 2 right 3 up
+            if (c >= 1 && c <= 4) a.buttons |= kFace[c];
+            else if (c == 5) a.buttons |= 0x0010;
+            else if (c == 6) a.buttons |= 0x0020;
+            else if (c == 7) a.lt = true;
+            else if (c == 8 || c == 35) a.rt = true;
+            else if (c == 9) a.buttons |= 0x0100;
+            else if (c == 10) a.buttons |= 0x0200;
+            else if (c == 11) a.buttons |= 0x0001;
+            else if (c == 12) a.buttons |= 0x0004;
+            else if (c == 13) a.buttons |= 0x0002;
+            else if (c == 14) a.buttons |= 0x0008;
+            else if (c == 15) a.buttons |= 0x0040;
+            else if (c == 16) a.buttons |= 0x0080;
+            else if (c >= 17 && c <= 20) a.lDir = kDir[c - 17];
+            else if (c >= 21 && c <= 24) a.rDir = kDir[c - 21];
+            else if (c == 30) a.buttons |= 0x2000;
+            else if (c == 31) a.buttons |= 0x8000;
+            else if (c == 32) a.buttons |= 0x1000;
+            else if (c == 33) a.buttons |= 0x4000;
+            else if (c >= 36 && c <= 39) { a.lRot = true; a.rot = (c % 2 == 0) ? 1 : 2; }
+            else if (c == 40 || c == 41) { a.rRot = true; a.rot = c == 40 ? 1 : 2; }
             else { static uint32_t warned[8] = {}; if (!(warned[c >> 5] & (1u << (c & 31)))) { warned[c >> 5] |= 1u << (c & 31); LOG("[qte] judge asks for unknown input code %u (kind %u): answering from the prompt icons\n", c, kind); } known = false; }
         }
     }
@@ -221,7 +242,7 @@ static void qte_apply(uint32_t st) {
     // rotate tug of wars turning clockwise (episode 5, episode 11: replays rec_20261113_230159, rec_20261115_163928), and turning
     // counterclockwise never filled episode 11's meter, a softlock (logs\rec_20261115_162855_2.mp4 3:41). ASURA_MASHROT=cw / ccw forces one way.
     static const int kRot = [] { const char* e = getenv("ASURA_MASHROT"); return !e ? 0 : !_stricmp(e, "cw") ? 1 : !_stricmp(e, "ccw") ? 2 : 0; }();
-    const bool cw = kRot ? kRot == 1 : mash;
+    const bool cw = kRot ? kRot == 1 : a.rot ? a.rot == 1 : mash;
     double ang = (double)(GetTickCount64() % 500) / 500.0 * 6.283185307;
     if (cw) ang = -ang;
     const int16_t cx = (int16_t)(cos(ang) * 32000.0), cy = (int16_t)(sin(ang) * 32000.0);

@@ -171,7 +171,9 @@ static const int g_resScale = [] {
     if (s < 1) {
         DEVMODEW dm{}; dm.dmSize = sizeof(dm);
         s = 1;
-        if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm)) s = (int)std::max((dm.dmPelsWidth + 1279) / 1280, (dm.dmPelsHeight + 719) / 720);
+        const int outH = getenv("ASURA_OUTRES") ? atoi(getenv("ASURA_OUTRES")) : 0;   // Output Resolution chosen: cover that instead
+        if (outH >= 360 && outH <= 4320) s = (outH + 719) / 720;
+        else if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm)) s = (int)std::max((dm.dmPelsWidth + 1279) / 1280, (dm.dmPelsHeight + 719) / 720);
     }
     s = s < 1 ? 1 : s > 4 ? 4 : s;
     if (bcr2_log_requested()) fprintf(stderr, "[display] render scale %dx (%dx%d)\n", s, 1280 * s, 720 * s);
@@ -4915,14 +4917,63 @@ static void shot_ring() {
     static const uint64_t kAt = getenv("ASURA_SHOTRINGAT") ? _atoi64(getenv("ASURA_SHOTRINGAT")) : 0;
     static std::vector<ComPtr<ID3D11Texture2D>> tex; static std::vector<uint64_t> frames; static int next = 0; static uint32_t w = 0, h = 0;
     D3D11_TEXTURE2D_DESC d; g_backTex->GetDesc(&d);
+    // Above 1920x1080 each kept frame is scaled down to fit 1920x1080 first: at a 4K output 150 full frames were 5 GB of staging memory
+    // (9.4 GB for the process against 4.3 without the ring, logs\bb4k_3_ring / bb4k_3_noring) and 1 GB/s of copies.
+    // ASURA_SHOTRINGFULL=1 keeps full-size frames.
+    static const bool kFull = getenv("ASURA_SHOTRINGFULL") != nullptr;
+    const uint32_t bw = d.Width, bh = d.Height;
+    const double fit = kFull ? 1.0 : std::min(1.0, std::min(1920.0 / bw, 1080.0 / bh));
+    const uint32_t rw = std::max(1u, (uint32_t)(bw * fit + 0.5)), rh = std::max(1u, (uint32_t)(bh * fit + 0.5));
+    const bool scaled = rw != bw || rh != bh;
+    static ComPtr<ID3D11Texture2D> full, ringSmall; static ComPtr<ID3D11ShaderResourceView> fullSrv; static ComPtr<ID3D11RenderTargetView> smallRtv;
+    static ComPtr<ID3D11VertexShader> vs; static ComPtr<ID3D11PixelShader> ps; static ComPtr<ID3D11SamplerState> samp;
+    d.Width = rw; d.Height = rh;
     d.BindFlags = 0; d.Usage = D3D11_USAGE_STAGING; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
-    if (d.Width != w || d.Height != h) { tex.clear(); frames.clear(); tex.resize(kN); frames.assign(kN, ~0ull); next = 0; w = d.Width; h = d.Height; }
+    if (d.Width != w || d.Height != h) {
+        tex.clear(); frames.clear(); tex.resize(kN); frames.assign(kN, ~0ull); next = 0; w = d.Width; h = d.Height;
+        full.Reset(); fullSrv.Reset(); ringSmall.Reset(); smallRtv.Reset();
+        if (scaled) {
+            D3D11_TEXTURE2D_DESC f{}; g_backTex->GetDesc(&f); f.BindFlags = D3D11_BIND_SHADER_RESOURCE; f.Usage = D3D11_USAGE_DEFAULT; f.CPUAccessFlags = 0; f.MiscFlags = 0;
+            g_dev->CreateTexture2D(&f, nullptr, &full); if (full) g_dev->CreateShaderResourceView(full.Get(), nullptr, &fullSrv);
+            f.Width = rw; f.Height = rh; f.BindFlags = D3D11_BIND_RENDER_TARGET;
+            g_dev->CreateTexture2D(&f, nullptr, &ringSmall); if (ringSmall) g_dev->CreateRenderTargetView(ringSmall.Get(), nullptr, &smallRtv);
+            fprintf(stderr, "[capture] F9 ring keeps frames at %ux%u (output %ux%u)\n", rw, rh, bw, bh);
+        }
+        if (scaled && !vs) {
+            static const char* kVs = "float4 main(uint id : SV_VertexID, out float2 uv : TEXCOORD0) : SV_Position { uv = float2((id << 1) & 2, id & 2); return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); }";
+            static const char* kPs = "Texture2D t : register(t0); SamplerState s : register(s0); float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return t.SampleLevel(s, uv, 0); }";
+            if (auto b = compile_cached(kVs, "main", "vs_5_0")) g_dev->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &vs);
+            if (auto b = compile_cached(kPs, "main", "ps_5_0")) g_dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &ps);
+            D3D11_SAMPLER_DESC sd{}; sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR; sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP; sd.MaxLOD = D3D11_FLOAT32_MAX;
+            g_dev->CreateSamplerState(&sd, &samp);
+        }
+    }
+    if (scaled && (!fullSrv || !smallRtv || !vs || !ps || !samp)) return;
     static uint64_t dumpAt = ~0ull;                                          // F9 keeps recording this long after the press, so what was just seen is inside
     static const uint64_t kAfter = getenv("ASURA_SHOTRINGAFTER") ? _atoi64(getenv("ASURA_SHOTRINGAFTER")) : 45;
     {
         ComPtr<ID3D11Texture2D>& t = tex[next];
         if (!t && FAILED(g_dev->CreateTexture2D(&d, nullptr, &t))) return;
-        g_ctx->CopyResource(t.Get(), g_backTex.Get());
+        if (!scaled) g_ctx->CopyResource(t.Get(), g_backTex.Get());
+        else {   // the back buffer can't be sampled: copy it, draw it smaller (bilinear; at 2x, 4 texels into 1), keep that
+            g_ctx->CopyResource(full.Get(), g_backTex.Get());
+            ID3D11ShaderResourceView* nul[1] = {};
+            ID3D11RenderTargetView* rtv = smallRtv.Get();
+            g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+            invalidate_binds();
+            D3D11_VIEWPORT vp{ 0, 0, (float)rw, (float)rh, 0, 1 }; g_ctx->RSSetViewports(1, &vp);
+            D3D11_RECT sc{ 0, 0, (LONG)rw, (LONG)rh }; g_ctx->RSSetScissorRects(1, &sc);
+            g_ctx->RSSetState(get_rs(0, true, true, 0, 0));
+            g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+            g_ctx->OMSetDepthStencilState(get_ds(0, 0, 0), 0);
+            g_ctx->IASetInputLayout(nullptr); g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            g_ctx->VSSetShader(vs.Get(), nullptr, 0); g_ctx->GSSetShader(nullptr, nullptr, 0); g_ctx->PSSetShader(ps.Get(), nullptr, 0);
+            ID3D11ShaderResourceView* srv = fullSrv.Get(); g_ctx->PSSetShaderResources(0, 1, &srv);
+            ID3D11SamplerState* sp = samp.Get(); g_ctx->PSSetSamplers(0, 1, &sp);
+            g_ctx->Draw(3, 0);
+            g_ctx->PSSetShaderResources(0, 1, nul);
+            g_ctx->CopyResource(t.Get(), ringSmall.Get());
+        }
         frames[next] = g_frame;
         next = (next + 1) % kN;
     }
@@ -5119,6 +5170,10 @@ static void dump_surfaces(uint32_t only, int seq) {                          // 
 }
 
 // Between frames: switch display mode if asked to, and match the back buffer to the window.
+// Output Resolution (Options, asura.ini outres, ASURA_OUTRES=<height>): in fullscreen the back buffer is that tall instead of the
+// display's size, so the present pass and anything sized by the output cost less on a 4K display; the compositor scales it up.
+static std::atomic<int> g_outResH{ [] { const int v = getenv("ASURA_OUTRES") ? atoi(getenv("ASURA_OUTRES")) : 0; return v >= 360 && v <= 4320 ? v : 0; }() };
+void gpu_set_output_res(int height) { g_outResH = height >= 360 && height <= 4320 ? height : 0; g_sizeChanged = true; fprintf(stderr, "[display] output resolution %s\n", height ? std::to_string(height).c_str() : "native"); }
 static void update_display() {
     static WINDOWPLACEMENT savedPlace{ sizeof(WINDOWPLACEMENT) };
     static LONG_PTR savedStyle = 0;
@@ -5157,6 +5212,13 @@ static void update_display() {
     if (!g_sizeChanged.exchange(false)) return;
     RECT rc{}; GetClientRect(g_hwnd, &rc);
     uint32_t w = (uint32_t)(rc.right - rc.left), h = (uint32_t)(rc.bottom - rc.top);
+    if (g_modeNow == kBorderless && g_outResH.load() > 0) {                 // Output Resolution: the back buffer at that height and the
+        const uint32_t oh = (uint32_t)g_outResH.load();                     // display's shape; the compositor scales it to the screen
+        MONITORINFO mi{ sizeof(mi) };                                       // the monitor's shape, not the window's: right after the
+        GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);   // switch the window can still have its old size
+        const uint32_t mw = (uint32_t)(mi.rcMonitor.right - mi.rcMonitor.left), mh = (uint32_t)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+        if (mw && mh) { w = (uint32_t)(((uint64_t)oh * mw + mh / 2) / mh) & ~1u; h = oh; }
+    }
     {   // ASURA_BACKBUFFER=<w>x<h>: the back buffer at that size whatever the window is (the compositor scales it to the window).
         // For measuring a 4K output on a smaller display; also used when minimised, so a test run pays the full output cost.
         static uint32_t fw = 0, fh = 0;

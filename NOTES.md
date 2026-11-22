@@ -267,6 +267,19 @@ The user's episode 2 run (logs\ep2_rec.log, replays\ep2_rec.txt; recording made 
 
 The one Synchronic QTE in episode 2 (frame 10,728 of that run, during the second fight): IsInputOk turned true, the user pressed Y 22 frames (0.73 s) later. Track properties: StartTime 1.1, EndTime 0.8, RankTimeA 0.1, RankTimeB 0.3, RankTimeC 0.5, RankTimeOver 0.1, RankHitA 1, RankHitB 0.6, RankHitC 0.3, SynchronicType 0, AchieveCount 1, Tracks {1} (the button is probably in there; the dump now prints short arrays' elements). A replay can't reach it (the fight before it plays out differently).
 
+### 4K performance (2026-11-21/22)
+
+The user saw large drops at 4K. Measured on this machine (RTX 5070, 1440p display), episode 1 replay to the fleet zoom-out:
+- Internal resolution alone is not it: 1x and 3x (3840x2160, what Auto picks at 4K) both hold 30 fps with the same CPU time per frame (logs\perf4k_1 / perf4k_3).
+- The GPU: the device now goes on the first adapter in DXGI's high-performance order and logs the list (`[gfx] adapter`); this machine has Intel graphics too. `ASURA_ADAPTER=<n>` picks another. The exe exports NvOptimusEnablement / AmdPowerXpressRequestHighPerformance.
+- `ASURA_GPUPROF=1` logs timestamp-query time per render-target change, resolve and present every 300 frames ([gpuprof]). It measures elapsed GPU time, which includes waiting: at 30 fps every frame reads ~33 ms. Useful only when the GPU is the limit.
+- `ASURA_BACKBUFFER=<w>x<h>` renders the output at that size whatever the window (the compositor scales it), to measure a 4K output here. With a 3840x2160 output at 3x, the F9 capture ring that `--log` turns on took the process to 9.4 GB private memory against 4.3 GB without it (logs\bb4k_3_ring, bb4k_3_noring): 150 staging copies of the back buffer (33 MB each at 4K) plus a full-size GPU copy every frame. Every test launcher uses --log, so the user's 4K test runs carried this.
+- Fix: above 1920x1080 the ring scales each frame to fit 1920x1080 before keeping it (its own bilinear pass; `ASURA_SHOTRINGFULL=1` keeps full size). F9 still saves 150 frames.
+
+Output Resolution (Options row, ini `outres`, `ASURA_OUTRES=<height>`): Native, 720, 1080, 1440 or 2160. In fullscreen (borderless, Alt+Enter) the back buffer is that tall with the display's shape and the compositor scales it up; in a window the window's size is used. Internal Resolution "Auto" covers the chosen output instead of the display (1080p output: 2x). Live.
+
+Also: Skip Splash Screens (Options row, ini `skipintro`, the same as `ASURA_SKIPINTRO`; from the next start). `--dumptextures` on the command line = `ASURA_MODDUMP=1` (every texture once to mods\dump, for HD replacements in mods\textures). The exe is now a windowed program (/SUBSYSTEM:WINDOWS): no console window opens; started from a terminal it attaches to it, and `ASURA_CONSOLE=1` opens one.
+
 ### Performance in the user's episode 3 run (2026-11-13)
 
 The run was at 30 fps, 2560x1440 window, with video recording on. Over 300 frames: p99 36 ms throughout. The spikes:
@@ -320,7 +333,8 @@ Rendering:
 - [x] Render delay on the crowds in front of the fleet (ep 9 1:59). A first-time shader compile (3 draws left out at frames 3,576-3,577); covered by the warm-up and generic vertex shaders (2026-11-16).
 - [ ] Asura falling through the atmosphere disappears one frame before the cut (ep 9 _5.mp4 0:51).
 - [ ] Ep 13 (user, 2026-11-18): near the end, a character shown on a screen during a conversation vanishes and reappears (culled and back).
-- [ ] Ep 14: flickering on a ship; F9 captures in hostuild\_debug_capture (f9_2784 / f9_1583, logsec_20261118_122344 / 123448).
+- [ ] Ep 14: flickering on a ship; F9 captures in hostuild\_debug_capture (f9_2784 / f9_1583, logs
+ec_20261118_122344 / 123448).
 - [x] Ep 13 mash B slow and ep 14 LS-up/RS-down QTE softlock, BURST answered by itself: record_test_dump.cmd set ASURA_AUTOQTE=0, which still turned the automatic answers on; their forced presses fought the player's (B held half the time, both sticks pushed down). "0" now means off (2026-11-18).
 - [x] Texture glitch in an eye (ep 11 rec_20261115_163928_3.mp4 0:21-0:28). Fixed by the resolve-surface change (user, 2026-11-16). Part of the eye is solid green, what a Bink plane of zeros gives after YUV conversion; the rest shows a video-like reflection. Possibly the same stale-surface bug as the title movie (fixed 2026-11-16); the replay falls out of step before it (logs\e11r), so the user should look again.
 - [x] After "Return to Main Menu", the title menu's background video is offset (ep 10 4:12). Fixed 2026-11-16, see "Resolves that start inside an older surface".
@@ -453,6 +467,16 @@ To capture one: `ASURA_SYNCLOG=1` logs each change of those natives' results (`[
 `ASURA_PROPDUMP=<exact class name>` dumps the first such object seen in a script event the same way (checked on BCPawn_Player_asr, logs\propdump1).
 
 Testing tip (from the user): Back/Select skips cutscenes, so a run can get past the ones not being tested.
+
+### QTE input codes: the game's own table (2026-11-21)
+
+The judge's input codes are the game's `EBCGameButtonCommand` (the enum behind BCButtonInfo.InputButton; `ASURA_ENUMDUMP=1` prints it at the first QTE, logs\enum2): 0 None, 1 A, 2 X, 3 Y, 4 B, 5 Start, 6 Back, 7 LT, 8 RT, 9 LB, 10 RB, 11 d-pad up, 12 left, 13 down, 14 right, 15 LS click, 16 RS click, 17 LS up, 18 LS down, 19 LS left, 20 LS right, 21-24 RS up/down/left/right, 25 Random_ABXY, 26 Random_LRButton, 27 Random_LRTrigger, 28 Random_LSRS, 29 Random_All, 30 Assult (B), 31 HeavyAssult (Y), 32 Jump (A), 33 Shot (X), 34 FinishAttack, 35 Burst (RT), 36 Stick_Clockwise, 37 Stick_ReverseClockwise, 38/39 LS clockwise / counterclockwise, 40/41 RS clockwise / counterclockwise, 42 RightDown.
+
+The auto-answer (xam.cpp qte_from_judge) had read 17-20 as left/down/right/up. That softlocked the user's AUTOQTE runs: episode 16's "both sticks left" got both sticks pushed right (log rec_20261118_143835: "left stick 2 right stick 2"), episode 18's first QTE (LS left + RS right; the user's own input in replays\rec_20261118_172504 at 111.98 s) got right + up, and probably Lost Episode 2's "stick right" ending. Codes 32 (Jump, an A mash in episode 16) and 35 (Burst) were unknown and answered from the icons (B). All codes but the Random ones and FinishAttack are now mapped; rotations follow 36-41. Checked (logs\autoqte_ep1b, Story Mode forced off with `ASURA_QTESKIP=0`): a left-stick sequence QTE (up, then down; 2 s limit) was answered "left stick 3" then "left stick 1" and passed in 13 frames; the old table would have pushed left first. The episode 18 replay diverges (the user skipped the opening credits), so the other episodes wait for the user's next AUTOQTE run.
+
+Test runs and the user's asura.ini: Story Mode (`invincible`, `qteskip`), 60 fps, vsync and AA in asura.ini apply to test runs unless the environment overrides them (`ASURA_QTESKIP=0`, `ASURA_FPS=30` ...). saves_complete\SAVEDATA.DAT was replaced on 2026-11-21 12:25 with the user's current save (identical to saves\), which opens the Episode Menu elsewhere: the episode 1 recordings (complete_ep1_qteskip.txt and older) now start episode 7's map (BC-S060) instead of BC-S000. No copy of the old completed save exists; episode 1 replays need it back or new recordings.
+
+Prompt icons from episodes 15-22 and the Lost Episodes (mods\dump, 128x128 DXT5): 12 more button icons (X, Y, A in several colours, RB, LS, RS) were missing from tools\prompts_map.txt, so their PlayStation / Switch versions were never made (episode 16's A mash showed the Xbox A). Added and built (assets\prompts).
 
 ### QTE judge (2026-11-10)
 

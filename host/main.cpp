@@ -121,6 +121,11 @@ static std::vector<char> read_file(const std::string& p) {
 }
 
 int main(int argc, char** argv) {
+    // The exe is a windowed (GUI) program, so no console window opens when the game is started. Run from a terminal, it prints into
+    // that terminal (the tool modes below report there); ASURA_CONSOLE=1 opens a console of its own. With --log, the log goes to a file.
+    if (getenv("ASURA_CONSOLE") ? AllocConsole() : AttachConsole(ATTACH_PARENT_PROCESS)) {
+        FILE* f; freopen_s(&f, "CONOUT$", "w", stdout); freopen_s(&f, "CONOUT$", "w", stderr);
+    }
     if (argc >= 7 && !strcmp(argv[1], "--decode-dxt1")) {                     // --decode-dxt1 <raw file> <w> <h> <pitch texels> <tiled 0/1> [out.bmp]: big-endian 8in16 DXT1, as the console stores it
         std::ifstream f(argv[2], std::ios::binary); std::vector<uint8_t> raw((std::istreambuf_iterator<char>(f)), {});
         const uint32_t w = atoi(argv[3]), h = atoi(argv[4]), pitch = atoi(argv[5]); const bool tiled = atoi(argv[6]) != 0;

@@ -40,6 +40,7 @@ bool kbm_reserved_down(int vk);                   // xenos_glue.cpp
 void gpu_set_vsync(bool on);                      // xenos.cpp
 void gpu_set_gamma(int percent);                  // xenos.cpp
 void gpu_set_aa(int mode);                        // xenos.cpp
+void gpu_set_output_res(int height);              // xenos.cpp
 void gpu_set_texfilter(int mode);                 // xenos.cpp
 void gpu_set_button_set(int s);                   // xenos.cpp
 int gpu_render_scale();                           // xenos.cpp
@@ -50,7 +51,7 @@ bool story_invincible();
 bool story_qteskip();
 
 namespace {
-struct Settings { int resscale = 0; int vsync = 0; int gamma = 100; int showfps = 0; int fps = 30; int pulldown = 0; int invincible = 0; int qteskip = 0; int aa = 0; int texfilter = 0; int buttons = 0; };
+struct Settings { int resscale = 0; int vsync = 0; int gamma = 100; int showfps = 0; int fps = 30; int pulldown = 0; int invincible = 0; int qteskip = 0; int aa = 0; int texfilter = 0; int buttons = 0; int outres = 0; int skipintro = 0; };
 Settings g_saved;                                 // what asura.ini holds
 bool g_envRes = false, g_envVsync = false, g_envFps = false, g_envVblank = false, g_envVrr = false, g_envPulldown = false;   // the variable came from the ini (a restart drops it), not from the user
 int g_runFps = 30, g_runPulldown = 0, g_runVrr = 0;            // the frame rate (and 24 fps display) this process started with
@@ -71,6 +72,8 @@ void load(Settings& s) {
             else if (sscanf(line, " aa = %d", &v) == 1) s.aa = std::clamp(v, 0, 2);
             else if (sscanf(line, " texfilter = %d", &v) == 1) s.texfilter = std::clamp(v, 0, 6);
             else if (sscanf(line, " buttons = %d", &v) == 1) s.buttons = (v == 2 || v == 3) ? v : 0;
+            else if (sscanf(line, " skipintro = %d", &v) == 1) s.skipintro = v ? 1 : 0;
+            else if (sscanf(line, " outres = %d", &v) == 1) s.outres = (v == 720 || v == 1080 || v == 1440 || v == 2160) ? v : 0;
         }
         fclose(f);
     }
@@ -99,6 +102,10 @@ void save(const Settings& s) {
         fprintf(f, "texfilter = %d\n", s.texfilter);
         fprintf(f, "; buttons: button prompts, 0 = Xbox (as the game draws them), 2 = PlayStation, 3 = Switch\n");
         fprintf(f, "buttons = %d\n", s.buttons);
+        fprintf(f, "; outres: output resolution in fullscreen, 0 = the display's own, or 720 / 1080 / 1440 / 2160 (the display scales it up)\n");
+        fprintf(f, "outres = %d\n", s.outres);
+        fprintf(f, "; skipintro: 1 = skip the splash screens (autosave notice and logos) when the game starts\n");
+        fprintf(f, "skipintro = %d\n", s.skipintro);
         fclose(f);
     }
 }
@@ -109,13 +116,14 @@ std::mutex g_lock;                                // menu state below, between t
 Settings g_cur;                                   // what the menu shows
 int g_row = 0;
 uint64_t g_version = 1;                           // bumped when the picture changes
-enum Row { kRes, kRate, kVsync, kGamma, kAA, kTex, kButtons, kFps, kStory, kInvincible, kQteSkip, kRestart, kClose, kRows };
+enum Row { kRes, kOut, kRate, kVsync, kGamma, kAA, kTex, kButtons, kFps, kSplash, kStory, kInvincible, kQteSkip, kRestart, kClose, kRows };
 std::atomic<bool> g_showFps{false};
 
-int auto_scale() {
+int auto_scale() {                                // the smallest multiple of 1280x720 covering the output (the chosen output resolution, or the display)
     DEVMODEW dm{}; dm.dmSize = sizeof(dm);
     int s = 1;
-    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm)) s = (int)std::max((dm.dmPelsWidth + 1279) / 1280, (dm.dmPelsHeight + 719) / 720);
+    if (g_cur.outres > 0) s = (g_cur.outres + 719) / 720;
+    else if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm)) s = (int)std::max((dm.dmPelsWidth + 1279) / 1280, (dm.dmPelsHeight + 719) / 720);
     return s < 1 ? 1 : s > 4 ? 4 : s;
 }
 std::wstring res_text(int s) {
@@ -156,6 +164,7 @@ void restart() {
 
 void change(int dir) {
     if (g_row == kRes) { g_cur.resscale = (g_cur.resscale + dir + 5) % 5; }
+    else if (g_row == kOut) { static const int order[5] = { 0, 720, 1080, 1440, 2160 }; int i = 0; while (i < 4 && order[i] != g_cur.outres) i++; g_cur.outres = order[(i + dir + 5) % 5]; gpu_set_output_res(g_cur.outres); }
     else if (g_row == kRate) { if (g_cur.fps == 24) return; g_cur.fps = g_lastRate = g_cur.fps == 60 ? 30 : 60; }
     else if (g_row == kVsync) {                                             // Off, On, 24 fps (FreeSync / G-Sync), 24 fps (2:3 pulldown)
         const int i = (std::min(vsync_choice(), 2) + dir + 3) % 3;          // the 24 fps choices were removed (2026-11-14, the user's call)
@@ -167,6 +176,7 @@ void change(int dir) {
     else if (g_row == kTex) { g_cur.texfilter = (g_cur.texfilter + dir + 7) % 7; gpu_set_texfilter(g_cur.texfilter); }
     else if (g_row == kButtons) { static const int order[3] = { 0, 2, 3 }; int i = g_cur.buttons == 2 ? 1 : g_cur.buttons == 3 ? 2 : 0; g_cur.buttons = order[(i + dir + 3) % 3]; gpu_set_button_set(g_cur.buttons); }
     else if (g_row == kFps) { g_cur.showfps ^= 1; g_showFps = g_cur.showfps != 0; }
+    else if (g_row == kSplash) { g_cur.skipintro ^= 1; }
     else if (g_row == kStory) { const int on = (g_cur.invincible && g_cur.qteskip) ? 0 : 1; g_cur.invincible = g_cur.qteskip = on; story_set(on, on); }
     else if (g_row == kInvincible) { g_cur.invincible ^= 1; story_set(g_cur.invincible, g_cur.qteskip); }
     else if (g_row == kQteSkip) { g_cur.qteskip ^= 1; story_set(g_cur.invincible, g_cur.qteskip); }
@@ -218,6 +228,13 @@ void settings_apply_to_env() {
     g_cur = g_saved;
     char v[16];
     if (!getenv("ASURA_RESSCALE") && g_saved.resscale > 0) { snprintf(v, sizeof v, "%d", g_saved.resscale); _putenv_s("ASURA_RESSCALE", v); g_envRes = true; }
+    if (!getenv("ASURA_SKIPINTRO") && g_saved.skipintro) _putenv_s("ASURA_SKIPINTRO", "1");
+    if (getenv("ASURA_SKIPINTRO")) g_cur.skipintro = g_saved.skipintro = 1;
+    // --dumptextures on the command line: every texture the game loads is written once to mods\dump (as ASURA_MODDUMP=1), to make
+    // HD replacements from (mods\textures\<hash>.png).
+    if (strstr(GetCommandLineA(), "--dumptextures") && !getenv("ASURA_MODDUMP")) _putenv_s("ASURA_MODDUMP", "1");
+    if (!getenv("ASURA_OUTRES") && g_saved.outres > 0) { snprintf(v, sizeof v, "%d", g_saved.outres); _putenv_s("ASURA_OUTRES", v); }
+    if (const char* e = getenv("ASURA_OUTRES")) { const int o = atoi(e); g_cur.outres = g_saved.outres = (o == 720 || o == 1080 || o == 1440 || o == 2160) ? o : 0; }
     if (!getenv("ASURA_VSYNC")) { snprintf(v, sizeof v, "%d", g_saved.vsync == 1 ? 1 : 0); _putenv_s("ASURA_VSYNC", v); g_envVsync = true; }
     if (g_saved.vsync == 2 && g_saved.fps != 24 && !getenv("ASURA_VRR")) { _putenv_s("ASURA_VRR", "1"); g_envVrr = true; }
     if (!getenv("ASURA_FPS") && !getenv("ASURA_FPS60") && g_saved.fps != 30) { _putenv_s("ASURA_FPS", g_saved.fps == 60 ? "60" : "24"); g_envFps = true; }
@@ -313,7 +330,7 @@ bool options_picture(int w, int h, std::vector<uint8_t>& rgba, uint64_t& version
     HGDIOBJ oldBmp = SelectObject(dc, bmp);
     memset(bits, 0, (size_t)w * h * 4);
     SetBkMode(dc, TRANSPARENT);
-    const int unit = h / 18;                                                // row height
+    const int unit = h / (kRows + 5);                                       // row height: title, the rows, then two hint lines
     auto font = [&](int px, int weight) { return CreateFontW(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, VARIABLE_PITCH, L"Segoe UI"); };
     HFONT fTitle = font(unit * 7 / 10, FW_SEMIBOLD), fRow = font(unit * 11 / 20, FW_NORMAL), fHint = font(unit * 2 / 5, FW_NORMAL);
     auto text = [&](HFONT f, COLORREF c, int x, int y, int ww, int hh, const std::wstring& s, UINT fmt) {
@@ -325,6 +342,7 @@ bool options_picture(int w, int h, std::vector<uint8_t>& rgba, uint64_t& version
     const int cur = g_cur.resscale == 0 ? auto_scale() : g_cur.resscale;
     Line lines[kRows] = {
         { L"Internal Resolution", L"◀  " + res_text(g_cur.resscale) + L"  ▶", true },
+        { L"Output Resolution", L"◀  " + std::wstring(g_cur.outres == 0 ? L"Native (the display's)" : g_cur.outres == 720 ? L"1280 x 720" : g_cur.outres == 1080 ? L"1920 x 1080" : g_cur.outres == 1440 ? L"2560 x 1440" : L"3840 x 2160") + L"  ▶", true },
         { L"Frame Rate", g_cur.fps == 24 ? std::wstring(L"24 fps (set by Vsync)") : L"◀  " + std::to_wstring(g_cur.fps) + L" fps  ▶", g_cur.fps != 24 },
         { L"Vsync", std::wstring(L"◀  ") + (vsync_choice() == 0 ? L"Off" : vsync_choice() == 1 ? L"On" : vsync_choice() == 2 ? L"On (FreeSync / G-Sync)" : vsync_choice() == 3 ? L"24 fps (FreeSync / G-Sync recommended)" : L"24 fps (2:3 pulldown)") + L"  ▶", true },
         { L"Gamma", L"◀  " + std::to_wstring(g_cur.gamma) + L"%  ▶", true },
@@ -333,6 +351,7 @@ bool options_picture(int w, int h, std::vector<uint8_t>& rgba, uint64_t& version
                                  : L"Anisotropic " + std::to_wstring(1 << (g_cur.texfilter - 2)) + L"x") + L"  ▶", true },
         { L"Button Labels", std::wstring(L"◀  ") + (g_cur.buttons == 2 ? L"PlayStation" : g_cur.buttons == 3 ? L"Switch" : L"Xbox") + L"  ▶", true },
         { L"Show FPS", std::wstring(L"◀  ") + (g_cur.showfps ? L"On" : L"Off") + L"  ▶", true },
+        { L"Skip Splash Screens", std::wstring(L"◀  ") + (g_cur.skipintro ? L"On" : L"Off") + L"  ▶", true },
         { L"Story Mode", std::wstring(L"◀  ") + (g_cur.invincible && g_cur.qteskip ? L"On" : g_cur.invincible || g_cur.qteskip ? L"Custom" : L"Off") + L"  ▶", true },
         { L"    Invincibility", std::wstring(L"◀  ") + (g_cur.invincible ? L"On" : L"Off") + L"  ▶", true },
         { L"    Automatic QTEs", std::wstring(L"◀  ") + (g_cur.qteskip ? L"On" : L"Off") + L"  ▶", true },
@@ -351,7 +370,7 @@ bool options_picture(int w, int h, std::vector<uint8_t>& rgba, uint64_t& version
         text(fRow, c, pad, y, w / 2, unit, lines[i].label, DT_LEFT);
         text(fRow, lines[i].enabled ? c : RGB(110, 110, 110), w / 2 - pad, y, w / 2, unit, lines[i].value, DT_RIGHT);
     }
-    std::wstring note = g_row == kButtons ? L"Button labels change from the next episode or menu screen that loads." : restart_needed() ? L"Internal resolution and frame rate change when the game restarts." : L"Settings are saved to asura.ini.";
+    std::wstring note = g_row == kSplash ? L"Takes effect the next time the game starts." : g_row == kOut ? L"Fullscreen only (Alt+Enter); a window shows the game at its own size." : g_row == kButtons ? L"Button labels change from the next episode or menu screen that loads." : restart_needed() ? L"Internal resolution and frame rate change when the game restarts." : L"Settings are saved to asura.ini.";
     if (g_cur.fps == 24 && (g_row == kVsync || !g_cur.pulldown))
         note = g_cur.pulldown ? L"24 fps shown 3:2 on a 60 Hz display, as DVD players do: no tearing, slight film judder."
                               : L"Warning: 24 fps needs a G-Sync or FreeSync display. Without one the picture will tear.";
