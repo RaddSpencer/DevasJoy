@@ -342,7 +342,7 @@ static const char* kVfd = R"(
 float vfc(uint w, uint off, uint bw, uint fl) {
   uint mask = bw == 32u ? 0xFFFFFFFFu : ((1u << bw) - 1u);
   float v = (fl & 1u) ? float((int)(w << (32u - off - bw)) >> (32u - bw)) : float((w >> off) & mask);
-  if ((fl & 2u) == 0u) {
+  [branch] if ((fl & 2u) == 0u) {
     float umax = bw == 32u ? 4294967295.0 : float(mask);
     float smax = bw == 32u ? 2147483647.0 : float((1u << (bw - 1u)) - 1u);
     if (fl & 1u) v = (fl & 4u) ? (2.0 * v + 1.0) / umax : max(v / smax, -1.0);
@@ -352,7 +352,7 @@ float vfc(uint w, uint off, uint bw, uint fl) {
 }
 float4 vfd(uint va, uint fmt, uint fl) {
   uint w0 = VB.Load(va), w1 = 0, w2 = 0, w3 = 0; float4 fv = float4(0, 0, 0, 1);
-  switch (fmt) {
+  [forcecase] switch (fmt) {
     case 6: fv = float4(vfc(w0, 0, 8, fl), vfc(w0, 8, 8, fl), vfc(w0, 16, 8, fl), vfc(w0, 24, 8, fl)); break;
     case 7: fv = float4(vfc(w0, 0, 10, fl), vfc(w0, 10, 10, fl), vfc(w0, 20, 10, fl), vfc(w0, 30, 2, fl)); break;
     case 16: fv.xyz = float3(vfc(w0, 0, 11, fl), vfc(w0, 11, 11, fl), vfc(w0, 22, 10, fl)); break;
@@ -627,6 +627,7 @@ struct XShader {
     // fetches and interpolator exports are; a variant is one patched copy the game binds, sharing its base's compiled shader.
     bool dynBase = false;
     std::vector<uint32_t> fetchPos, expPos;
+    uint64_t fetchDstMask = 0;                                                  // generic VS: registers its fetches may write (each fetch's own)
     XShader* base = nullptr;
     uint32_t vsf[32 * 4] = {};
     int32_t vsx[64] = {};
@@ -884,6 +885,7 @@ struct Translator {
     // patched copy the game makes of it. The word offsets of each vertex fetch and each interpolator export, in emission order.
     bool dynVs = false;
     std::vector<uint32_t> dynFetchPos, dynExpPos;
+    uint64_t dynDstMask = 0;                                                     // registers written by the fetches (generic VS)
 
     std::string R(int n) {
         n &= 63; usedRegs.insert(n);
@@ -1126,9 +1128,13 @@ struct Translator {
             B += S("{ uint4 P=vsf[%u]; float ix=%s; if(P.x&0x8000000u) ix=round(ix);\n"
                    " float4 fv=vfd(vfo[(P.x&127u)>>2][P.x&3u]+(uint)((int)ix)*((P.x>>8)&255u)*4u+(uint)((int)P.y*4), (P.x>>16)&63u, P.x>>24);\n"
                    " int ex=(int)(P.z<<14)>>26; if(ex!=0) fv*=exp2((float)ex);\n"
-                   " uint dr=(P.z>>18)&63u; float4 t=r[dr];\n"
+                   " uint dr=(P.z>>18)&63u; float4 t=@VFR@;\n"
                    " [unroll] for(uint c=0;c<4;c++){ uint sw=(P.z>>(3*c))&7u; if(sw!=7u) t[c]=sw<4u?fv[sw]:(sw==5u?1.0:0.0); }\n"
-                   " r[dr]=t; }\n", f, ix.c_str());
+                   " @VFW@ }\n", f, ix.c_str());
+            // The game moves fetches between the vertex input registers per mesh (r2 -> r4 ...), so the register is chosen at draw time, but only among
+            // the registers this shader's own fetches write (the markers become selects over them in translate_shader). Writing r[dr] instead made the
+            // whole register file an indexed array: about 3x the compile time and twice the code.
+            R(dst); dynDstMask |= 1ull << (dst & 63);
             return;
         }
         auto it = vfs.find(slot);
@@ -1330,7 +1336,7 @@ struct Translator {
         bool jumps = false;
         for (auto& c : cfs) if (c.op == 9 || c.op == 11 || c.op == 7) jumps = true;
         for (auto& c : cfs) if (c.op == 7) hasLoop = true;
-        body.clear(); dynFetchPos.clear(); dynExpPos.clear();
+        body.clear(); dynFetchPos.clear(); dynExpPos.clear(); dynDstMask = 0;
         std::string& B = body;
         std::vector<std::pair<uint32_t, std::string>> loopEnds;
         for (uint32_t i = 0; i < cfs.size(); i++) {
@@ -1438,12 +1444,23 @@ static void shader_find(const std::vector<uint32_t>& code, bool isVs) {
 // use. h is the shader's key (debug switches name shaders by it). Thread-safe: also used by the background pixel-shader warm-up.
 static void translate_shader(const std::vector<uint32_t>& code, bool isVs, uint32_t paramGen, uint64_t h, XShader* sh, std::string& src, std::string& fallback, bool dyn = false) {
     Translator T; T.ucode = code.data(); T.words = (uint32_t)code.size(); T.isVs = isVs; T.out = sh;
-    if (dyn) { T.dynVs = true; T.useArray = true; }                       // dynamic register writes need the register array
+    if (dyn) T.dynVs = true;                                                // fetches write their own register, so no register array is needed
     T.decode_cf();
     T.walk();
     if (T.needRel) { T.useArray = true; T.usedRegs.clear(); T.needRel = false; memset(T.prevFull, 0, sizeof(T.prevFull)); T.walk(); }
     if (T.memexport) { T.exact = true; T.usedRegs.clear(); T.needRel = false; memset(T.prevFull, 0, sizeof(T.prevFull)); T.walk(); }
     sh->memexport = T.memexport;
+    if (T.dynVs) {   // generic VS fetch writes: read and write the register the draw names, among the fetches' own registers
+        std::string rd, wr;
+        for (int r = 63; r >= 0; r--) if (T.dynDstMask >> r & 1) {
+            const std::string reg = T.R(r);
+            rd = rd.empty() ? reg : S("(dr==%du?%s:%s)", r, reg.c_str(), rd.c_str());
+            wr += S("if(dr==%du) %s=t; ", r, reg.c_str());
+        }
+        auto subst = [&](const std::string& m, const std::string& by) { for (size_t at; (at = T.body.find(m)) != std::string::npos;) T.body.replace(at, m.size(), by); };
+        subst("@VFR@", rd.empty() ? "float4(0,0,0,0)" : rd);
+        subst("@VFW@", wr);
+    }
     if (T.memexport) fprintf(stderr, "[mx] memexport shader %016llX (%u dwords)\n", (unsigned long long)h, T.words);
     {   // alloc markers: the memexport flush in memexport shaders, nothing (no line at all, so the source and its cached compile stay the same) elsewhere
         std::string b; b.reserve(T.body.size());
@@ -1580,7 +1597,7 @@ static void translate_shader(const std::vector<uint32_t>& code, bool isVs, uint3
     }
     for (auto& kv : T.texs) sh->tex.push_back(kv.second);
     for (auto& kv : T.vfs) sh->vf.push_back({ kv.first, kv.second });
-    if (dyn) { sh->fetchPos = T.dynFetchPos; sh->expPos = T.dynExpPos; sh->dynBase = !T.memexport && T.dynFetchPos.size() <= 32 && T.dynExpPos.size() <= 64; }
+    if (dyn) { sh->fetchPos = T.dynFetchPos; sh->expPos = T.dynExpPos; sh->fetchDstMask = T.dynDstMask; sh->dynBase = !T.memexport && T.dynFetchPos.size() <= 32 && T.dynExpPos.size() <= 64; }
     fallback = (!isVs && T.hasLoop) ? to_level0(src) : std::string();
     if (fallback == src) fallback.clear();
 }
@@ -1711,7 +1728,11 @@ static void shader_record(const std::vector<uint32_t>& code, bool isVs, uint32_t
     if (!g_manifestLines.insert(line).second) return;
     if (FILE* f = fopen(g_manifestPath.c_str(), "a")) { fprintf(f, "%s\n", line.c_str()); fclose(f); }
 }
-static void show_compile_progress(int pct);   // draws the "Compiling shaders... NN%" screen (defined with the sprites, below)
+static void show_compile_progress(int pct);   // draws the "Compiling shaders... NN%" screen (defined with the overlays, below)
+// The first-start screen shows several phases as one percentage: each phase reports 0-100, mapped into [g_progLo, g_progHi].
+static int g_progLo = 0, g_progHi = 100;
+static bool g_progShown = false;                                              // the screen is up
+static void show_phase_progress(int pct) { show_compile_progress(g_progLo + (g_progHi - g_progLo) * std::clamp(pct, 0, 100) / 100); }
 // ---- generic vertex shaders ----
 // The game patches every vertex shader when it binds it: the vertex fetches get the mesh's layout (destination register, stream, stride,
 // offset, format, swizzle, exponent) and the interpolator exports are renumbered or blanked to link with the pixel shader. Each patched
@@ -1762,6 +1783,7 @@ static bool vs_extract(const XShader* b, const std::vector<uint32_t>& bc, const 
         const uint32_t flags = bits(d[1], 12, 1) | (bits(d[1], 13, 1) << 1) | (bits(d[1], 14, 1) << 2) | (rounded << 3);
         const uint32_t ex = bits(d[1], 24, 6), off = bits(d[2], 8, 23);
         if (slot >= 96) { why = "fetch slot"; return false; }
+        if (!(b->fetchDstMask >> dst & 1)) { why = S("fetch destination %u: r%u -> r%u", (unsigned)f, bits(o[0], 12, 6), dst); return false; }   // only the fetches' own registers (see emit_vfetch)
         v->vsf[f * 4 + 0] = slot | (stride << 8) | (fmt << 16) | (flags << 24);
         v->vsf[f * 4 + 1] = (uint32_t)(((int32_t)(off << 9)) >> 9);          // sign-extended, in dwords
         v->vsf[f * 4 + 2] = dsw | (ex << 12) | (dst << 18);
@@ -1825,7 +1847,10 @@ static XShader* vs_variant(const std::vector<uint32_t>& code) {
 // had to compile while its draws were left out, so objects and lighting appeared a few frames after a camera cut. These threads translate and
 // compile every indexed pixel shader into the disk cache, at the lowest priority, so build_shader finds the compiled blob at first use and the
 // draw goes ahead in the same frame. Nothing is registered or recorded. Done once per build and render scale (stamp file);
-// ASURA_NOPSWARM=1 turns it off, ASURA_PSWARMTHREADS=n sets the thread count (default a quarter of the cores).
+// ASURA_NOPSWARM=1 turns it off, ASURA_PSWARMTHREADS=n sets the thread count.
+// It starts once the shaders the game is known to use (the manifest) are compiled, and runs while the game plays (a quarter of the cores, lowest
+// priority). ASURA_PSWARMFG=1 runs it in the foreground first instead, behind the "Compiling shaders" screen on all cores but one (about 7 minutes
+// cold on a 24-core machine).
 static void start_ps_warmup() {
     if (getenv("ASURA_NOPSWARM") || getenv("ASURA_SYNCSHADERS") || shaderindex_size() == 0) return;
     WIN32_FILE_ATTRIBUTE_DATA fa{}; wchar_t ew[MAX_PATH]; GetModuleFileNameW(nullptr, ew, MAX_PATH); GetFileAttributesExW(ew, GetFileExInfoStandard, &fa);
@@ -1840,14 +1865,18 @@ static void start_ps_warmup() {
     static const bool kStaticVs = getenv("ASURA_STATICVS") != nullptr;
     if (!kStaticVs) shaderindex_for_each(true, [&](uint64_t, const std::vector<uint32_t>& code) { list->push_back({ true, code }); });
     shaderindex_for_each(false, [&](uint64_t, const std::vector<uint32_t>& code) { list->push_back({ false, code }); });
-    const unsigned nThreads = getenv("ASURA_PSWARMTHREADS") ? (unsigned)std::max(1, atoi(getenv("ASURA_PSWARMTHREADS"))) : std::max(1u, std::thread::hardware_concurrency() / 4);
+    const bool foreground = getenv("ASURA_PSWARMFG") != nullptr;
+    const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned nThreads = getenv("ASURA_PSWARMTHREADS") ? (unsigned)std::max(1, atoi(getenv("ASURA_PSWARMTHREADS"))) : foreground ? std::max(1u, cores - 1) : std::max(1u, cores / 4);
+    auto finished = std::make_shared<std::atomic<bool>>(false);
     auto next = std::make_shared<std::atomic<size_t>>(0);
     auto left = std::make_shared<std::atomic<unsigned>>(nThreads);
     auto compiled = std::make_shared<std::atomic<size_t>>(0), failed = std::make_shared<std::atomic<size_t>>(0);
     LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
-    fprintf(stderr, "[pswarm] compiling %zu indexed shaders (generic vertex shaders, then pixel shaders) into the cache on %u low-priority threads\n", list->size(), nThreads);
+    fprintf(stderr, "[pswarm] compiling %zu indexed shaders (generic vertex shaders, then pixel shaders) into the cache on %u %s threads\n", list->size(), nThreads,
+            foreground ? "foreground" : "low-priority");
     for (unsigned t = 0; t < nThreads; t++) std::thread([=] {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        SetThreadPriority(GetCurrentThread(), foreground ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_LOWEST);
         t_warmThread = true;
         for (;;) {
             const size_t i = next->fetch_add(1);
@@ -1861,9 +1890,15 @@ static void start_ps_warmup() {
             if (isVs && !tmp.dynBase) continue;
             const char* target = isVs ? "vs_5_0" : "ps_5_0";
             if (load_cached(src, target)) continue;
+            static const bool kTimes = getenv("ASURA_PSWARMTIMES") != nullptr;   // [pswtime] kind, ms, words, HLSL bytes: what the warm-up spends its time on
+            LARGE_INTEGER c0; QueryPerformanceCounter(&c0);
             ComPtr<ID3DBlob> blob = compile_cached(src, "main", target);
             if (!blob && !fallback.empty()) blob = compile_cached(fallback, "main", target);
             (blob ? *compiled : *failed)++;
+            if (kTimes) { LARGE_INTEGER c1; QueryPerformanceCounter(&c1);
+                const double ms = (double)(c1.QuadPart - c0.QuadPart) * g_perfTicksToMs;
+                fprintf(stderr, "[pswtime] %s %.0f %zu %zu %016llX\n", isVs ? "vs" : "ps", ms, code.size(), src.size(), (unsigned long long)h);
+                if (ms > 8000) if (FILE* f = fopen((shader_cache_dir() + S("\\slow_%016llX.hlsl", (unsigned long long)h)).c_str(), "wb")) { fwrite(src.data(), 1, src.size(), f); fclose(f); } }
             if ((i + 1) % 2000 == 0) fprintf(stderr, "[pswarm] %zu of %zu\n", i + 1, list->size());
         }
         if (--*left == 0) {
@@ -1871,8 +1906,21 @@ static void start_ps_warmup() {
             fprintf(stderr, "[pswarm] done: %zu compiled now, %zu failed, %zu were cached, %.0f s\n", compiled->load(), failed->load(),
                     list->size() - compiled->load() - failed->load(), (double)(t1.QuadPart - t0.QuadPart) * g_perfTicksToMs / 1000.0);
             if (FILE* f = fopen(stampPath.c_str(), "w")) { fputs(stampWant.c_str(), f); fclose(f); }
+            *finished = true;
         }
     }).detach();
+    if (!foreground) return;
+    const bool showProgress = !getenv("ASURA_NOPROGRESS");
+    int shown = -1;
+    while (!*finished) {
+        const int pct = (int)(std::min(next->load(), list->size()) * 100 / std::max<size_t>(list->size(), 1));
+        if (pct != shown) {
+            shown = pct;
+            SetWindowTextA(g_hwnd, S("Asura's Wrath - compiling shaders (%d%%)", g_progLo + (g_progHi - g_progLo) * pct / 100).c_str());
+            if (showProgress) show_phase_progress(pct);
+        }
+        Sleep(50);
+    }
 }
 static void shader_precompile() {
     manifest_read();
@@ -1885,15 +1933,16 @@ static void shader_precompile() {
             fprintf(stderr, "[shader] building the shader index from %s\n", cooked.c_str());
             const bool showIdx = !getenv("ASURA_NOPROGRESS");
             int lastPct = -1;
+            g_progLo = 0; g_progHi = 15;                                     // reading the game files: the first part of the first-start screen
             if (shaderindex_build(cooked, cacheDir, [&](int done, int total) {
                     const int pct = total ? done * 100 / total : 100;
                     if (pct == lastPct) return;
                     lastPct = pct;
                     SetWindowTextA(g_hwnd, S("Asura's Wrath - reading shaders from the game files (%d%%)", pct).c_str());
-                    if (showIdx) show_compile_progress(pct);
+                    if (showIdx) show_phase_progress(pct);
                 }))
                 shaderindex_load(cacheDir);
-            if (showIdx) show_compile_progress(-1);
+            g_progLo = 15;                                                   // the compiles take the rest
         }
         g_indexReady = shaderindex_size() > 0;
         fprintf(stderr, "[shader] shader index: %zu shaders\n", shaderindex_size());
@@ -1910,15 +1959,26 @@ static void shader_precompile() {
             }
         }
     }
-    if (!pack_load()) start_ps_warmup();                                     // every pixel shader in the game files, in the background
-    if (getenv("ASURA_NOPRECOMPILE") || getenv("ASURA_SYNCSHADERS")) return;
+    // The shaders the game is known to use (the manifest) compile now, behind the "Compiling shaders" screen. Every other shader in the game files
+    // is compiled afterwards in the background (start_ps_warmup) while the game plays. ASURA_PSWARMFG=1: all of them in the foreground, first.
+    const bool warmFirst = getenv("ASURA_PSWARMFG") != nullptr;
+    if (warmFirst) { g_progHi = 95; if (!pack_load()) start_ps_warmup(); if (g_progShown) g_progLo = 95; }
+    g_progHi = 100;
+    auto end_progress = [warmFirst] {                                        // the screen goes when the game starts
+        if (g_progShown) {
+            show_compile_progress(100); Sleep(400); show_compile_progress(-1);
+            SetWindowTextA(g_hwnd, "Asura's Wrath (recomp)");
+        }
+        if (!warmFirst && !pack_load()) start_ps_warmup();
+    };
+    if (getenv("ASURA_NOPRECOMPILE") || getenv("ASURA_SYNCSHADERS")) { end_progress(); return; }
     // Done already for this build, render scale and manifest? Cached shaders load quickly on first use, so nothing more is needed.
     WIN32_FILE_ATTRIBUTE_DATA fa{}; wchar_t ew[MAX_PATH]; GetModuleFileNameW(nullptr, ew, MAX_PATH); GetFileAttributesExW(ew, GetFileExInfoStandard, &fa);
     const std::string stampWant = S("%08lX%08lX scale=%d manifest=%zu refs=%zu", fa.ftLastWriteTime.dwHighDateTime, fa.ftLastWriteTime.dwLowDateTime, g_resScale, g_manifestLines.size(), g_refLines.size());
     const std::string stampPath = shader_cache_dir() + "\\precompile.stamp";
     if (FILE* f = fopen(stampPath.c_str(), "r")) {
         char b[128] = {}; const size_t n = fread(b, 1, sizeof b - 1, f); fclose(f);
-        if (stampWant == std::string(b, n)) { fprintf(stderr, "[shader] already compiled ahead of time\n"); return; }
+        if (stampWant == std::string(b, n)) { fprintf(stderr, "[shader] already compiled ahead of time\n"); end_progress(); return; }
     }
     const bool havePack = pack_load();
     LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
@@ -1989,19 +2049,41 @@ static void shader_precompile() {
         nManifest++;
     }
     const int total = g_compilePending.load();
-    fprintf(stderr, "[shader] compiling ahead of time: %zu pixel shaders, %zu from the manifest (%zu not found), %d need compiling\n", nPs, nManifest, nMissing, total);
+    {   // the game waits for these, so more threads help: the background workers (6) plus helpers that stop when the queue is empty
+        const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+        const unsigned helpers = total > 64 && cores > 7 ? cores - 7 : 0;
+        for (unsigned i = 0; i < helpers; i++) std::thread([] {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            for (;;) {
+                CompileJob job;
+                {
+                    std::lock_guard<std::mutex> lk(g_compileLock);
+                    if (g_compileQueue.empty()) return;
+                    job = std::move(g_compileQueue.front()); g_compileQueue.pop_front();
+                }
+                auto blob = compile_cached(job.src, "main", job.isVs ? "vs_5_0" : "ps_5_0");
+                if (!blob && !job.fallback.empty()) blob = compile_cached(job.fallback, "main", job.isVs ? "vs_5_0" : "ps_5_0");
+                finish_shader(job.sh, blob.Get(), job.isVs);
+                g_compilePending--;
+            }
+        }).detach();
+        if (helpers) fprintf(stderr, "[shader] %u extra compile threads until the queue is empty\n", helpers);
+    }
+    { LARGE_INTEGER tq; QueryPerformanceCounter(&tq);
+      fprintf(stderr, "[shader] compiling ahead of time: %zu pixel shaders, %zu from the manifest (%zu not found), %d need compiling (queued after %.1f s)\n",
+              nPs, nManifest, nMissing, total, (double)(tq.QuadPart - t0.QuadPart) * g_perfTicksToMs / 1000.0); }
     int shown = -1;
-    const bool showProgress = total > 0 && !getenv("ASURA_NOPROGRESS");
-    if (showProgress) show_compile_progress(0);
+    const bool showProgress = (total > 0 || g_progShown) && !getenv("ASURA_NOPROGRESS");
+    if (showProgress) show_phase_progress(0);
     while (g_compilePending.load() > 0) {
         const int left = g_compilePending.load();
         if (left != shown) {
             shown = left; SetWindowTextA(g_hwnd, S("Asura's Wrath - preparing shaders (%d of %d)", total - left, total).c_str());
-            if (showProgress) show_compile_progress((total - left) * 100 / total);
+            if (showProgress) show_phase_progress((total - left) * 100 / total);
         }
         Sleep(50);
     }
-    if (showProgress) { show_compile_progress(100); Sleep(400); show_compile_progress(-1); }
+    if (showProgress) { show_phase_progress(100); end_progress(); }
     SetWindowTextA(g_hwnd, "Asura's Wrath (recomp)");
     QueryPerformanceCounter(&t1);
     fprintf(stderr, "[shader] done in %.1f s\n", (double)(t1.QuadPart - t0.QuadPart) * g_perfTicksToMs / 1000.0);
@@ -4525,25 +4607,62 @@ static void draw_options(int px, int py, int pw, int ph) {
     draw_overlay(fps, fps_picture, px + fh / 2, py + fh / 2, fw, fh);
 }
 
-// The startup screen while shaders compile: white text on black in the game's own font, centred. The text is pictures of the game's rendering of it
-// (assets\keys\shader_msg, shader_d0 to shader_d9, shader_pct), laid out the way the game's text layout measured it. pct < 0 clears the sprites.
+// The startup screen while shaders compile: "Compiling shaders... NN%", a line saying it happens once, and a progress bar, white on black, centred.
+// Drawn with GDI into a premultiplied panel like the Options menu (BCR2 used pictures of the game's own text, which Asura doesn't have).
+// pct < 0 clears it.
+static int g_progPct = 0;
+static bool progress_picture(int w, int h, std::vector<uint8_t>& rgba, uint64_t& version) {
+    static int lastPct = -1, lastW = 0, lastH = 0; static uint64_t ver = 1;
+    if (g_progPct == lastPct && w == lastW && h == lastH && version == ver) return true;
+    ver++; lastPct = g_progPct; lastW = w; lastH = h; version = ver;
+    BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    void* bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp || !bits) { if (bmp) DeleteObject(bmp); DeleteDC(dc); return false; }
+    HGDIOBJ oldBmp = SelectObject(dc, bmp);
+    memset(bits, 0, (size_t)w * h * 4);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    HFONT big = CreateFontW(-(h * 30 / 100), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+    HFONT smallFont = CreateFontW(-(h * 15 / 100), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+    HGDIOBJ oldFont = SelectObject(dc, big);
+    const std::wstring line1 = L"Compiling shaders... " + std::to_wstring(std::clamp(g_progPct, 0, 100)) + L"%";
+    RECT r1{ 0, 0, w, h * 45 / 100 }; DrawTextW(dc, line1.c_str(), -1, &r1, DT_CENTER | DT_SINGLELINE | DT_BOTTOM | DT_NOPREFIX);
+    SelectObject(dc, smallFont);
+    SetTextColor(dc, RGB(170, 170, 170));
+    RECT r2{ 0, h * 47 / 100, w, h * 70 / 100 };
+    DrawTextW(dc, L"This happens on the first start (and after an update). The game starts when it is done.", -1, &r2, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    // the bar: an outline and the filled part
+    const int bx = w / 8, bw = w - 2 * bx, by = h * 80 / 100, bh = std::max(h * 7 / 100, 3);
+    HBRUSH dim = CreateSolidBrush(RGB(90, 90, 90)), full = CreateSolidBrush(RGB(235, 235, 235));
+    RECT outer{ bx, by, bx + bw, by + bh }; FillRect(dc, &outer, dim);
+    RECT fill{ bx, by, bx + bw * std::clamp(g_progPct, 0, 100) / 100, by + bh }; FillRect(dc, &fill, full);
+    DeleteObject(dim); DeleteObject(full);
+    GdiFlush();
+    rgba.resize((size_t)w * h * 4);
+    const uint8_t* src = (const uint8_t*)bits;
+    for (size_t i = 0; i < (size_t)w * h; i++) {                            // grey levels as premultiplied white over the black screen
+        const uint8_t b = src[i * 4], g = src[i * 4 + 1], r = src[i * 4 + 2];
+        rgba[i * 4] = r; rgba[i * 4 + 1] = g; rgba[i * 4 + 2] = b;
+        rgba[i * 4 + 3] = std::max(r, std::max(g, b));
+    }
+    SelectObject(dc, oldFont); DeleteObject(big); DeleteObject(smallFont);
+    SelectObject(dc, oldBmp); DeleteObject(bmp); DeleteDC(dc);
+    return true;
+}
 static void show_compile_progress(int pct) {
     if (!g_swap || !g_backRtv) return;
-    std::vector<GpuSprite> list;
-    if (pct >= 0) {
-        const float x0 = 480.45f, y0 = 336.0f, m = 4.0f, h = 48.3f;
-        list.push_back({ "shader_msg", x0 - m, y0, 250.8f, h });
-        float nx = x0 + 242.7f + 10.2f - m;
-        for (char c : std::to_string(std::min(pct, 100))) { list.push_back({ std::string("shader_d") + c, nx, y0, 22.5f, h }); nx += 14.5f; }
-        list.push_back({ "shader_pct", nx, y0, 30.7f, h });
-    }
-    gpu_set_sprites(list);
+    static OverlayPic pic;
+    g_progShown = pct >= 0;
+    if (pct >= 0) g_progPct = std::min(pct, 100);
     const float black[4] = { 0, 0, 0, 1 };
     g_ctx->ClearRenderTargetView(g_backRtv.Get(), black);
     if (pct >= 0) {
         const float fit = std::min(g_backW / 1280.0f, g_backH / 720.0f);
         const int pw = std::max((int)std::lround(1280.0f * fit), 1), ph = std::max((int)std::lround(720.0f * fit), 1);
-        draw_sprites(((int)g_backW - pw) / 2, ((int)g_backH - ph) / 2, pw, ph);
+        const int mw = pw * 3 / 4, mh = ph / 5;
+        draw_overlay(pic, progress_picture, ((int)g_backW - mw) / 2, ((int)g_backH - mh) / 2, mw, mh);
     }
     g_swap->Present(0, 0);
     invalidate_binds();

@@ -555,3 +555,46 @@ Things that mattered:
 1. Input past the title screen (XInput works; keyboard and mouse are BCR2's kbm.cpp, not ported), then play into the first episode and look for rendering bugs.
 2. Audio: WASAPI output from BCR2, then XMA decoding (UE3 plays its sound as XMA; BCR2 never needed it).
 3. Saves and the `cache:` utility drive, then the menus with real input.
+
+## Setup (asura_setup.exe, 2026-11-23)
+
+`host\setup.cpp` builds `host\build\asura_setup.exe` (its own small target: `host\build.cmd --target asura_setup`). It finds the player's files, checks each by exact size and then SHA-256, and asks for what is missing. The ISO and the title update are required. Part IV is presented as strongly recommended (episodes 19-22). Episode 11.5, Episode 15.5 and Lost Episodes 1 and 2 are optional. It looks in the data folder, `gamefiles\`, the exe's folder, `Documents\Xenia`, Downloads, Desktop and Documents. If something is still missing, it offers a folder search or an all-drives search, then a file picker for each missing file. It notes near misses (an `Asura*.iso` or a 43430817 content package of another size or hash) as "different version". Results and a hash cache go to `game\sources.ini` (ignored by git). `--check [--search <dir>] [--drives] [--report <file>]` runs without dialogs. `--hash <file>` prints a file's hash. Unpacking (xdvdfs, STFS, delta patch, image) is not part of it yet.
+
+Known-good files (the user's copies):
+
+| File | Size | SHA-256 |
+|---|---|---|
+| Asura's Wrath (World).iso | 8,738,846,720 | b94db72ab0dcef88e14f47e820ef42502b3ebca246d50d564776e630287fd423 |
+| TU_11K620N_000000K000000.0000000000085 | 626,688 | 43914d513122c49afa70f051143f4b3b89279e5d9ef05f2ec73abc604c4dc0a0 |
+| 78E95E38... Part IV | 1,769,050,112 | 543e5273cf788cd9c5e47dcc3d629eb8a88f6996f6f46c2269bba800742be787 |
+| 8A6811EC... Episode 11.5 | 1,163,853,824 | 17c6b0f27d9c6d67c6693dd3712f3fb2d9bc2837d226c418302b3141b8c22ae2 |
+| E2AFB00E... Episode 15.5 | 1,322,115,072 | 69c8d489c295086b755ac635a4c9279e394cb893a817e31cffd7580d00efff16 |
+| 981ED336... Lost Episode 1 | 164,962,304 | 3a1315c5cbf102da29b9a55ff591be36cfebb2c64b5eade9b116b59eed24e089 |
+| F56F8734... Lost Episode 2 | 251,736,064 | 9fa7e282990404043b94d8f07ae53c8a6457474dd8a8becceb5e69f9d07d5a37 |
+| derived: private\default.xex (from the ISO) | 19,644,416 | c7e324a807a4407239b8fbfabe4377c0623889daa772eadac42c8b8f86782479 |
+| derived: private\default.xexp (from the TU) | 573,440 | 918cdee90389f27dee0bfe1bdfd758bc52cc4148666dcae1e35a1c0297f2005c |
+| derived: private\default_patched.xex | 20,529,152 | 5c00e0580849cc46119e7003a7caede861b663c70f767f5188e84fd4b31ffbaa |
+| derived: private\image.bin (xexinfo.py of the patched xex) | 20,512,768 | 0d97444aff937e52164c45dc23cb561fae9ee60e958f61f47a92d4c0df0b1759 |
+
+### What the title update changes
+
+Base executable built "Dec 7 2011 23:41:44", TU "Jan 31 2012 13:59:49" (Scaleform build strings). The XEX version goes from 5 to 0x105, and the TU package holds only `default.xexp`, with no data files (`UPDATE:` stays empty). Comparison of the two unpacked images: both have 37,915 `.pdata` functions. With branch displacements and address immediates masked, 37,914 are identical. The one real change is sub_828EE6A0 (444 -> 460 bytes): after `XMarketplaceCreateOfferEnumerator`-style code (sub_829B6788, which calls XNetLogonGetTitleID and XamUserGetXUID), XamEnumerate, and copying the 104-byte offer records, the TU adds `lwz r3,0x58(r1); cmplwi r3,0; beq +8; bl 0x82BBC5F0`, i.e. it closes the enumeration handle that leaked. This is a Live marketplace (DLC offer list) handle leak and nothing else. Every function after it moved 16 bytes (and the linker reordered others), and only 6,679 functions kept their address.
+
+So the game works the same without the TU. This build still needs it, because ppc\, config\asura.toml, switch_tables.toml, the hooks and the patch scripts all use the TU's addresses (entry 82B75160 against 82B75150 on the disc). Dropping the requirement would mean recompiling from the disc xex and remapping every hard-coded address.
+
+Decision (user, 2026-11-23): the TU stays required; the build is not retargeted to the disc executable.
+
+### First-start shader screen and faster generic vertex shaders (2026-11-23)
+
+- The "Compiling shaders... NN%" screen is now drawn with GDI text and a progress bar (xenos.cpp `progress_picture`, via `draw_overlay`). It used BCR2's pictures of the game's text (`assets\keys\shader_msg` and so on), which don't exist here, so it had been a black screen. One percentage covers every phase: building the shader index (0-15%, first start only), then compiling the manifest shaders. The window title shows it too.
+- Order on start: the manifest shaders (the ones the game is known to use, about 4,500) compile in the foreground behind that screen. During that phase, 17 extra threads (cores - 7) join the 6 background compile workers and stop when the queue is empty. The full warm-up of every indexed shader (19,500) starts afterwards in the background, as before. `ASURA_PSWARMFG=1` runs the whole warm-up in the foreground first (about 7.5 minutes cold before the fix below).
+- Cold start (empty cache, `ASURA_SHADERCACHE=<empty dir>`) to the game: 69-73 s on this machine (24 cores: 8 P + 16 E). It was about 8 minutes with the whole warm-up in the foreground, and the vertex shaders took most of that.
+- Why generic vertex shaders were slow: each vertex fetch wrote `r[dr]`, a register picked at draw time, which made the whole register file an indexed array. fxc then took about 3.7 s for a typical one (up to 34 s), against 1.1 s with fixed registers, and its output was twice as large (222 KB against 103 KB of bytecode). The game really does move fetches between registers per mesh (r2 -> r4, r0 -> r3 ...: the vertex layout). So a fetch now writes through selects over the registers the shader's own fetches write (`@VFR@`/`@VFW@` markers filled in by translate_shader, `XShader::fetchDstMask`), and `vs_extract` sends a variant whose fetch writes any other register to its own compile. Coverage is unchanged: 1,174 generic, 26 on their own (all "not in the shader index"), the same as before. Median generic compile 1.5 s instead of about 3 s on the same threads.
+- Checked: the episode 1 short replay at frames 1,200-9,000 every 300, generic against `ASURA_STATICVS=1`. Frames match until the static run's in-play compiles make the wall-clock replay drift (from about 5,400), and both look correct throughout. No compile failures.
+- Compile throughput is limited by the hardware, not by a lock: 23 separate fxc processes are no faster than 23 threads.
+- `ASURA_PSWARMTIMES=1` logs each warm-up compile (`[pswtime] kind ms words bytes hash`) and writes the HLSL of any compile over 8 s to the cache folder as `slow_<hash>.hlsl`.
+- The user's shader cache is stale after this change (every generic vertex shader's source changed), so the next start shows the screen once.
+
+### Setup: adding DLC later (2026-11-23)
+
+After the first setup (disc and update verified in `game\sources.ini`, both files still there), running `asura_setup.exe` again opens a DLC screen. It lists each DLC as installed, verified but not unpacked, or not added. Yes picks package files (several at once; names don't matter, since each is identified by size and SHA-256), No searches a folder, Cancel closes. `--add-dlc` goes straight there, `--full` reruns the whole setup, and `--add <file>...` does the same without dialogs. The first setup also unpacks every verified DLC at the end now. Unpacking: setup.cpp `install_dlc` (BCR2's STFS reader, wide paths) writes `game\dlc\<content id>.tmp`, moves it into place, and writes `<content id>.name` with the package's display name, as xam.cpp's `list_content` expects. Checked with `--add` into a scratch root: Lost Episode 1 (108 files), Lost Episode 2 (126) and Part IV (614 files, 9 s including the hash) are byte-identical to the existing `game\dlc` copies with the same `.name` text; the TU is recognised as "not a DLC" and NOTES.md as "not an Xbox 360 content package". The dialog version of the DLC screen has not been clicked through.

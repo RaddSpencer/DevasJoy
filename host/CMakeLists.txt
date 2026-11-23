@@ -35,3 +35,9 @@ target_include_directories(asura PRIVATE ${FFMPEG_DIR}/include)
 target_link_directories(asura PRIVATE ${FFMPEG_DIR}/lib)
 file(GLOB FFMPEG_DLLS ${FFMPEG_DIR}/bin/avcodec-*.dll ${FFMPEG_DIR}/bin/avutil-*.dll ${FFMPEG_DIR}/bin/swresample-*.dll)
 add_custom_command(TARGET asura POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FFMPEG_DLLS} $<TARGET_FILE_DIR:asura>)
+
+# Setup (setup.h): finds and verifies the player's game files. Its own small program, so it builds and runs without the recompiled code.
+add_executable(asura_setup WIN32 setup.cpp)
+set_source_files_properties(setup.cpp PROPERTIES COMPILE_DEFINITIONS "NOMINMAX;_CRT_SECURE_NO_WARNINGS;UNICODE;_UNICODE" COMPILE_OPTIONS "/O2")
+target_link_libraries(asura_setup PRIVATE user32 ole32 shell32 bcrypt comdlg32 uuid)
+target_link_options(asura_setup PRIVATE /ENTRY:wmainCRTStartup)
