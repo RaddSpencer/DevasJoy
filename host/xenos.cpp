@@ -20,6 +20,7 @@
 #include <d3d11_1.h>
 #include <dxgi1_6.h>
 #include "shaderpack.h"
+#include "inputguard.h"
 #include "shaderindex.h"
 #include "paths.h"
 #include "kbm.h"
@@ -279,6 +280,7 @@ static DWORD WINAPI window_thread(LPVOID ev) {
     g_hwnd = CreateWindowW(L"asurawin", L"Asura's Wrath (recomp)", WS_OVERLAPPEDWINDOW | (kMinimized ? 0 : WS_VISIBLE), CW_USEDEFAULT, CW_USEDEFAULT,
                            rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, wc.hInstance, nullptr);
     if (kMinimized) ShowWindow(g_hwnd, SW_SHOWMINNOACTIVE);
+    input_guard_install(true);   // Steam's controller chords and other remappers must not Alt+Tab us away (inputguard.h); this thread's loop runs the hooks
     SetEvent((HANDLE)ev);
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }

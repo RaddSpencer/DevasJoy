@@ -20,6 +20,15 @@
 #include <set>
 #include <functional>
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <commctrl.h>
+#include <shellapi.h>
+#include "xex_patcher.h"
+#include "inputguard.h"   // thirdparty\xexpatch (XenonRecomp's XEX delta patcher)
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -113,12 +122,16 @@ std::wstring data_root() {
 // ------------------------------------------------------------------------------------------------------------------------------------------------
 // Progress dialog (the standard Windows one, with Cancel). Without a dialog (the --check mode) it prints a line now and then.
 // ------------------------------------------------------------------------------------------------------------------------------------------------
+// The setup window's worker reports here instead (set once, used only by that thread): (done, total, line2, line1 or null) -> keep going.
+std::function<bool(uint64_t, uint64_t, const std::wstring&, const std::wstring*)> g_progressHook;
+
 struct Progress {
     IProgressDialog* d = nullptr;
-    bool console = false;
+    bool console = false, hooked = false;
     DWORD tick = 0;
     Progress(const wchar_t* line1, bool ui) {
         console = !ui;
+        if (g_progressHook) { hooked = true; console = false; const std::wstring l = line1; g_progressHook(0, 0, L"", &l); return; }
         if (ui && SUCCEEDED(CoCreateInstance(CLSID_ProgressDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) {
             d->SetTitle(kTitle);
             d->SetLine(1, line1, FALSE, nullptr);
@@ -126,11 +139,16 @@ struct Progress {
         }
     }
     ~Progress() { if (d) { d->StopProgressDialog(); d->Release(); } }
-    void line1(const std::wstring& s) { if (d) d->SetLine(1, s.c_str(), FALSE, nullptr); }
+    void line1(const std::wstring& s) { if (hooked) g_progressHook(0, 0, L"", &s); if (d) d->SetLine(1, s.c_str(), FALSE, nullptr); }
+    DWORD printed = 0;
     bool update(uint64_t done, uint64_t total, const std::wstring& line2) {
+        if (hooked) { if (GetTickCount() - tick < 100 && done < total) return g_progressHook(UINT64_MAX, 0, L"", nullptr); tick = GetTickCount(); return g_progressHook(done, total, line2, nullptr); }
         if (GetTickCount() - tick < 100) return d ? !d->HasUserCancelled() : true;
         tick = GetTickCount();
-        if (!d) return true;
+        if (!d) {
+            if (console && total && GetTickCount() - printed > 2000) { printed = GetTickCount(); fprintf(stderr, "  %5.1f%%  %s\n", 100.0 * done / total, utf8(line2).c_str()); }
+            return true;
+        }
         d->SetProgress64(done, total ? total : 1);
         d->SetLine(2, line2.c_str(), TRUE, nullptr);
         return !d->HasUserCancelled();
@@ -457,12 +475,17 @@ void remove_tree(const std::wstring& dir) {
     SHFileOperationW(&op);
 }
 
-// Unpacks the verified package of entry i. Written to <dir>.tmp and moved into place at the end, so an interrupted run leaves nothing half done.
-bool install_dlc(State& st, size_t i, Progress* pr, std::wstring& err) {
-    const std::wstring dir = dlc_dir(st, i), tmp = dir + L".tmp";
+void make_dirs(const std::wstring& d) {
+    for (size_t k = 0; (k = d.find(L'\\', k + 1)) != std::wstring::npos;) CreateDirectoryW(d.substr(0, k).c_str(), nullptr);
+    CreateDirectoryW(d.c_str(), nullptr);
+}
+
+// Every file of an STFS package (DLC, title update) into the folder out (made empty first). displayOut: the package's display name.
+bool extract_stfs(const std::wstring& pkg, const std::wstring& out, Progress* pr, std::wstring& err, std::wstring* displayOut = nullptr) {
+    const std::wstring& tmp = out;
     Stfs s;
-    s.h = CreateFileW(st.found[i].path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    if (s.h == INVALID_HANDLE_VALUE) { err = L"cannot open " + st.found[i].path; return false; }
+    s.h = CreateFileW(pkg.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (s.h == INVALID_HANDLE_VALUE) { err = L"cannot open " + pkg; return false; }
     uint8_t hdr[0x1000];
     if (!s.readAt(0, hdr, sizeof hdr)) { err = L"cannot read the package header"; return false; }
     s.base = ((uint64_t)be32(hdr + 0x340) + 0xFFF) & 0xF000;
@@ -493,12 +516,9 @@ bool install_dlc(State& st, size_t i, Progress* pr, std::wstring& err) {
     };
     uint64_t total = 0, done = 0; for (auto& e : es) if (!e.dir) total += e.size;
     remove_tree(tmp);
-    if (!CreateDirectoryW((st.root + L"\\game").c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) { err = L"cannot create game\\"; return false; }
-    CreateDirectoryW((st.root + L"\\game\\dlc").c_str(), nullptr);
-    if (!CreateDirectoryW(tmp.c_str(), nullptr)) { err = L"cannot create " + tmp; return false; }
-    auto make_dirs = [](const std::wstring& d) { for (size_t k = 0; (k = d.find(L'\\', k + 1)) != std::wstring::npos;) CreateDirectoryW(d.substr(0, k).c_str(), nullptr); CreateDirectoryW(d.c_str(), nullptr); };
+    make_dirs(tmp);
+    if (!exists(tmp)) { err = L"cannot create " + tmp; return false; }
     std::vector<uint8_t> buf(0x1000 * 64);
-    if (pr) pr->line1(std::wstring(L"Unpacking ") + kSetupFiles[i].title + L"...");
     for (size_t k = 0; k < es.size(); k++) {
         const Entry& e = es[k];
         const std::wstring rel = pathOf(k), full = tmp + L"\\" + rel;
@@ -524,6 +544,16 @@ bool install_dlc(State& st, size_t i, Progress* pr, std::wstring& err) {
         CloseHandle(out);
         if (!ok) { remove_tree(tmp); return false; }
     }
+    if (displayOut) *displayOut = display;
+    return true;
+}
+
+// Unpacks the verified DLC package of entry i. Written to <dir>.tmp and moved into place at the end, so an interrupted run leaves nothing half done.
+bool install_dlc(State& st, size_t i, Progress* pr, std::wstring& err) {
+    const std::wstring dir = dlc_dir(st, i), tmp = dir + L".tmp";
+    if (pr) pr->line1(std::wstring(L"Unpacking ") + kSetupFiles[i].title + L"...");
+    std::wstring display;
+    if (!extract_stfs(st.found[i].path, tmp, pr, err, &display)) return false;
     remove_tree(dir);
     if (!MoveFileExW(tmp.c_str(), dir.c_str(), 0)) { err = L"cannot move the unpacked files into place"; remove_tree(tmp); return false; }
     if (FILE* f = _wfopen((dir + L".name").c_str(), L"wb")) { const std::string n = utf8(display.empty() ? kSetupFiles[i].title : display); fwrite(n.data(), 1, n.size(), f); fclose(f); }
@@ -541,6 +571,259 @@ std::wstring install_verified_dlc(State& st) {
         if (!st.ui) fprintf(stderr, "%s\n", utf8(report.substr(report.rfind(L"  - "))).c_str());
     }
     return report;
+}
+
+// ------------------------------------------------------------------------------------------------------------------------------------------------
+// Unpacking the game: what the host loads (host\main.cpp, kfile.cpp)
+//   game\disc\                   the disc's files, without $SystemUpdate\ and default.xex (tools\xdvdfs.py did the same)
+//   game\update\                 the UPDATE: drive (empty: the title update holds no data files)
+//   private\default.xex          from the disc
+//   private\default.xexp         from the title update package
+//   private\default_patched.xex  the update applied, decrypted and decompressed (XenonRecomp's XexPatcher, as XenonRecomp made it)
+//   private\image.bin            the flat memory image at 0x82000000 (as tools\xexinfo.py makes it)
+// Each step is skipped when its output is already there and right, and every output is checked against the hash of the file the recompiled
+// code was made from.
+// ------------------------------------------------------------------------------------------------------------------------------------------------
+struct Derived { const wchar_t* rel; uint64_t size; const char* sha256; };
+const Derived kDerived[] = {
+    { L"private\\default.xex", 19644416ull, "c7e324a807a4407239b8fbfabe4377c0623889daa772eadac42c8b8f86782479" },
+    { L"private\\default.xexp", 573440ull, "918cdee90389f27dee0bfe1bdfd758bc52cc4148666dcae1e35a1c0297f2005c" },
+    { L"private\\default_patched.xex", 20529152ull, "5c00e0580849cc46119e7003a7caede861b663c70f767f5188e84fd4b31ffbaa" },
+    { L"private\\image.bin", 20512768ull, "0d97444aff937e52164c45dc23cb561fae9ee60e958f61f47a92d4c0df0b1759" },
+};
+enum { kDefaultXex, kXexp, kPatched, kImage };
+
+bool derived_ok(State& st, int k) {
+    const std::wstring p = st.root + L"\\" + kDerived[k].rel;
+    uint64_t size = 0, time = 0;
+    return file_stat(p, size, time) && size == kDerived[k].size && st.sha_of(p, nullptr, nullptr) == kDerived[k].sha256;
+}
+
+bool read_at(HANDLE h, uint64_t off, void* dst, size_t n) {
+    LARGE_INTEGER li; li.QuadPart = (LONGLONG)off;
+    if (!SetFilePointerEx(h, li, nullptr, FILE_BEGIN)) return false;
+    uint8_t* d = (uint8_t*)dst;
+    while (n) { DWORD got = 0; if (!ReadFile(h, d, (DWORD)std::min<size_t>(n, 1u << 26), &got, nullptr) || !got) return false; d += got; n -= got; }
+    return true;
+}
+bool write_file(const std::wstring& path, const void* data, size_t n) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool ok = true; const uint8_t* p = (const uint8_t*)data;
+    while (n && ok) { DWORD w = 0; const DWORD k = (DWORD)std::min<size_t>(n, 1u << 26); ok = WriteFile(h, p, k, &w, nullptr) && w == k; p += k; n -= k; }
+    CloseHandle(h);
+    return ok;
+}
+bool read_file(const std::wstring& path, std::vector<uint8_t>& out) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz; GetFileSizeEx(h, &sz);
+    out.resize((size_t)sz.QuadPart);
+    const bool ok = read_at(h, 0, out.data(), out.size());
+    CloseHandle(h);
+    return ok;
+}
+// Writes under a temporary name and renames, so a reader never sees half a file.
+bool replace_file(const std::wstring& path, const void* data, size_t n) {
+    const std::wstring tmp = path + L".tmp";
+    if (!write_file(tmp, data, n)) { DeleteFileW(tmp.c_str()); return false; }
+    return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+}
+
+// XDVDFS (the Xbox 360 disc file system), as tools\xdvdfs.py reads it.
+struct IsoEntry { std::wstring path; uint32_t sector = 0, size = 0; bool dir = false; };
+bool iso_walk(HANDLE h, uint64_t base, uint32_t sector, uint32_t size, const std::wstring& prefix, std::vector<IsoEntry>& out, int depth) {
+    if (!size) return true;
+    if (depth > 32 || size > (64u << 20)) return false;
+    std::vector<uint8_t> d(size);
+    if (!read_at(h, base + (uint64_t)sector * 0x800, d.data(), size)) return false;
+    std::vector<uint32_t> stack{ 0 }; std::set<uint32_t> seen;
+    while (!stack.empty()) {
+        const uint32_t off = stack.back(); stack.pop_back();
+        if (seen.count(off) || off + 14 > d.size()) continue;
+        seen.insert(off);
+        const uint16_t left = d[off] | d[off + 1] << 8, right = d[off + 2] | d[off + 3] << 8;
+        if (left == 0xFFFF) continue;
+        IsoEntry e;
+        e.sector = d[off + 4] | d[off + 5] << 8 | d[off + 6] << 16 | (uint32_t)d[off + 7] << 24;
+        e.size = d[off + 8] | d[off + 9] << 8 | d[off + 10] << 16 | (uint32_t)d[off + 11] << 24;
+        const uint8_t attr = d[off + 12], nlen = d[off + 13];
+        if (off + 14 + nlen > d.size()) continue;
+        e.path = prefix + std::wstring(d.begin() + off + 14, d.begin() + off + 14 + nlen);
+        e.dir = (attr & 0x10) != 0;
+        out.push_back(e);
+        if (e.dir && !iso_walk(h, base, e.sector, e.size, e.path + L"\\", out, depth + 1)) return false;
+        if (left) stack.push_back(left * 4u);
+        if (right) stack.push_back(right * 4u);
+    }
+    return true;
+}
+bool iso_entries(HANDLE h, uint64_t& base, std::vector<IsoEntry>& out) {
+    static const uint64_t kPartitions[] = { 0, 0x2080000, 0xFD90000, 0x18300000 };   // plain, XGD3, XGD2, XGD1
+    for (uint64_t b : kPartitions) {
+        uint8_t vd[28];
+        if (!read_at(h, b + 32 * 0x800, vd, sizeof vd) || memcmp(vd, "MICROSOFT*XBOX*MEDIA", 20)) continue;
+        base = b;
+        const uint32_t rootSec = vd[20] | vd[21] << 8 | vd[22] << 16 | (uint32_t)vd[23] << 24, rootSize = vd[24] | vd[25] << 8 | vd[26] << 16 | (uint32_t)vd[27] << 24;
+        return iso_walk(h, b, rootSec, rootSize, L"", out, 0);
+    }
+    return false;
+}
+// The disc files the game reads: everything but the dashboard update and the executable (which goes to private\).
+bool disc_wanted(const IsoEntry& e) {
+    const std::wstring l = lower(e.path);
+    return l.rfind(L"$systemupdate", 0) != 0 && l != L"default.xex";
+}
+bool disc_up_to_date(const State& st, const std::vector<IsoEntry>& es) {
+    for (const auto& e : es) {
+        if (e.dir || !disc_wanted(e)) continue;
+        uint64_t size = 0, time = 0;
+        if (!file_stat(st.root + L"\\game\\disc\\" + e.path, size, time) || size != e.size) return false;
+    }
+    return true;
+}
+
+// Copies size bytes at off in h to a new file.
+bool copy_out(HANDLE h, uint64_t off, uint64_t size, const std::wstring& path, std::vector<uint8_t>& buf, Progress* pr, uint64_t& done, uint64_t total, std::wstring& err) {
+    HANDLE o = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (o == INVALID_HANDLE_VALUE) { err = L"cannot create " + path; return false; }
+    bool ok = true;
+    for (uint64_t left = size; left && ok;) {
+        const size_t n = (size_t)std::min<uint64_t>(left, buf.size());
+        DWORD w = 0;
+        if (!read_at(h, off, buf.data(), n)) { err = L"the disc image ends early"; ok = false; break; }
+        if (!WriteFile(o, buf.data(), (DWORD)n, &w, nullptr) || w != n) { err = L"cannot write " + path + L" (disk full?)"; ok = false; break; }
+        off += n; left -= n; done += n;
+        if (pr && !pr->update(done, total, path)) { err = L"cancelled"; ok = false; }
+    }
+    CloseHandle(o);
+    if (!ok) DeleteFileW(path.c_str());
+    return ok;
+}
+
+// The flat memory image of an unencrypted XEX (the patched one): tools\xexinfo.py.
+bool xex_image(const std::vector<uint8_t>& x, std::vector<uint8_t>& img, std::wstring& err) {
+    if (x.size() < 0x200 || memcmp(x.data(), "XEX2", 4)) { err = L"not an XEX2 file"; return false; }
+    const uint32_t peOff = be32(&x[8]), secOff = be32(&x[16]), nhdr = be32(&x[20]);
+    if (secOff + 0x114 > x.size() || 0x18 + 8ull * nhdr > x.size() || peOff > x.size()) { err = L"damaged XEX header"; return false; }
+    const uint32_t imageSize = be32(&x[secOff + 4]);
+    uint32_t ffi = 0;
+    for (uint32_t k = 0; k < nhdr; k++) if (be32(&x[0x18 + 8 * k]) == 0x000003FF) ffi = be32(&x[0x18 + 8 * k + 4]);
+    if (!ffi || ffi + 8 > x.size()) { err = L"no file format header"; return false; }
+    const uint16_t enc = (uint16_t)(x[ffi + 4] << 8 | x[ffi + 5]), comp = (uint16_t)(x[ffi + 6] << 8 | x[ffi + 7]);
+    if (enc != 0 || comp > 1) { err = L"the patched XEX is still encrypted or compressed"; return false; }
+    img.assign(imageSize, 0);
+    if (comp == 1) {   // basic: (data, zero) block pairs
+        const uint32_t infoSize = be32(&x[ffi]);
+        size_t src = peOff, dst = 0;
+        for (uint32_t k = 0; k < (infoSize - 8) / 8; k++) {
+            const uint32_t ds = be32(&x[ffi + 8 + 8 * k]), zs = be32(&x[ffi + 12 + 8 * k]);
+            if (src + ds > x.size()) { err = L"damaged XEX data"; return false; }
+            const size_t n = std::min<size_t>(ds, dst < imageSize ? imageSize - dst : 0);
+            memcpy(img.data() + dst, x.data() + src, n);
+            src += ds; dst += (size_t)ds + zs;
+        }
+    } else memcpy(img.data(), x.data() + peOff, std::min<size_t>(imageSize, x.size() - peOff));
+    return true;
+}
+
+// Unpacks the verified disc image and title update. log gets a line per step.
+bool unpack_game(State& st, std::wstring& log, std::wstring& err) {
+    const std::wstring priv = st.root + L"\\private", game = st.root + L"\\game";
+    make_dirs(priv); make_dirs(game + L"\\update");
+    Progress pr(L"Unpacking the game...", st.ui);
+    HANDLE iso = CreateFileW(st.found[0].path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (iso == INVALID_HANDLE_VALUE) { err = L"cannot open " + st.found[0].path; return false; }
+    struct Closer { HANDLE h; ~Closer() { CloseHandle(h); } } closer{ iso };
+    uint64_t base = 0; std::vector<IsoEntry> es;
+    if (!iso_entries(iso, base, es)) { err = L"cannot read the disc image's file system"; return false; }
+    std::vector<uint8_t> buf(1 << 24);
+
+    // 1. default.xex
+    if (derived_ok(st, kDefaultXex)) log += L"  - private\\default.xex: already there\n";
+    else {
+        auto it = std::find_if(es.begin(), es.end(), [](const IsoEntry& e) { return lower(e.path) == L"default.xex"; });
+        if (it == es.end()) { err = L"the disc image has no default.xex"; return false; }
+        uint64_t done = 0; const std::wstring p = priv + L"\\default.xex";
+        if (!copy_out(iso, base + (uint64_t)it->sector * 0x800, it->size, p + L".tmp", buf, &pr, done, it->size, err)) return false;
+        if (!MoveFileExW((p + L".tmp").c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING)) { err = L"cannot write " + p; return false; }
+        st.cache.erase(lower(p));
+        if (!derived_ok(st, kDefaultXex)) { err = L"private\\default.xex is not the executable this build was made from"; return false; }
+        log += L"  - private\\default.xex: written\n";
+    }
+    // 2. the disc's files
+    if (disc_up_to_date(st, es)) log += L"  - game\\disc: already there\n";
+    else {
+        const std::wstring tmp = game + L"\\disc.tmp", dir = game + L"\\disc";
+        remove_tree(tmp); make_dirs(tmp);
+        uint64_t total = 0, done = 0; size_t files = 0;
+        for (const auto& e : es) if (!e.dir && disc_wanted(e)) total += e.size;
+        pr.line1(L"Unpacking the disc's files (about " + gb(total) + L")...");
+        for (const auto& e : es) {
+            if (!disc_wanted(e)) continue;
+            const std::wstring out = tmp + L"\\" + e.path;
+            if (e.dir) { make_dirs(out); continue; }
+            make_dirs(parent(out));
+            if (!copy_out(iso, base + (uint64_t)e.sector * 0x800, e.size, out, buf, &pr, done, total, err)) { remove_tree(tmp); return false; }
+            files++;
+        }
+        remove_tree(dir);
+        if (!MoveFileExW(tmp.c_str(), dir.c_str(), 0)) { err = L"cannot move the disc's files into place"; remove_tree(tmp); return false; }
+        log += L"  - game\\disc: " + std::to_wstring(files) + L" files, " + gb(total) + L"\n";
+    }
+    // 3. default.xexp from the title update
+    if (derived_ok(st, kXexp)) log += L"  - private\\default.xexp: already there\n";
+    else {
+        const std::wstring tmp = priv + L"\\tu.tmp", p = priv + L"\\default.xexp";
+        pr.line1(L"Unpacking the title update...");
+        if (!extract_stfs(st.found[1].path, tmp, &pr, err)) return false;
+        const bool moved = MoveFileExW((tmp + L"\\default.xexp").c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+        remove_tree(tmp);
+        if (!moved) { err = L"the title update package has no default.xexp"; return false; }
+        st.cache.erase(lower(p));
+        if (!derived_ok(st, kXexp)) { err = L"private\\default.xexp is not the update this build was made from"; return false; }
+        log += L"  - private\\default.xexp: written\n";
+    }
+    // 4. the update applied
+    std::vector<uint8_t> patched;
+    const std::wstring patchedPath = priv + L"\\default_patched.xex";
+    if (derived_ok(st, kPatched)) { log += L"  - private\\default_patched.xex: already there\n"; if (!derived_ok(st, kImage) && !read_file(patchedPath, patched)) { err = L"cannot read " + patchedPath; return false; } }
+    else {
+        pr.line1(L"Applying the title update...");
+        std::vector<uint8_t> xex, xexp;
+        if (!read_file(priv + L"\\default.xex", xex) || !read_file(priv + L"\\default.xexp", xexp)) { err = L"cannot read private\\default.xex / default.xexp"; return false; }
+        const XexPatcher::Result r = XexPatcher::apply(xex.data(), xex.size(), xexp.data(), xexp.size(), patched, false);
+        if (r != XexPatcher::Result::Success) { err = L"applying the title update failed (XexPatcher result " + std::to_wstring((int)r) + L")"; return false; }
+        if (!replace_file(patchedPath, patched.data(), patched.size())) { err = L"cannot write " + patchedPath; return false; }
+        st.cache.erase(lower(patchedPath));
+        if (!derived_ok(st, kPatched)) { err = L"private\\default_patched.xex does not match the one this build was made from"; return false; }
+        log += L"  - private\\default_patched.xex: written\n";
+    }
+    // 5. the memory image
+    if (derived_ok(st, kImage)) log += L"  - private\\image.bin: already there\n";
+    else {
+        std::vector<uint8_t> img;
+        if (!xex_image(patched, img, err)) return false;
+        const std::wstring p = priv + L"\\image.bin";
+        if (!replace_file(p, img.data(), img.size())) { err = L"cannot write " + p; return false; }
+        st.cache.erase(lower(p));
+        if (!derived_ok(st, kImage)) { err = L"private\\image.bin does not match the one this build was made from"; return false; }
+        log += L"  - private\\image.bin: written\n";
+    }
+    st.save();
+    return true;
+}
+
+// Whether everything unpack_game makes is in place (reads the disc image's directory and hashes the four private files, through the cache).
+bool game_unpacked(State& st) {
+    for (int k = 0; k < 4; k++) if (!derived_ok(st, k)) return false;
+    if (st.found[0].status != Status::Verified) return exists(st.root + L"\\game\\disc\\BCGame");
+    HANDLE iso = CreateFileW(st.found[0].path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (iso == INVALID_HANDLE_VALUE) return false;
+    uint64_t base = 0; std::vector<IsoEntry> es;
+    const bool ok = iso_entries(iso, base, es) && disc_up_to_date(st, es);
+    CloseHandle(iso);
+    return ok;
 }
 
 // Which known file this is, checked by size and SHA-256. -1 when none: why says what it is instead.
@@ -629,122 +912,6 @@ bool browse_folder(std::wstring& dir) {
     return ok;
 }
 
-// Asks for one file until it verifies. False when the player gave up on it.
-bool ask_for(State& st, size_t i, const wchar_t* extra) {
-    for (;;) {
-        std::wstring path;
-        if (!browse_file(i, path, extra)) return false;
-        bool cancelled = false;
-        bool ok;
-        {
-            Progress pr(L"Checking the file...", true);
-            ok = st.try_file(i, path, &pr, &cancelled);
-        }
-        if (ok) return true;
-        if (cancelled) return false;
-        uint64_t size = 0, time = 0; file_stat(path, size, time);
-        auto it = st.cache.find(lower(path));
-        std::wstring got = size != kSetupFiles[i].size ? L"Its size is " + std::to_wstring(size) + L" bytes."
-                         : it != st.cache.end() ? L"Its SHA-256 is\n  " + wide(it->second.sha) : L"It could not be read.";
-        if (box(std::wstring(L"That is not the file setup needs for ") + kSetupFiles[i].title + L".\n\n" + path + L"\n" + got +
-                L"\n\nThe file needed:\n" + needed_text(i) + L"\n\nChoose another file?", MB_RETRYCANCEL | MB_ICONWARNING) != IDRETRY)
-            return false;
-    }
-}
-
-int run_interactive(State& st) {
-    std::wstring intro =
-        L"This sets up the Asura's Wrath recomp from your own copy of the Xbox 360 game. You will need to dump these files yourself:\n\n";
-    for (size_t i = 0; i < kCount; i++)
-        intro += std::wstring(L"  - ") + kSetupFiles[i].title + L" (" + need_text(kSetupFiles[i].need) + L", " + gb(kSetupFiles[i].size) + L")\n";
-    intro += L"\nSetup looks for them first (in this folder, gamefiles\\, Xenia's content folder, Downloads, Desktop and Documents), checks each one "
-             L"against the known SHA-256, and then asks you for anything it could not find.";
-    if (box(intro, MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) return 1;
-
-    if (!quick_search(st)) { st.save(); return 1; }
-
-    // Further searching, as long as something is missing and the player wants to.
-    bool searchedDrives = false;
-    while (!st.allFound()) {
-        std::wstring m = L"Found so far:\n\n" + summary(st, false) + L"\nSearch further for what is missing?\n\n"
-                         L"Yes: choose a folder to search\n" + (searchedDrives ? L"No: (all drives were searched)\n" : L"No: search all drives (can take a few minutes)\n") +
-                         L"Cancel: go on; you can pick the files yourself next";
-        int r = box(m, MB_YESNOCANCEL | MB_ICONQUESTION);
-        if (r == IDYES) {
-            std::wstring dir;
-            if (browse_folder(dir) && !search(st, { { dir, 12 } }, L"Searching the folder...")) { st.save(); return 1; }
-        } else if (r == IDNO) {
-            if (searchedDrives) continue;
-            searchedDrives = true;
-            if (!search(st, all_drives(), L"Searching all drives...")) { /* cancelled: keep what was found */ }
-        } else break;
-    }
-    st.save();
-
-    // The required files: setup can't finish without them.
-    for (size_t i = 0; i < kCount; i++) {
-        if (kSetupFiles[i].need != Need::Required || st.found[i].status == Status::Verified) continue;
-        std::wstring why = i == 0 ? L"It is the game itself." :
-            L"The recomp's program was translated from the game's executable with this update applied, so it only runs with the updated executable.";
-        if (box(std::wstring(kSetupFiles[i].title) + L" is required. " + why + L"\n\nThe file needed:\n" + needed_text(i) + L"\n\nBrowse for it now?",
-                MB_OKCANCEL | MB_ICONINFORMATION) != IDOK || !ask_for(st, i, L" (required)")) {
-            st.save();
-            box(std::wstring(L"Setup can't finish without ") + kSetupFiles[i].title + L". Run it again when you have the file.", MB_OK | MB_ICONERROR);
-            return 1;
-        }
-        st.save();
-    }
-
-    // Part IV: strongly recommended.
-    for (size_t i = 0; i < kCount; i++) {
-        if (kSetupFiles[i].need != Need::Recommended || st.found[i].status == Status::Verified) continue;
-        std::wstring m = std::wstring(kSetupFiles[i].title) + L" is strongly recommended for the complete experience.\n\n"
-                         L"It holds episodes 19 to 22, which follow episode 18 and finish the story: without it the game stops before its real ending.\n\n"
-                         L"The file needed:\n" + needed_text(i) + L"\n\nBrowse for it now? (No: continue without it)";
-        if (box(m, MB_YESNO | MB_ICONWARNING) == IDYES && ask_for(st, i, L" (strongly recommended; Cancel to skip)")) { st.save(); continue; }
-        st.found[i].status = Status::Skipped;
-        st.save();
-    }
-
-    // The rest: optional, one question for all of them.
-    std::wstring optional;
-    for (size_t i = 0; i < kCount; i++)
-        if (kSetupFiles[i].need == Need::Optional && st.found[i].status != Status::Verified)
-            optional += std::wstring(L"  - ") + kSetupFiles[i].title + L": " + kSetupFiles[i].about + L" (" + kSetupFiles[i].usualName + L")\n";
-    if (!optional.empty()) {
-        bool ask = box(L"These optional DLC episodes were not found:\n\n" + optional + L"\nThe game is complete without them. Browse for them now? "
-                       L"(Cancel in the file window skips that one.)", MB_YESNO | MB_ICONQUESTION) == IDYES;
-        for (size_t i = 0; i < kCount; i++) {
-            if (kSetupFiles[i].need != Need::Optional || st.found[i].status == Status::Verified) continue;
-            if (!ask || !ask_for(st, i, L" (optional; Cancel to skip)")) st.found[i].status = Status::Skipped;
-            st.save();
-        }
-    }
-
-    st.save();
-    const std::wstring unpacked = install_verified_dlc(st);
-    box(L"Your game files are checked:\n\n" + summary(st, false) + (unpacked.empty() ? L"" : L"\nDLC:\n" + unpacked) + L"\nThe list is saved in " + st.sourcesPath +
-        L".\n\nTo add DLC later, run setup again. Unpacking the disc and the title update for the recomp is the next step of setup "
-        L"(not part of this version yet).", MB_OK | MB_ICONINFORMATION);
-    return 0;
-}
-
-// Several files at once (OFN_ALLOWMULTISELECT): the folder, then the names, each 0-terminated, an empty name last.
-bool browse_files(std::vector<std::wstring>& out) {
-    std::vector<wchar_t> buf(1 << 16, 0);
-    OPENFILENAMEW o{}; o.lStructSize = sizeof(o);
-    o.lpstrFilter = L"All files (*.*)\0*.*\0";
-    o.lpstrFile = buf.data(); o.nMaxFile = (DWORD)buf.size();
-    o.lpstrTitle = L"Select your Asura's Wrath DLC package files (you can pick several)";
-    o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_EXPLORER | OFN_DONTADDTORECENT | OFN_ALLOWMULTISELECT;
-    if (!GetOpenFileNameW(&o)) return false;
-    const std::wstring first = buf.data();
-    const wchar_t* p = buf.data() + first.size() + 1;
-    if (!*p) { out.push_back(first); return true; }   // one file: the whole path
-    for (; *p; p += wcslen(p) + 1) out.push_back(first + L"\\" + p);
-    return true;
-}
-
 std::wstring dlc_status(const State& st) {
     std::wstring s;
     for (size_t i = 0; i < kCount; i++) {
@@ -755,38 +922,21 @@ std::wstring dlc_status(const State& st) {
     return s;
 }
 
-// Adding DLC after setup: pick package files (any names, several at once) or search a folder; each is identified by size and SHA-256 and unpacked
-// into game\dlc, where the game finds it on its next start.
-int run_add_dlc(State& st) {
-    // what was verified before and is still there (instant through the hash cache)
-    { Progress pr(L"Checking the files found last time...", true);
-      for (size_t i = 0; i < kCount; i++) if (!st.prevPath[i].empty() && exists(st.prevPath[i])) { bool c = false; st.try_file(i, st.prevPath[i], &pr, &c); } }
-    std::wstring last;
-    for (;;) {
-        const std::wstring pending = install_verified_dlc(st);
-        st.save();
-        if (!pending.empty()) last += pending;
-        bool allIn = true; for (size_t i = 0; i < kCount; i++) if (is_dlc(i) && !dlc_installed(st, i)) allIn = false;
-        std::wstring m = (last.empty() ? L"" : L"Done:\n" + last + L"\n") + L"DLC:\n" + dlc_status(st);
-        if (allIn) { box(m + L"\nEvery DLC is installed.", MB_OK | MB_ICONINFORMATION); return 0; }
-        m += L"\nAdd DLC now?\n\nYes: choose the package files (you can pick several; their names don't matter)\nNo: search a folder for them\nCancel: close";
-        const int r = box(m, MB_YESNOCANCEL | MB_ICONQUESTION);
-        last.clear();
-        if (r == IDYES) {
-            std::vector<std::wstring> files;
-            if (!browse_files(files)) continue;
-            Progress pr(L"Checking the files...", true);
-            for (const auto& f : files) {
-                std::wstring why;
-                const int i = identify(st, f, &pr, why);
-                if (i < 0) last += L"  - " + file_name(f) + L": " + why + L"\n";
-                else if (!is_dlc(i)) last += L"  - " + file_name(f) + L": " + kSetupFiles[i].title + L" (verified; not a DLC)\n";
-            }
-        } else if (r == IDNO) {
-            std::wstring dir;
-            if (browse_folder(dir)) search(st, { { dir, 12 } }, L"Searching the folder...");
-        } else return 0;
-    }
+// --unpack: find and verify the files (as --check), then unpack the game and any verified DLC, without dialogs.
+int run_unpack(State& st) {
+    quick_search(st);
+    st.save();
+    fputs(utf8(summary(st, false)).c_str(), stdout);
+    if (!st.allRequired()) { puts("The disc image and the title update must both be verified first."); return 1; }
+    std::wstring log, err;
+    const DWORD t0 = GetTickCount();
+    const bool ok = unpack_game(st, log, err);
+    fputs(utf8(log).c_str(), stdout);
+    if (!ok) { printf("unpacking failed: %s\n", utf8(err).c_str()); return 1; }
+    const std::wstring dlc = install_verified_dlc(st);
+    st.save();
+    printf("%sdone in %.0f s\n", utf8(dlc).c_str(), (GetTickCount() - t0) / 1000.0);
+    return 0;
 }
 
 // --add <file>...: the same without dialogs.
@@ -821,6 +971,410 @@ int run_check(State& st, const std::vector<std::wstring>& folders, bool drives, 
     return st.allRequired() ? 0 : 1;
 }
 
+
+// ------------------------------------------------------------------------------------------------------------------------------------------------
+// The setup window: a row per file (path box, Browse..., a red/green status), drag and drop, OK once the disc image and the title update are
+// verified or already installed. Searching, checking and unpacking run on a worker thread on a copy of the state; results come back as
+// messages and are merged on the window's thread, which alone owns the real State.
+// ------------------------------------------------------------------------------------------------------------------------------------------------
+#pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+
+enum class RowState { Searching, Empty, Checking, Wrong, Verified, Installed };
+struct Row { HWND label = nullptr, edit = nullptr, browse = nullptr, status = nullptr; RowState state = RowState::Searching; std::wstring path; int pct = -1; };
+
+struct Job { enum Kind { Startup, Check, Search, Install } kind = Startup; int row = -1; std::wstring path; State snap; };
+struct Result { Job::Kind kind = Job::Startup; int row = -1; std::wstring path, why, log; bool ok = false, cancelled = false, gameInstalled = false; State snap; };
+
+constexpr UINT WM_APP_RESULT = WM_APP + 1, WM_APP_PROGRESS = WM_APP + 2;
+enum { ID_EDIT = 100, ID_BROWSE = 200, ID_OK = 1, ID_CANCEL = 2, ID_SEARCH = 300 };
+
+struct Ui {
+    HWND wnd = nullptr, header = nullptr, statusText = nullptr, progress = nullptr, searchBtn = nullptr, okBtn = nullptr, cancelBtn = nullptr;
+    Row rows[kCount];
+    HFONT font = nullptr, bold = nullptr;
+    int dpi = 96;
+    State* st = nullptr;
+    bool gameInstalled = false, closing = false;
+    int pending = 0;            // jobs queued or running
+    bool installing = false;
+    std::wstring status;
+} g;
+
+std::mutex g_jobLock; std::condition_variable g_jobCv; std::deque<Job> g_jobs; std::atomic<bool> g_cancel{ false };
+std::mutex g_progLock; std::wstring g_progLine1, g_progLine2; uint64_t g_progDone = 0, g_progTotal = 0; std::atomic<int> g_progRow{ -1 };
+
+int px(int v) { return MulDiv(v, g.dpi, 96); }
+
+void enqueue(Job j) {
+    g.pending++;
+    { std::lock_guard<std::mutex> lk(g_jobLock); g_jobs.push_back(std::move(j)); }
+    g_jobCv.notify_one();
+}
+
+void worker() {
+    g_progressHook = [](uint64_t done, uint64_t total, const std::wstring& line2, const std::wstring* line1) {
+        if (done != UINT64_MAX) {
+            std::lock_guard<std::mutex> lk(g_progLock);
+            if (line1) { g_progLine1 = *line1; g_progLine2.clear(); g_progDone = 0; g_progTotal = 0; }
+            else { g_progDone = done; g_progTotal = total; g_progLine2 = line2; }
+            PostMessageW(g.wnd, WM_APP_PROGRESS, 0, 0);
+        }
+        return !g_cancel.load();
+    };
+    for (;;) {
+        Job j;
+        {
+            std::unique_lock<std::mutex> lk(g_jobLock);
+            g_jobCv.wait(lk, [] { return !g_jobs.empty(); });
+            j = std::move(g_jobs.front()); g_jobs.pop_front();
+        }
+        g_cancel = false;
+        g_progRow = j.kind == Job::Check ? j.row : -1;
+        auto* r = new Result;
+        r->kind = j.kind; r->row = j.row; r->path = j.path;
+        State& s = j.snap; s.ui = false;
+        switch (j.kind) {
+        case Job::Startup:
+            r->cancelled = !quick_search(s);
+            r->gameInstalled = game_unpacked(s);
+            break;
+        case Job::Search:
+            r->cancelled = !search(s, { { j.path, 12 } }, (L"Searching " + j.path + L"...").c_str());
+            break;
+        case Job::Check: {
+            uint64_t size = 0, time = 0;
+            const size_t i = (size_t)j.row;
+            s.found[i] = Found();
+            if (!file_stat(j.path, size, time)) { r->why = L"cannot be read"; break; }
+            if (size != kSetupFiles[i].size) { r->why = L"wrong size (" + std::to_wstring(size) + L" bytes; needs " + std::to_wstring(kSetupFiles[i].size) + L")"; break; }
+            Progress pr((L"Checking " + file_name(j.path) + L" (" + gb(size) + L")...").c_str(), false);
+            bool cancelled = false;
+            r->ok = s.try_file(i, j.path, &pr, &cancelled);
+            r->cancelled = cancelled;
+            if (!r->ok && !cancelled) r->why = L"different SHA-256: another version or a damaged copy";
+            break;
+        }
+        case Job::Install: {
+            std::wstring log, err;
+            bool ok = true;
+            if (s.found[0].status == Status::Verified && s.found[1].status == Status::Verified && !game_unpacked(s)) ok = unpack_game(s, log, err);
+            if (ok) log += install_verified_dlc(s);
+            r->ok = ok; r->log = log; r->why = err; r->cancelled = g_cancel.load();
+            r->gameInstalled = game_unpacked(s);
+            break;
+        }
+        }
+        r->snap = std::move(s);
+        PostMessageW(g.wnd, WM_APP_RESULT, 0, (LPARAM)r);
+    }
+}
+
+// The recomp itself: asura.exe beside setup, or in the data folder (host\build\asura.exe in the dev layout). "" if neither.
+std::wstring game_exe() {
+    wchar_t p[MAX_PATH]; GetModuleFileNameW(nullptr, p, MAX_PATH);
+    for (const std::wstring& c : { parent(p) + L"\\asura.exe", g.st->root + L"\\asura.exe", g.st->root + L"\\host\\build\\asura.exe" })
+        if (exists(c)) return c;
+    return L"";
+}
+
+bool row_ok(size_t i) { return g.rows[i].state == RowState::Verified || g.rows[i].state == RowState::Installed; }
+bool row_installed(size_t i) { return is_dlc(i) ? dlc_installed(*g.st, i) : g.gameInstalled; }
+
+void set_status(const std::wstring& t) { g.status = t; SetWindowTextW(g.statusText, t.c_str()); }
+
+void refresh() {
+    for (size_t i = 0; i < kCount; i++) {
+        Row& r = g.rows[i];
+        std::wstring t;
+        switch (r.state) {
+        case RowState::Searching: t = L"\x25CF  Searching..."; break;
+        case RowState::Checking: t = r.pct >= 0 ? L"\x25CF  Checking... " + std::to_wstring(r.pct) + L"%" : L"\x25CF  Checking..."; break;
+        case RowState::Empty: t = is_dlc(i) ? L"\x25CF  Not added" : L"\x25CF  Not found"; break;
+        case RowState::Wrong: t = L"\x25CF  Wrong file"; break;
+        case RowState::Verified: t = row_installed(i) ? L"\x25CF  Verified, installed" : L"\x25CF  Verified"; break;
+        case RowState::Installed: t = L"\x25CF  Installed"; break;
+        }
+        SetWindowTextW(r.status, t.c_str());
+        InvalidateRect(r.status, nullptr, TRUE);
+        const bool idle = !g.installing;
+        EnableWindow(r.edit, idle); EnableWindow(r.browse, idle);
+    }
+    EnableWindow(g.okBtn, !g.installing && g.pending == 0 && row_ok(0) && row_ok(1));
+    EnableWindow(g.searchBtn, !g.installing);
+    SetWindowTextW(g.cancelBtn, g.pending ? L"Stop" : L"Close");
+}
+
+// Row i without a verified file: installed, or red (with what was found instead).
+void settle_row(size_t i) {
+    Row& r = g.rows[i];
+    if (r.state == RowState::Verified || r.state == RowState::Checking) return;
+    if (!r.path.empty()) { r.state = RowState::Wrong; return; }
+    r.state = row_installed(i) ? RowState::Installed : RowState::Empty;
+}
+
+void check_row(size_t i, const std::wstring& path) {
+    Row& r = g.rows[i];
+    r.path = path;
+    SetWindowTextW(r.edit, path.c_str());
+    g.st->found[i] = Found();
+    if (path.empty()) { r.state = RowState::Searching; settle_row(i); refresh(); return; }
+    r.state = RowState::Checking; r.pct = -1;
+    Job j; j.kind = Job::Check; j.row = (int)i; j.path = path; j.snap = *g.st;
+    enqueue(std::move(j));
+    refresh();
+}
+
+void merge_cache(const State& from) { for (auto& kv : from.cache) g.st->cache[kv.first] = kv.second; }
+
+void on_result(Result* r) {
+    g.pending--;
+    merge_cache(r->snap);
+    switch (r->kind) {
+    case Job::Startup:
+    case Job::Search:
+        if (r->kind == Job::Startup) g.gameInstalled = r->gameInstalled;
+        for (size_t i = 0; i < kCount; i++) {
+            Row& row = g.rows[i];
+            const Found& f = r->snap.found[i];
+            if (row.state == RowState::Verified || row.state == RowState::Checking) continue;   // the player's own choice wins
+            if (f.status == Status::Verified) {
+                g.st->found[i] = f; row.path = f.path; row.state = RowState::Verified; SetWindowTextW(row.edit, f.path.c_str());
+            } else if (row.path.empty() && !f.mismatches.empty() && !row_installed(i)) {
+                row.path = f.mismatches.front().path; SetWindowTextW(row.edit, row.path.c_str()); row.state = RowState::Wrong;
+            } else { if (row.state == RowState::Searching) row.state = RowState::Empty; settle_row(i); }
+        }
+        set_status(r->cancelled ? L"Search stopped." : r->kind == Job::Startup ? L"Ready. Fill in anything missing: type a path, Browse..., or drop files on this window." : L"Search finished.");
+        break;
+    case Job::Check: {
+        Row& row = g.rows[r->row];
+        if (row.path != r->path || row.state != RowState::Checking) break;   // the box changed meanwhile: a newer check follows
+        row.pct = -1;
+        if (r->ok) { g.st->found[r->row] = r->snap.found[r->row]; row.state = RowState::Verified; set_status(std::wstring(kSetupFiles[r->row].title) + L": verified."); }
+        else { row.state = RowState::Wrong; set_status(std::wstring(kSetupFiles[r->row].title) + L": " + (r->cancelled ? L"check stopped" : L"not the right file, " + r->why) + L"."); }
+        break;
+    }
+    case Job::Install:
+        g.installing = false;
+        g.gameInstalled = r->gameInstalled;
+        for (size_t i = 0; i < kCount; i++) g.st->found[i] = r->snap.found[i];
+        g.st->save();
+        for (size_t i = 0; i < kCount; i++) settle_row(i);
+        SendMessageW(g.progress, PBM_SETPOS, 0, 0);
+        refresh();
+        if (r->cancelled) set_status(L"Stopped. Nothing half-done was left in place; press OK to continue.");
+        else if (!r->ok) { set_status(L"Unpacking failed: " + r->why); MessageBoxW(g.wnd, (L"Unpacking failed:\n" + r->why).c_str(), kTitle, MB_OK | MB_ICONERROR); }
+        else {
+            set_status(L"Done.");
+            const std::wstring done = L"Setup is complete.\n\n" + (r->log.empty() ? std::wstring(L"Everything was already in place.\n") : r->log) +
+                                      L"\nRun setup again at any time to add DLC.";
+            const std::wstring game = game_exe();
+            if (!game.empty()) {
+                if (MessageBoxW(g.wnd, (done + L"\n\nStart the game now?").c_str(), kTitle, MB_YESNO | MB_ICONINFORMATION) == IDYES)
+                    ShellExecuteW(nullptr, L"open", game.c_str(), nullptr, parent(game).c_str(), SW_SHOWNORMAL);
+            } else MessageBoxW(g.wnd, done.c_str(), kTitle, MB_OK | MB_ICONINFORMATION);
+            DestroyWindow(g.wnd);
+        }
+        delete r;
+        return;
+    }
+    g.st->save();
+    if (g.pending == 0) SendMessageW(g.progress, PBM_SETPOS, 0, 0);
+    refresh();
+    delete r;
+}
+
+void on_progress() {
+    std::wstring l1, l2; uint64_t done, total;
+    { std::lock_guard<std::mutex> lk(g_progLock); l1 = g_progLine1; l2 = g_progLine2; done = g_progDone; total = g_progTotal; }
+    const int pos = total ? (int)(done * 1000 / total) : 0;
+    SendMessageW(g.progress, PBM_SETPOS, pos, 0);
+    std::wstring t = l1;
+    if (!l2.empty()) { std::wstring f = l2; if (f.size() > 70) f = L"..." + f.substr(f.size() - 67); t += L"  " + f; }
+    if (t != g.status) set_status(t);
+    const int row = g_progRow.load();
+    if (row >= 0 && g.rows[row].state == RowState::Checking && total) {
+        const int pct = (int)(done * 100 / total);
+        if (pct != g.rows[row].pct) { g.rows[row].pct = pct; refresh(); }
+    }
+}
+
+// Dropped files: one file on a row goes to that row; otherwise each goes to the row its size belongs to.
+void on_drop(HDROP drop) {
+    POINT pt; DragQueryPoint(drop, &pt);
+    const UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    std::vector<std::wstring> files;
+    for (UINT k = 0; k < n; k++) { wchar_t b[MAX_PATH * 4]; if (DragQueryFileW(drop, k, b, MAX_PATH * 4)) files.push_back(b); }
+    DragFinish(drop);
+    if (g.installing || files.empty()) return;
+    if (files.size() == 1) {
+        for (size_t i = 0; i < kCount; i++) {
+            RECT rc; GetWindowRect(g.rows[i].label, &rc); RECT re; GetWindowRect(g.rows[i].status, &re);
+            POINT a{ rc.left, rc.top }, b{ re.right, re.bottom }; ScreenToClient(g.wnd, &a); ScreenToClient(g.wnd, &b);
+            if (pt.y >= a.y && pt.y <= b.y) { check_row(i, files[0]); return; }
+        }
+    }
+    std::wstring unknown;
+    for (const auto& f : files) {
+        uint64_t size = 0, time = 0; bool placed = false;
+        if (file_stat(f, size, time))
+            for (size_t i = 0; i < kCount && !placed; i++) if (kSetupFiles[i].size == size) { check_row(i, f); placed = true; }
+        if (!placed) unknown += (unknown.empty() ? L"" : L", ") + file_name(f);
+    }
+    if (!unknown.empty()) set_status(L"Not one of the files setup needs (by size): " + unknown);
+}
+
+HWND child(const wchar_t* cls, const wchar_t* text, DWORD style, int id, DWORD ex = 0) {
+    HWND h = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, g.wnd, (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
+    SendMessageW(h, WM_SETFONT, (WPARAM)g.font, TRUE);
+    return h;
+}
+
+void layout() {
+    RECT rc; GetClientRect(g.wnd, &rc);
+    const int W = rc.right, m = px(16), browseW = px(88), statusW = px(170), gap = px(8), rowH = px(58), ctrlH = px(25);
+    MoveWindow(g.header, m, px(12), W - 2 * m, px(40), TRUE);
+    int y = px(60);
+    for (size_t i = 0; i < kCount; i++) {
+        if (i == 2) y += px(10);   // a little space between the game and the DLC
+        Row& r = g.rows[i];
+        MoveWindow(r.label, m, y, W - 2 * m, px(20), TRUE);
+        const int ey = y + px(22), editW = W - 2 * m - browseW - statusW - 2 * gap;
+        MoveWindow(r.edit, m, ey, editW, ctrlH, TRUE);
+        MoveWindow(r.browse, m + editW + gap, ey, browseW, ctrlH, TRUE);
+        MoveWindow(r.status, m + editW + gap + browseW + gap, ey, statusW, ctrlH, TRUE);
+        y += rowH;
+    }
+    y += px(6);
+    MoveWindow(g.statusText, m, y, W - 2 * m, px(20), TRUE); y += px(24);
+    MoveWindow(g.progress, m, y, W - 2 * m, px(14), TRUE);
+    const int by = rc.bottom - m - px(28), bw = px(96);
+    MoveWindow(g.searchBtn, m, by, px(150), px(28), TRUE);
+    MoveWindow(g.cancelBtn, W - m - bw, by, bw, px(28), TRUE);
+    MoveWindow(g.okBtn, W - m - 2 * bw - gap, by, bw, px(28), TRUE);
+}
+
+LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        g.wnd = h;
+        NONCLIENTMETRICSW ncm{ sizeof(ncm) }; SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0, g.dpi);
+        g.font = CreateFontIndirectW(&ncm.lfMessageFont);
+        LOGFONTW lb = ncm.lfMessageFont; lb.lfWeight = FW_SEMIBOLD; g.bold = CreateFontIndirectW(&lb);
+        g.header = child(L"STATIC", L"Choose your own dumps of the Xbox 360 game. Each file is checked against the known SHA-256: green is ready, red is missing "
+                                    L"or the wrong file. You can also drop files on this window. Run setup again later to add DLC.", SS_LEFT, -1);
+        for (size_t i = 0; i < kCount; i++) {
+            Row& r = g.rows[i];
+            const KnownFile& k = kSetupFiles[i];
+            const std::wstring label = std::wstring(k.title) + (k.need == Need::Required ? L"  (required)" : k.need == Need::Recommended ? L"  (DLC, strongly recommended: the story's real ending)" : L"  (DLC, optional)");
+            r.label = child(L"STATIC", label.c_str(), SS_LEFT | SS_NOPREFIX, -1);
+            SendMessageW(r.label, WM_SETFONT, (WPARAM)g.bold, TRUE);
+            r.edit = child(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, ID_EDIT + (int)i, WS_EX_CLIENTEDGE);
+            SendMessageW(r.edit, EM_SETCUEBANNER, TRUE, (LPARAM)(std::wstring(L"Usual name: ") + k.usualName).c_str());
+            r.browse = child(L"BUTTON", L"Browse...", WS_TABSTOP | BS_PUSHBUTTON, ID_BROWSE + (int)i);
+            r.status = child(L"STATIC", L"", SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX, -1);
+        }
+        g.statusText = child(L"STATIC", L"Looking for your files...", SS_LEFT | SS_NOPREFIX | SS_ENDELLIPSIS, -1);
+        g.progress = child(PROGRESS_CLASSW, L"", 0, -1);
+        SendMessageW(g.progress, PBM_SETRANGE32, 0, 1000);
+        g.searchBtn = child(L"BUTTON", L"Search a folder...", WS_TABSTOP | BS_PUSHBUTTON, ID_SEARCH);
+        g.okBtn = child(L"BUTTON", L"OK", WS_TABSTOP | BS_DEFPUSHBUTTON, ID_OK);
+        g.cancelBtn = child(L"BUTTON", L"Close", WS_TABSTOP | BS_PUSHBUTTON, ID_CANCEL);
+        DragAcceptFiles(h, TRUE);
+        layout();
+        refresh();
+        return 0;
+    }
+    case WM_SIZE: layout(); return 0;
+    case WM_GETMINMAXINFO: { auto* mm = (MINMAXINFO*)lp; mm->ptMinTrackSize.x = px(640); mm->ptMinTrackSize.y = px(600); return 0; }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wp; HWND c = (HWND)lp;
+        SetBkColor(dc, GetSysColor(COLOR_WINDOW));
+        SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+        for (size_t i = 0; i < kCount; i++) if (c == g.rows[i].status) {
+            const RowState s = g.rows[i].state;
+            SetTextColor(dc, s == RowState::Verified || s == RowState::Installed ? RGB(0, 140, 60) : s == RowState::Empty || s == RowState::Wrong ? RGB(200, 30, 30) : RGB(120, 120, 120));
+        }
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    }
+    case WM_DROPFILES: on_drop((HDROP)wp); return 0;
+    case WM_APP_RESULT: on_result((Result*)lp); return 0;
+    case WM_APP_PROGRESS: on_progress(); return 0;
+    case WM_COMMAND: {
+        const int id = LOWORD(wp), code = HIWORD(wp);
+        if (id >= ID_EDIT && id < ID_EDIT + (int)kCount && code == EN_KILLFOCUS) {
+            const size_t i = id - ID_EDIT;
+            wchar_t b[MAX_PATH * 4]; GetWindowTextW(g.rows[i].edit, b, MAX_PATH * 4);
+            std::wstring t = b;
+            while (!t.empty() && (t.back() == L' ' || t.back() == L'"')) t.pop_back();
+            while (!t.empty() && (t.front() == L' ' || t.front() == L'"')) t.erase(0, 1);
+            if (t != g.rows[i].path) check_row(i, t);
+            return 0;
+        }
+        if (id >= ID_BROWSE && id < ID_BROWSE + (int)kCount) {
+            std::wstring path;
+            if (browse_file(id - ID_BROWSE, path, L"")) check_row(id - ID_BROWSE, path);
+            return 0;
+        }
+        if (id == ID_SEARCH) {
+            std::wstring dir;
+            if (browse_folder(dir)) {
+                for (size_t i = 0; i < kCount; i++) if (!row_ok(i) && g.rows[i].path.empty()) g.rows[i].state = RowState::Searching;
+                Job j; j.kind = Job::Search; j.path = dir; j.snap = *g.st; enqueue(std::move(j)); refresh();
+            }
+            return 0;
+        }
+        if (id == ID_OK && IsWindowEnabled(g.okBtn)) {
+            g.installing = true;
+            set_status(L"Unpacking...");
+            Job j; j.kind = Job::Install; j.snap = *g.st; enqueue(std::move(j));
+            refresh();
+            return 0;
+        }
+        if (id == ID_CANCEL) {
+            if (g.pending) { g_cancel = true; set_status(L"Stopping..."); }
+            else DestroyWindow(h);
+            return 0;
+        }
+        break;
+    }
+    case WM_CLOSE:
+        if (g.installing && MessageBoxW(h, L"Unpacking is still running. Stop it and close setup?", kTitle, MB_YESNO | MB_ICONQUESTION) != IDYES) return 0;
+        g_cancel = true;
+        DestroyWindow(h);
+        return 0;
+    case WM_DESTROY: PostQuitMessage(0); return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+int run_window(State& st) {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES }; InitCommonControlsEx(&icc);
+    g.st = &st;
+    g.dpi = (int)GetDpiForSystem();
+    WNDCLASSW wc{}; wc.lpfnWndProc = wnd_proc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"AsuraSetup";
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
+    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    RegisterClassW(&wc);
+    RECT r{ 0, 0, px(780), px(600) }; AdjustWindowRectExForDpi(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, g.dpi);
+    HWND h = CreateWindowExW(0, wc.lpszClassName, kTitle, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
+                             nullptr, nullptr, wc.hInstance, nullptr);
+    if (!h) return 1;
+    std::thread(worker).detach();
+    input_guard_install(false);   // no Alt+Tab from Steam's controller chords while setup is in front; the controller may still move the mouse
+    { Job j; j.kind = Job::Startup; j.snap = st; enqueue(std::move(j)); }
+    ShowWindow(h, SW_SHOW);
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+        if (m.message == WM_KEYDOWN && m.wParam == VK_RETURN) {   // Enter in a path box: check it now (by leaving the box)
+            for (size_t i = 0; i < kCount; i++) if (m.hwnd == g.rows[i].edit) { SetFocus(g.rows[i].browse); break; }
+        }
+        if (IsDialogMessageW(h, &m)) continue;
+        TranslateMessage(&m); DispatchMessageW(&m);
+    }
+    return 0;
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -835,7 +1389,7 @@ int wmain(int argc, wchar_t** argv) {
     st.root = data_root();
     st.sourcesPath = st.root + L"\\game\\sources.ini";
 
-    bool check = false, drives = false, full = false, addDlc = false; std::vector<std::wstring> folders, adds; std::wstring report;
+    bool check = false, drives = false, unpack = false; std::vector<std::wstring> folders, adds; std::wstring report;
     for (int a = 1; a < argc; a++) {
         std::wstring s = argv[a];
         if (s == L"--hash" && a + 1 < argc) {
@@ -845,22 +1399,19 @@ int wmain(int argc, wchar_t** argv) {
             return sha.empty() ? 1 : 0;
         }
         if (s == L"--check") check = true;
-        else if (s == L"--full") full = true;
-        else if (s == L"--add-dlc") addDlc = true;
+        else if (s == L"--unpack") unpack = true;
         else if (s == L"--add" && a + 1 < argc) adds.push_back(argv[++a]);
         else if (s == L"--drives") drives = true;
         else if (s == L"--search" && a + 1 < argc) folders.push_back(argv[++a]);
         else if (s == L"--report" && a + 1 < argc) report = argv[++a];
         else if (s == L"--root" && a + 1 < argc) { st.root = argv[++a]; st.sourcesPath = st.root + L"\\game\\sources.ini"; }
     }
-    st.ui = !check && adds.empty();
+    st.ui = !check && !unpack && adds.empty();
     st.load();
-    // Setup done before (the disc and the update verified and still there): running it again is for adding DLC, unless --full.
-    const bool setUp = !st.prevPath[0].empty() && exists(st.prevPath[0]) && !st.prevPath[1].empty() && exists(st.prevPath[1]);
-    int r = !adds.empty() ? run_add_files(st, adds)
+    int r = unpack ? run_unpack(st)
+          : !adds.empty() ? run_add_files(st, adds)
           : check ? run_check(st, folders, drives, report)
-          : (addDlc || (setUp && !full)) ? run_add_dlc(st)
-          : run_interactive(st);
+          : run_window(st);
     CoUninitialize();
     return r;
 }

@@ -30,6 +30,7 @@ SAVEDATA.DAT
 asura_logo*.png
 thirdparty/*
 !thirdparty/libmspack/
+!thirdparty/xexpatch/
 
 # player settings written by the Graphics Options menu
 asura.ini
@@ -42,3 +43,6 @@ assets/prompts/
 
 # input recordings of the user's own runs (local test data)
 replays/
+
+# release folder made by tools\make_release.ps1 (may hold a test install with game data)
+release/

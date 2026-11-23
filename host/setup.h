@@ -7,13 +7,16 @@
 //   Episode 11.5, Episode 15.5, Lost Episode 1, Lost Episode 2: optional
 //
 // What it found is written to game\sources.ini (path, size, time and SHA-256 of each verified file), which also saves hashing the 8.7 GB disc image
-// again on the next run. Verified DLC is unpacked into game\dlc\<content id>\ (+ <content id>.name), where the game finds it. Unpacking the disc
-// and the update into game\ and private\ is the next step and is not done here yet (NOTES.md, "Setup").
+// again on the next run. Then it unpacks (setup.cpp unpack_game), skipping anything already in place and correct:
+//   game\disc\ (the disc's files without $SystemUpdate\ and default.xex), game\update\ (empty), private\default.xex, private\default.xexp,
+//   private\default_patched.xex (the update applied with XenonRecomp's patcher, thirdparty\xexpatch) and private\image.bin,
+// each private file checked against the hash of the one the recompiled code was made from; and every verified DLC into game\dlc\<content id>\
+// (+ <content id>.name).
 //
-//   asura_setup.exe                     the interactive setup (dialogs). Once the disc and the update are verified (game\sources.ini), running it
-//                                       again opens the DLC screen instead: add package files (several at once, any names) or search a folder
-//   asura_setup.exe --full              the whole setup again
-//   asura_setup.exe --add-dlc           straight to the DLC screen
+//   asura_setup.exe                     the setup window: a row per file (path box, Browse..., drag and drop, a green/red status), OK unpacks.
+//                                       OK stays greyed out until the disc image and the title update are verified or already installed.
+//                                       Run it again at any time to add DLC: what is installed shows green.
+//   asura_setup.exe --unpack            no dialogs: find and verify (as --check), then unpack the game and the verified DLC
 //   asura_setup.exe --add <file>...     no dialogs: identify each file by size and SHA-256, unpack verified DLC into game\dlc, print the result
 //                                       (exit code 1 if a file was not recognised)
 //   asura_setup.exe --check [--search <folder>]... [--drives] [--report <file>] [--root <folder>]

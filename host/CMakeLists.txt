@@ -37,7 +37,12 @@ file(GLOB FFMPEG_DLLS ${FFMPEG_DIR}/bin/avcodec-*.dll ${FFMPEG_DIR}/bin/avutil-*
 add_custom_command(TARGET asura POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FFMPEG_DLLS} $<TARGET_FILE_DIR:asura>)
 
 # Setup (setup.h): finds and verifies the player's game files. Its own small program, so it builds and runs without the recompiled code.
-add_executable(asura_setup WIN32 setup.cpp)
+# It applies the title update with XenonRecomp's XEX patcher (thirdparty/xexpatch, MIT) and libmspack's LZX decoder.
+set(XEXPATCH_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/xexpatch)
+set_source_files_properties(${XEXPATCH_DIR}/aes.c PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "/TC;/O2;/w")
+set_source_files_properties(${XEXPATCH_DIR}/xex_patcher.cpp ${XEXPATCH_DIR}/memory_mapped_file.cpp PROPERTIES COMPILE_DEFINITIONS "NOMINMAX;_CRT_SECURE_NO_WARNINGS" COMPILE_OPTIONS "/O2;/w")
+add_executable(asura_setup WIN32 setup.cpp ${XEXPATCH_DIR}/xex_patcher.cpp ${XEXPATCH_DIR}/memory_mapped_file.cpp ${XEXPATCH_DIR}/aes.c ${MSPACK_SRC})
+target_include_directories(asura_setup PRIVATE ${XEXPATCH_DIR} ${MSPACK_DIR})
 set_source_files_properties(setup.cpp PROPERTIES COMPILE_DEFINITIONS "NOMINMAX;_CRT_SECURE_NO_WARNINGS;UNICODE;_UNICODE" COMPILE_OPTIONS "/O2")
-target_link_libraries(asura_setup PRIVATE user32 ole32 shell32 bcrypt comdlg32 uuid)
+target_link_libraries(asura_setup PRIVATE user32 gdi32 ole32 shell32 bcrypt comdlg32 comctl32 uuid)
 target_link_options(asura_setup PRIVATE /ENTRY:wmainCRTStartup)

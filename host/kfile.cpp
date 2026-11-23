@@ -18,11 +18,12 @@ std::string data_root() {
         if (const char* e = getenv("ASURA_ROOT")) return std::string(e);
         char p[MAX_PATH]; GetModuleFileNameA(nullptr, p, MAX_PATH);
         std::string d = p; d = d.substr(0, d.find_last_of('\\'));
+        const std::string exeDir = d;
         for (int up = 0; up < 3; up++) {                         // the folder holding game\disc: next to the exe, or above it (host\build\asura.exe)
             if (GetFileAttributesA((d + "\\game\\disc").c_str()) != INVALID_FILE_ATTRIBUTES) return d;
             d = d.substr(0, d.find_last_of('\\'));
         }
-        return std::string("C:\\dev\\asura");
+        return exeDir;                                           // not set up yet: setup unpacks into the exe's folder
     }();
     return r;
 }

@@ -9,6 +9,7 @@
 #include "kernel.h"
 #include "shaderindex.h"
 #include <windows.h>
+#include <shellapi.h>
 #include <algorithm>
 #include <atomic>
 #include <fstream>
@@ -306,6 +307,17 @@ int main(int argc, char** argv) {
     std::vector<char> image = read_file(root + "\\private\\image.bin"), xex = read_file(root + "\\private\\default_patched.xex");
     if (image.size() < PPC_IMAGE_SIZE || xex.size() < 0x1000 || memcmp(xex.data(), "XEX2", 4)) {
         fprintf(stderr, "missing or short private\\image.bin / private\\default_patched.xex under %s\n", root.c_str());
+        // Not set up yet: open setup (asura_setup.exe beside this exe), which unpacks the player's game files here and can start the game after.
+        char exe[MAX_PATH]; GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        std::string setup = exe; setup = setup.substr(0, setup.find_last_of('\\')) + "\\asura_setup.exe";
+        if (GetFileAttributesA(setup.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            if (MessageBoxA(nullptr, "The game files are not set up yet.\n\nOpen setup now? It needs your own copy of Asura's Wrath (the disc image and title update).",
+                            "Asura's Wrath (recomp)", MB_OKCANCEL | MB_ICONINFORMATION) == IDOK)
+                ShellExecuteA(nullptr, "open", setup.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        } else {
+            MessageBoxA(nullptr, ("The game files are not set up: private\\image.bin and private\\default_patched.xex are missing under\n" + root +
+                                  "\n\nRun asura_setup.exe first.").c_str(), "Asura's Wrath (recomp)", MB_OK | MB_ICONERROR);
+        }
         return 1;
     }
 
