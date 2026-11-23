@@ -27,8 +27,9 @@
 #include <thread>
 #include <commctrl.h>
 #include <shellapi.h>
-#include "xex_patcher.h"
-#include "inputguard.h"   // thirdparty\xexpatch (XenonRecomp's XEX delta patcher)
+#include "xex_patcher.h"   // thirdparty\xexpatch (XenonRecomp's XEX delta patcher)
+#include "inputguard.h"
+#include "version.h"
 
 #pragma comment(lib, "bcrypt.lib")
 
@@ -67,7 +68,8 @@ const KnownFile kSetupFiles[] = {
 };
 constexpr size_t kCount = sizeof(kSetupFiles) / sizeof(kSetupFiles[0]);
 constexpr uint32_t kTitleId = 0x43430817;
-const wchar_t* const kTitle = L"Asura's Wrath recomp - Setup";
+const std::wstring kTitleText = [] { const char* v = "Asura's Wrath recomp - Setup " ASURA_VERSION; return std::wstring(v, v + strlen(v)); }();
+const wchar_t* const kTitle = kTitleText.c_str();
 
 // ------------------------------------------------------------------------------------------------------------------------------------------------
 // Small helpers
@@ -928,6 +930,7 @@ int run_unpack(State& st) {
     st.save();
     fputs(utf8(summary(st, false)).c_str(), stdout);
     if (!st.allRequired()) { puts("The disc image and the title update must both be verified first."); return 1; }
+    if (st.root.size() > ASURA_MAX_ROOT_LEN) { printf("The data folder's path is too long (%zu characters, at most %d): move it somewhere shorter.\n", st.root.size(), ASURA_MAX_ROOT_LEN); return 1; }
     std::wstring log, err;
     const DWORD t0 = GetTickCount();
     const bool ok = unpack_game(st, log, err);
@@ -1099,7 +1102,7 @@ void refresh() {
         const bool idle = !g.installing;
         EnableWindow(r.edit, idle); EnableWindow(r.browse, idle);
     }
-    EnableWindow(g.okBtn, !g.installing && g.pending == 0 && row_ok(0) && row_ok(1));
+    EnableWindow(g.okBtn, !g.installing && g.pending == 0 && row_ok(0) && row_ok(1) && g.st->root.size() <= ASURA_MAX_ROOT_LEN);
     EnableWindow(g.searchBtn, !g.installing);
     SetWindowTextW(g.cancelBtn, g.pending ? L"Stop" : L"Close");
 }
@@ -1144,6 +1147,9 @@ void on_result(Result* r) {
             } else { if (row.state == RowState::Searching) row.state = RowState::Empty; settle_row(i); }
         }
         set_status(r->cancelled ? L"Search stopped." : r->kind == Job::Startup ? L"Ready. Fill in anything missing: type a path, Browse..., or drop files on this window." : L"Search finished.");
+        if (g.st->root.size() > ASURA_MAX_ROOT_LEN)
+            set_status(L"This folder's path is too long (" + std::to_wstring(g.st->root.size()) + L" characters, at most " + std::to_wstring(ASURA_MAX_ROOT_LEN) +
+                       L"): some game files would not fit. Move the folder somewhere shorter, e.g. C:\\Games\\AsurasWrath, and run setup again.");
         break;
     case Job::Check: {
         Row& row = g.rows[r->row];

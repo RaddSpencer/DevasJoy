@@ -21,6 +21,7 @@
 #include <dxgi1_6.h>
 #include "shaderpack.h"
 #include "inputguard.h"
+#include "version.h"
 void report_problem(const char* kind, const std::string& title, const std::string& details, void (*extra)(FILE*, void*) = nullptr, void* arg = nullptr);   // main.cpp
 #include "shaderindex.h"
 #include "paths.h"
@@ -280,6 +281,7 @@ static DWORD WINAPI window_thread(LPVOID ev) {
     static const bool kMinimized = getenv("ASURA_MINIMIZED") != nullptr;    // test runs: start minimized, without taking focus
     g_hwnd = CreateWindowW(L"asurawin", L"Asura's Wrath (recomp)", WS_OVERLAPPEDWINDOW | (kMinimized ? 0 : WS_VISIBLE), CW_USEDEFAULT, CW_USEDEFAULT,
                            rc.right - rc.left, rc.bottom - rc.top, nullptr, nullptr, wc.hInstance, nullptr);
+    SetWindowTextA(g_hwnd, ASURA_TITLE);
     if (kMinimized) ShowWindow(g_hwnd, SW_SHOWMINNOACTIVE);
     input_guard_install(true);   // Steam's controller chords and other remappers must not Alt+Tab us away (inputguard.h); this thread's loop runs the hooks
     SetEvent((HANDLE)ev);
@@ -1976,7 +1978,7 @@ static void shader_precompile() {
     auto end_progress = [warmFirst] {                                        // the screen goes when the game starts
         if (g_progShown) {
             show_compile_progress(100); Sleep(400); show_compile_progress(-1);
-            SetWindowTextA(g_hwnd, "Asura's Wrath (recomp)");
+            SetWindowTextA(g_hwnd, ASURA_TITLE);
         }
         if (!warmFirst && !pack_load()) start_ps_warmup();
     };
@@ -2093,7 +2095,7 @@ static void shader_precompile() {
         Sleep(50);
     }
     if (showProgress) { show_phase_progress(100); end_progress(); }
-    SetWindowTextA(g_hwnd, "Asura's Wrath (recomp)");
+    SetWindowTextA(g_hwnd, ASURA_TITLE);
     QueryPerformanceCounter(&t1);
     fprintf(stderr, "[shader] done in %.1f s\n", (double)(t1.QuadPart - t0.QuadPart) * g_perfTicksToMs / 1000.0);
     if (FILE* f = fopen(stampPath.c_str(), "w")) { fputs(stampWant.c_str(), f); fclose(f); }

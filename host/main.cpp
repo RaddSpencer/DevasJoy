@@ -7,6 +7,7 @@
 //   82000000           the image, then the indirect-call table (8 bytes per code word)
 //   A0000000-BFFFFFFF  physical memory, aliased at C0000000 and E0000000 like the console
 #include "kernel.h"
+#include "version.h"
 #include "shaderindex.h"
 #include <windows.h>
 #include <shellapi.h>
@@ -156,16 +157,16 @@ void report_problem(const char* kind, const std::string& title, const std::strin
     snprintf(path, sizeof path, "%s\\%s_%04d-%02d-%02d_%02d-%02d-%02d.txt", dir.c_str(), kind, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
     bool saved = false;
     if (FILE* f = fopen(path, "w")) {
-        fprintf(f, "%s\n%s\n", title.c_str(), details.c_str());
+        fprintf(f, "%s\n%s\nversion %s\n", title.c_str(), details.c_str(), ASURA_VERSION_LINE);
         if (extra) extra(f, arg);
         fclose(f);
         saved = true;
     }
-    std::string msg = title + "\n\n" + details + "\n\n";
+    std::string msg = title + "\n\n" + details + "\n\nVersion " ASURA_VERSION_LINE "\n\n";
     msg += saved ? "A report was saved to\n" + std::string(path) + "\n\nPlease send it (and the log, if you ran asura_debug.cmd) with a description of what was happening."
                  : std::string("The report could not be saved.");
     HWND owner = nullptr;
-    MessageBoxA(owner, msg.c_str(), "Asura's Wrath (recomp)", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+    MessageBoxA(owner, msg.c_str(), ASURA_TITLE, MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
     TerminateProcess(GetCurrentProcess(), 3);
 }
 
@@ -346,6 +347,7 @@ int main(int argc, char** argv) {
         snprintf(n, sizeof n, "\\asura_%04d-%02d-%02d_%02d-%02d-%02d.log", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
         std::string file = getenv("ASURA_LOGFILE") ? getenv("ASURA_LOGFILE") : dir + n;
         if (!freopen(file.c_str(), "w", stderr)) g_logging = false;
+        else fprintf(stderr, "[version] Asura's Wrath recomp %s\n", ASURA_VERSION_LINE);
         setvbuf(stderr, nullptr, _IOFBF, 1 << 20);
         CreateThread(nullptr, 0, [](LPVOID) -> DWORD { for (;;) { Sleep(500); fflush(stderr); } }, nullptr, 0, nullptr);
     }
@@ -359,6 +361,10 @@ int main(int argc, char** argv) {
     if (getenv("ASURA_TESTCRASH")) *(volatile int*)nullptr = 0;   // checks the crash report
 
     const std::string root = data_root();
+    if (root.size() > ASURA_MAX_ROOT_LEN)
+        MessageBoxA(nullptr, ("This folder's path is too long (" + std::to_string(root.size()) + " characters, at most " + std::to_string(ASURA_MAX_ROOT_LEN) +
+                              "), so some game files can't be opened:\n" + root + "\n\nMove the folder somewhere shorter, e.g. C:\\Games\\AsurasWrath.").c_str(),
+                    ASURA_TITLE, MB_OK | MB_ICONWARNING);
     std::vector<char> image = read_file(root + "\\private\\image.bin"), xex = read_file(root + "\\private\\default_patched.xex");
     if (image.size() < PPC_IMAGE_SIZE || xex.size() < 0x1000 || memcmp(xex.data(), "XEX2", 4)) {
         fprintf(stderr, "missing or short private\\image.bin / private\\default_patched.xex under %s\n", root.c_str());
@@ -367,11 +373,11 @@ int main(int argc, char** argv) {
         std::string setup = exe; setup = setup.substr(0, setup.find_last_of('\\')) + "\\asura_setup.exe";
         if (GetFileAttributesA(setup.c_str()) != INVALID_FILE_ATTRIBUTES) {
             if (MessageBoxA(nullptr, "The game files are not set up yet.\n\nOpen setup now? It needs your own copy of Asura's Wrath (the disc image and title update).",
-                            "Asura's Wrath (recomp)", MB_OKCANCEL | MB_ICONINFORMATION) == IDOK)
+                            ASURA_TITLE, MB_OKCANCEL | MB_ICONINFORMATION) == IDOK)
                 ShellExecuteA(nullptr, "open", setup.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         } else {
             MessageBoxA(nullptr, ("The game files are not set up: private\\image.bin and private\\default_patched.xex are missing under\n" + root +
-                                  "\n\nRun asura_setup.exe first.").c_str(), "Asura's Wrath (recomp)", MB_OK | MB_ICONERROR);
+                                  "\n\nRun asura_setup.exe first.").c_str(), ASURA_TITLE, MB_OK | MB_ICONERROR);
         }
         return 1;
     }

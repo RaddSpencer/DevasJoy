@@ -46,3 +46,6 @@ replays/
 
 # release folder made by tools\make_release.ps1 (may hold a test install with game data)
 release/
+
+# written by tools\make_release.ps1 for a release build, removed after
+host/generated/build_version.h
