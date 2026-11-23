@@ -21,6 +21,7 @@
 #include <dxgi1_6.h>
 #include "shaderpack.h"
 #include "inputguard.h"
+void report_problem(const char* kind, const std::string& title, const std::string& details, void (*extra)(FILE*, void*) = nullptr, void* arg = nullptr);   // main.cpp
 #include "shaderindex.h"
 #include "paths.h"
 #include "kbm.h"
@@ -490,7 +491,12 @@ static bool device_init() {
     HRESULT hr = D3D11CreateDeviceAndSwapChain(adapter.Get(), dt, nullptr, 0, want, 2, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, &got, &g_ctx);
     if (FAILED(hr)) hr = D3D11CreateDeviceAndSwapChain(adapter.Get(), dt, nullptr, 0, want + 1, 1, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, &got, &g_ctx);
     if (FAILED(hr) && adapter) hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, want, 2, D3D11_SDK_VERSION, &sd, &g_swap, &g_dev, &got, &g_ctx);
-    if (FAILED(hr)) { fprintf(stderr, "[gfx] D3D11 device creation failed: %08lX; running without rendering\n", hr); return false; }
+    if (FAILED(hr)) {
+        fprintf(stderr, "[gfx] D3D11 device creation failed: %08lX; running without rendering\n", hr);
+        char d[200]; snprintf(d, sizeof d, "Direct3D 11 device creation failed (%08lX). The game needs a graphics card and driver with Direct3D 11 (feature level 11.0) support.", hr);
+        if (!getenv("ASURA_NOGPUOK")) report_problem("gpu", "Asura's Wrath can't start its graphics.", d);
+        return false;
+    }
     g_featureLevel = got;
     g_ctx.As(&g_ctx1);
     {   // Queue at most one finished frame ahead of the display. The default of three adds visible input lag.
@@ -741,6 +747,7 @@ cbuffer CS : register(b1) {
   float4 vpW;       // w0_fmt, index offset
   float4 alpha;     // func, ref
   float4 vpSnap;    // target width and height (0 = off), rest of the half pixel, half host pixel already applied
+  float4 vpRs;      // render scale, 1 / render scale (a constant, so one compiled shader serves every internal resolution)
   uint4 vfo[24];
   int4 tfsw[32];
   float4 tfp[32];   // uv scale x/y, exp scale, cube/unused
@@ -1522,7 +1529,7 @@ static void translate_shader(const std::vector<uint32_t>& code, bool isVs, uint3
         // along their screen derivatives, so lookup-table passes compute the values the game laid out per guest pixel.
         // A hair past the centre (+0.02 guest pixel): the colour table's shader picks slice and row from these values, and at the exact centre the
         // first row of each slice sat on the boundary with the slice before. Which side won depended on the render scale (fine at 2, green at 3).
-        src += S(" float2 gd=(floor(In.pos.xy/%d.0)+0.52)*%d.0-In.pos.xy; if(vpW.z==0.0) gd=0;\n", g_resScale, g_resScale);
+        src += " float2 gd=(floor(In.pos.xy*vpRs.y)+0.52)*vpRs.x-In.pos.xy; if(vpW.z==0.0) gd=0;\n";   // the scale is a constant: no recompile per resolution
         for (int i = 0; i < 16; i++) {
             if (T.useArray) src += S(" r[%d]=In.o[%d]+ddx_fine(In.o[%d])*gd.x+ddy_fine(In.o[%d])*gd.y;\n", i, i, i, i);
             else if (T.usedRegs.count(i)) src += S(" r%d=In.o[%d]+ddx_fine(In.o[%d])*gd.x+ddy_fine(In.o[%d])*gd.y;\n", i, i, i, i);
@@ -1530,7 +1537,7 @@ static void translate_shader(const std::vector<uint32_t>& code, bool isVs, uint3
         if (paramGen < 16) {
             // The game expects guest pixels. vpW.z set: the guest pixel's centre, for small targets (lookup tables) whose shaders
             // turn the position into integer rows and slices; otherwise the host pixel's own position, for finer upscaled passes.
-            std::string pos = S("(vpW.z!=0.0?floor(In.pos.xy/%d.0)+0.5:In.pos.xy/%d.0)", g_resScale, g_resScale);
+            const std::string pos = "(vpW.z!=0.0?floor(In.pos.xy*vpRs.y)+0.5:In.pos.xy*vpRs.y)";
             if (T.useArray) src += S(" r[%u]=float4(%s,0,0);\n", paramGen, pos.c_str());
             else if (T.usedRegs.count(paramGen)) src += S(" r%u=float4(%s,0,0);\n", paramGen, pos.c_str());
         }
@@ -1848,7 +1855,7 @@ static XShader* vs_variant(const std::vector<uint32_t>& code) {
 // (93% of the pixel shaders first seen in episodes 4-8 had no patched words and paramGen FFFFFFFF). A shader the game used for the first time
 // had to compile while its draws were left out, so objects and lighting appeared a few frames after a camera cut. These threads translate and
 // compile every indexed pixel shader into the disk cache, at the lowest priority, so build_shader finds the compiled blob at first use and the
-// draw goes ahead in the same frame. Nothing is registered or recorded. Done once per build and render scale (stamp file);
+// draw goes ahead in the same frame. Nothing is registered or recorded. Done once per build (stamp file; the render scale is a shader constant, so it needs no recompile);
 // ASURA_NOPSWARM=1 turns it off, ASURA_PSWARMTHREADS=n sets the thread count.
 // It starts once the shaders the game is known to use (the manifest) are compiled, and runs while the game plays (a quarter of the cores, lowest
 // priority). ASURA_PSWARMFG=1 runs it in the foreground first instead, behind the "Compiling shaders" screen on all cores but one (about 7 minutes
@@ -1856,7 +1863,7 @@ static XShader* vs_variant(const std::vector<uint32_t>& code) {
 static void start_ps_warmup() {
     if (getenv("ASURA_NOPSWARM") || getenv("ASURA_SYNCSHADERS") || shaderindex_size() == 0) return;
     WIN32_FILE_ATTRIBUTE_DATA fa{}; wchar_t ew[MAX_PATH]; GetModuleFileNameW(nullptr, ew, MAX_PATH); GetFileAttributesExW(ew, GetFileExInfoStandard, &fa);
-    const std::string stampWant = S("%08lX%08lX scale=%d index=%zu vs=%d", fa.ftLastWriteTime.dwHighDateTime, fa.ftLastWriteTime.dwLowDateTime, g_resScale, shaderindex_size(), getenv("ASURA_STATICVS") ? 0 : 1);
+    const std::string stampWant = S("%08lX%08lX index=%zu vs=%d", fa.ftLastWriteTime.dwHighDateTime, fa.ftLastWriteTime.dwLowDateTime, shaderindex_size(), getenv("ASURA_STATICVS") ? 0 : 1);
     const std::string stampPath = shader_cache_dir() + "\\pswarm.stamp";
     if (FILE* f = fopen(stampPath.c_str(), "r")) {
         char b[160] = {}; const size_t n = fread(b, 1, sizeof b - 1, f); fclose(f);
@@ -1976,7 +1983,7 @@ static void shader_precompile() {
     if (getenv("ASURA_NOPRECOMPILE") || getenv("ASURA_SYNCSHADERS")) { end_progress(); return; }
     // Done already for this build, render scale and manifest? Cached shaders load quickly on first use, so nothing more is needed.
     WIN32_FILE_ATTRIBUTE_DATA fa{}; wchar_t ew[MAX_PATH]; GetModuleFileNameW(nullptr, ew, MAX_PATH); GetFileAttributesExW(ew, GetFileExInfoStandard, &fa);
-    const std::string stampWant = S("%08lX%08lX scale=%d manifest=%zu refs=%zu", fa.ftLastWriteTime.dwHighDateTime, fa.ftLastWriteTime.dwLowDateTime, g_resScale, g_manifestLines.size(), g_refLines.size());
+    const std::string stampWant = S("%08lX%08lX manifest=%zu refs=%zu", fa.ftLastWriteTime.dwHighDateTime, fa.ftLastWriteTime.dwLowDateTime, g_manifestLines.size(), g_refLines.size());
     const std::string stampPath = shader_cache_dir() + "\\precompile.stamp";
     if (FILE* f = fopen(stampPath.c_str(), "r")) {
         char b[128] = {}; const size_t n = fread(b, 1, sizeof b - 1, f); fclose(f);
@@ -3211,7 +3218,7 @@ static XShader* g_vsCur = nullptr; static XShader* g_psCur = nullptr; static uin
 
 struct alignas(16) StateCb {
     uint32_t bools[8]; uint32_t loops[32];
-    float vpNdc[4]; float vpZ[4]; float vpW[4]; float alpha[4]; float vpSnap[4];
+    float vpNdc[4]; float vpZ[4]; float vpW[4]; float alpha[4]; float vpSnap[4]; float vpRs[4];
     uint32_t vfo[96];
     int32_t tfsw[32 * 4];
     float tfp[32 * 4];
@@ -3220,6 +3227,7 @@ struct alignas(16) StateCb {
     uint32_t vsf[32 * 4];
     int32_t vsx[64];
 };
+static_assert(sizeof(StateCb) <= 4096, "StateCb must fit g_cbState (mkcb(4096))");
 
 static uint32_t vb_alloc(uint32_t size, uint8_t*& ptr) {
     size = align_up(size, 16);
@@ -4260,6 +4268,7 @@ static void issue_draw(uint32_t init, const uint32_t* inlineIdx, uint32_t dmaBas
         const bool snap = g_resScale > 1 && !(g_regs[R_VTX_CNTL] & 1) && (g_regs[R_SURFACE_INFO] & 0x3FFF) > 256;   // small targets: see vpW.z
         cb.vpSnap[0] = snap ? (float)rw : 0.0f; cb.vpSnap[1] = (float)rh; cb.vpSnap[2] = 0.5f - 0.5f / g_resScale; cb.vpSnap[3] = 0.5f / g_resScale;
     }
+    cb.vpRs[0] = (float)g_resScale; cb.vpRs[1] = 1.0f / (float)g_resScale; cb.vpRs[2] = 0; cb.vpRs[3] = 0;
     cb.vpW[0] = (float)((vte >> 10) & 1); cb.vpW[1] = (float)indexOffset;
     {   // colour target 0 is the console's 7e3 float format: clamp the output to its range (pixel shader epilogue). ASURA_NO7E3CLAMP to compare.
         static const bool kNo7e3 = getenv("ASURA_NO7E3CLAMP") != nullptr;

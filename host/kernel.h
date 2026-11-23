@@ -75,6 +75,9 @@ void bind_guest_thread(PPCContext& ctx, const GuestHostThread& t);
 void call_guest(PPCContext& ctx, uint32_t fn);   // ctx registers already set
 
 // ---- paths ----
+// A problem the player should see (crash, fatal error, no Direct3D 11): writes logs\<kind>_<date>.txt with title and details (plus anything the
+// writer callback adds), shows a message naming the file, and ends the process. Safe to call from any thread, once.
+void report_problem(const char* kind, const std::string& title, const std::string& details, void (*extra)(FILE*, void*) = nullptr, void* arg = nullptr);
 std::string data_root();    // folder holding game\, saves\ (C:\dev\asura in the development layout)
 bool resolve_game_path(const std::string& guestPath, std::string& hostPath, bool& writable);
 void content_mount(const std::string& root, const std::string& hostDir, bool writable);

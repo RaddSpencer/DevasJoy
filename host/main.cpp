@@ -10,6 +10,8 @@
 #include "shaderindex.h"
 #include <windows.h>
 #include <shellapi.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 #include <algorithm>
 #include <atomic>
 #include <fstream>
@@ -65,6 +67,7 @@ static void guest_backtrace(uint32_t sp) {
     }
     fprintf(stderr, "\n");
 }
+static void write_crash(FILE* out, PEXCEPTION_POINTERS ep);
 static LONG CALLBACK CrashHandler(PEXCEPTION_POINTERS ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code >= 0xC000008Du && code <= 0xC0000093u) {   // floating-point traps: mask them and go on
@@ -74,15 +77,43 @@ static LONG CALLBACK CrashHandler(PEXCEPTION_POINTERS ep) {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (code == DBG_PRINTEXCEPTION_C || code == DBG_PRINTEXCEPTION_WIDE_C || code == 0x406D1388 || code == 0xE06D7363) return EXCEPTION_CONTINUE_SEARCH;
-    fprintf(stderr, "\n*** EXCEPTION %08lX at host +%llX thread %lu\n", code,
+    write_crash(stderr, ep);
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+// The same details for a crash nothing handled, into logs\crash_<date>.txt with a minidump beside it, and a message for the player.
+static LONG WINAPI UnhandledFilter(PEXCEPTION_POINTERS ep) {
+    char what[160];
+    snprintf(what, sizeof what, "exception %08lX at asura.exe+%llX", ep->ExceptionRecord->ExceptionCode,
+             (unsigned long long)((uintptr_t)ep->ExceptionRecord->ExceptionAddress - (uintptr_t)GetModuleHandleW(nullptr)));
+    report_problem("crash", "Asura's Wrath crashed.", what, [](FILE* f, void* p) {
+        write_crash(f, (PEXCEPTION_POINTERS)p);
+        // a small minidump (thread stacks, modules) beside the report, for the developer
+        static char dumpPath[MAX_PATH];
+        SYSTEMTIME t; GetLocalTime(&t);
+        snprintf(dumpPath, sizeof dumpPath, "%s\\logs\\crash_%04d-%02d-%02d_%02d-%02d-%02d.dmp", data_root().c_str(), t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+        HANDLE h = CreateFileA(dumpPath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) { fprintf(f, "minidump: cannot create %s\n", dumpPath); return; }
+        MINIDUMP_EXCEPTION_INFORMATION info{ GetCurrentThreadId(), (PEXCEPTION_POINTERS)p, FALSE };
+        const BOOL ok = MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), h, MiniDumpNormal, &info, nullptr, nullptr);
+        const DWORD err = GetLastError();
+        CloseHandle(h);
+        if (ok) fprintf(f, "minidump: %s\n", dumpPath);
+        else { fprintf(f, "minidump failed (%08lX)\n", err); DeleteFileA(dumpPath); }
+    }, ep);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+static void write_crash(FILE* out, PEXCEPTION_POINTERS ep) {
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    fprintf(out, "\n*** EXCEPTION %08lX at host +%llX thread %lu\n", code,
             (unsigned long long)((uintptr_t)ep->ExceptionRecord->ExceptionAddress - (uintptr_t)GetModuleHandleW(nullptr)), GetCurrentThreadId());
     if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2) {
         uint64_t a = ep->ExceptionRecord->ExceptionInformation[1];
-        fprintf(stderr, "    %s guest %08llX\n", ep->ExceptionRecord->ExceptionInformation[0] ? "write to" : "read from", (unsigned long long)(a - (uint64_t)g_base));
+        fprintf(out, "    %s guest %08llX\n", ep->ExceptionRecord->ExceptionInformation[0] ? "write to" : "read from", (unsigned long long)(a - (uint64_t)g_base));
     }
     if (g_ctx) {
         PPCContext& c = *g_ctx;
-        fprintf(stderr, "    lr=%08X ctr=%08X r1=%08X r3=%08X r4=%08X r5=%08X r6=%08X r11=%08X r30=%08X r31=%08X\n",
+        fprintf(out, "    lr=%08X ctr=%08X r1=%08X r3=%08X r4=%08X r5=%08X r6=%08X r11=%08X r30=%08X r31=%08X\n",
                 (uint32_t)c.lr, c.ctr.u32, c.r1.u32, c.r3.u32, c.r4.u32, c.r5.u32, c.r6.u32, c.r11.u32, c.r30.u32, c.r31.u32);
         guest_backtrace(c.r1.u32);
         // the memory the non-volatile registers point at, which usually holds the objects the crashing code was working on
@@ -91,9 +122,9 @@ static LONG CALLBACK CrashHandler(PEXCEPTION_POINTERS ep) {
         for (int i = 0; i < 10; i++) {
             uint32_t a = regs[i]->u32 & ~3u;
             if (a < 0x10000 || IsBadReadPtr(g_base + a, 64)) continue;
-            fprintf(stderr, "    [%s=%08X]", names[i], regs[i]->u32);
-            for (int k = 0; k < 12; k++) fprintf(stderr, " %08X", rd32(a + k * 4));
-            fprintf(stderr, "\n");
+            fprintf(out, "    [%s=%08X]", names[i], regs[i]->u32);
+            for (int k = 0; k < 12; k++) fprintf(out, " %08X", rd32(a + k * 4));
+            fprintf(out, "\n");
         }
     }
     if (const char* d = getenv("ASURA_CRASHDUMP")) {   // ASURA_CRASHDUMP=address,bytes (hex): dump that range too
@@ -101,18 +132,40 @@ static LONG CALLBACK CrashHandler(PEXCEPTION_POINTERS ep) {
         if (sscanf(d, "%x,%x", &a, &n) == 2)
             for (uint32_t o = 0; o < n; o += 32) {
                 if (IsBadReadPtr(g_base + a + o, 32)) break;
-                fprintf(stderr, "    %08X:", a + o);
-                for (int k = 0; k < 8; k++) fprintf(stderr, " %08X", rd32(a + o + k * 4));
-                fprintf(stderr, "\n");
+                fprintf(out, "    %08X:", a + o);
+                for (int k = 0; k < 8; k++) fprintf(out, " %08X", rd32(a + o + k * 4));
+                fprintf(out, "\n");
             }
     }
-    fflush(stderr);
-    return EXCEPTION_CONTINUE_SEARCH;
 }
 static void UnresolvedIndirect(PPCContext& ctx, uint8_t*) {
     fprintf(stderr, "\n*** indirect call to %08X, which has no recompiled function (lr=%08X r3=%08X)\n", ctx.ctr.u32, (uint32_t)ctx.lr, ctx.r3.u32);
     guest_backtrace(ctx.r1.u32);
     fflush(stderr);
+    char d[160]; snprintf(d, sizeof d, "indirect call to %08X, which has no recompiled function (lr=%08X r3=%08X)", ctx.ctr.u32, (uint32_t)ctx.lr, ctx.r3.u32);
+    report_problem("crash", "Asura's Wrath stopped: the game called code the recompilation doesn't have.", d);
+}
+
+void report_problem(const char* kind, const std::string& title, const std::string& details, void (*extra)(FILE*, void*), void* arg) {
+    static std::atomic<bool> once{ false };
+    if (once.exchange(true)) { Sleep(INFINITE); }                                // another thread is already reporting
+    fprintf(stderr, "\n*** %s: %s\n", title.c_str(), details.c_str()); fflush(stderr);
+    const std::string dir = data_root() + "\\logs"; CreateDirectoryA(dir.c_str(), nullptr);
+    SYSTEMTIME t; GetLocalTime(&t);
+    char path[MAX_PATH];
+    snprintf(path, sizeof path, "%s\\%s_%04d-%02d-%02d_%02d-%02d-%02d.txt", dir.c_str(), kind, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    bool saved = false;
+    if (FILE* f = fopen(path, "w")) {
+        fprintf(f, "%s\n%s\n", title.c_str(), details.c_str());
+        if (extra) extra(f, arg);
+        fclose(f);
+        saved = true;
+    }
+    std::string msg = title + "\n\n" + details + "\n\n";
+    msg += saved ? "A report was saved to\n" + std::string(path) + "\n\nPlease send it (and the log, if you ran asura_debug.cmd) with a description of what was happening."
+                 : std::string("The report could not be saved.");
+    HWND owner = nullptr;
+    MessageBoxA(owner, msg.c_str(), "Asura's Wrath (recomp)", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
     TerminateProcess(GetCurrentProcess(), 3);
 }
 
@@ -302,6 +355,8 @@ int main(int argc, char** argv) {
         SetProcessInformation(GetCurrentProcess(), (PROCESS_INFORMATION_CLASS)4, &pt, sizeof pt);
     }
     AddVectoredExceptionHandler(1, CrashHandler);
+    SetUnhandledExceptionFilter(UnhandledFilter);   // a crash nothing handles: report file, minidump and a message (report_problem)
+    if (getenv("ASURA_TESTCRASH")) *(volatile int*)nullptr = 0;   // checks the crash report
 
     const std::string root = data_root();
     std::vector<char> image = read_file(root + "\\private\\image.bin"), xex = read_file(root + "\\private\\default_patched.xex");

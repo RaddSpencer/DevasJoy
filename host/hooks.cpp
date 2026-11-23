@@ -216,11 +216,17 @@ PPC_FUNC(sub_8271BCA8) {
     __imp__sub_8271BCA8(ctx, base);
 }
 
-// UE3 fatal error (appError path): prints the message and parks the thread with Sleep(INFINITE). Log it, always.
+// UE3 fatal error (appError path): prints the message and parks the thread with Sleep(INFINITE), which looks like a hang. Log it, always, and
+// tell the player (report_problem: logs\fatal_<date>.txt and a message, then the process ends). ASURA_FATALHANG=1: hang as before (debugging).
 PPC_FUNC_IMPL(__imp__sub_8229BB28);
 PPC_FUNC(sub_8229BB28) {
-    fprintf(stderr, "[fatal] %s | %s (lr=%08X)\n", guest_text(ctx.r4.u32).c_str(), guest_text(ctx.r5.u32).c_str(), (uint32_t)ctx.lr);
+    const std::string a = guest_text(ctx.r4.u32), b = guest_text(ctx.r5.u32);
+    fprintf(stderr, "[fatal] %s | %s (lr=%08X)\n", a.c_str(), b.c_str(), (uint32_t)ctx.lr);
     fflush(stderr);
+    if (!getenv("ASURA_FATALHANG")) {
+        char lr[32]; snprintf(lr, sizeof lr, " (lr=%08X)", (uint32_t)ctx.lr);
+        report_problem("fatal", "Asura's Wrath stopped with a fatal error from the game.", a + (b.empty() ? "" : " | " + b) + lr);
+    }
     __imp__sub_8229BB28(ctx, base);
 }
 
